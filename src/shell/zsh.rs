@@ -98,9 +98,11 @@ impl ZshEmitter {
 impl ShellEmitter for ZshEmitter {
     fn emit_wrapper(&self, shortcut: bool) -> String {
         let mut source = String::from(WRAPPER_PREFIX);
+        source.push_str(COMPLETION_FUNCTIONS);
         if shortcut {
             source.push_str(SHORTCUT_FUNCTION);
         }
+        source.push_str(COMPLETION_REGISTRATION);
         source.push_str(WRAPPER_SUFFIX);
         source
     }
@@ -415,9 +417,15 @@ const WRAPPER_PREFIX: &str = r#"function __gschrank_dispatch_v1 {
       if GSCHRANK_SHELL_PAYLOAD_V1="$(builtin command gschrank __emit-zsh 1 explicit unload)"; then
         if GSCHRANK_SHELL_COMMAND_OUTPUT_V1="$(builtin command gschrank __purge-from-zsh)"; then
           if builtin eval -- "$GSCHRANK_SHELL_PAYLOAD_V1"; then
-            builtin unset GSCHRANK_SHELL_PAYLOAD_V1
             builtin print -r -- "$GSCHRANK_SHELL_COMMAND_OUTPUT_V1"
-            return 0
+            builtin unset GSCHRANK_SHELL_PAYLOAD_V1 GSCHRANK_SHELL_COMMAND_OUTPUT_V1
+            if __gschrank_remove_integration_v1; then
+              return 0
+            else
+              GSCHRANK_SHELL_RC_V1=$?
+              builtin print -ru2 -- 'gschrank: vault purge completed but shell integration cleanup was incomplete; close this shell'
+              return "$GSCHRANK_SHELL_RC_V1"
+            fi
           else
             GSCHRANK_SHELL_RC_V1=$?
             builtin unset GSCHRANK_SHELL_PAYLOAD_V1 GSCHRANK_SHELL_COMMAND_OUTPUT_V1
@@ -473,10 +481,200 @@ function gschrank {
 }
 "#;
 
+const COMPLETION_FUNCTIONS: &str = r#"function __gschrank_complete_profiles_v1 {
+  builtin emulate -L zsh
+  builtin unsetopt XTRACE VERBOSE
+  builtin typeset -a _gschrank_profiles_v1
+  _gschrank_profiles_v1=("${(@f)$(builtin command gschrank profile list </dev/null 2>/dev/null)}")
+  if (( ${#_gschrank_profiles_v1} )); then
+    builtin compadd -Q -a _gschrank_profiles_v1
+  fi
+}
+
+function __gschrank_complete_variables_v1 {
+  builtin emulate -L zsh
+  builtin unsetopt XTRACE VERBOSE
+  builtin typeset _gschrank_profile_v1="$1"
+  builtin typeset -a _gschrank_variables_v1
+  _gschrank_variables_v1=("${(@f)$(builtin command gschrank profile inspect "$_gschrank_profile_v1" </dev/null 2>/dev/null)}")
+  if (( ${#_gschrank_variables_v1} )); then
+    _gschrank_variables_v1[1]=()
+  fi
+  if (( ${#_gschrank_variables_v1} )); then
+    builtin compadd -Q -a _gschrank_variables_v1
+  fi
+}
+
+function __gschrank_complete_recovery_v1 {
+  builtin emulate -L zsh
+  builtin unsetopt XTRACE VERBOSE
+  builtin typeset _gschrank_line_v1 _gschrank_candidate_v1
+  builtin typeset -a _gschrank_recovery_lines_v1 _gschrank_recovery_ids_v1
+  builtin typeset -A _gschrank_seen_recovery_v1
+  _gschrank_recovery_lines_v1=("${(@f)$(builtin command gschrank recovery list </dev/null 2>/dev/null)}")
+  for _gschrank_line_v1 in "${_gschrank_recovery_lines_v1[@]}"; do
+    _gschrank_candidate_v1="${_gschrank_line_v1#  }"
+    if (( ${#_gschrank_candidate_v1} == 32 )) && [[ "$_gschrank_candidate_v1" != *[^0-9a-f]* ]] && [[ -z ${_gschrank_seen_recovery_v1[$_gschrank_candidate_v1]-} ]]; then
+      _gschrank_seen_recovery_v1[$_gschrank_candidate_v1]=1
+      _gschrank_recovery_ids_v1+=("$_gschrank_candidate_v1")
+    fi
+  done
+  if (( ${#_gschrank_recovery_ids_v1} )); then
+    builtin compadd -Q -a _gschrank_recovery_ids_v1
+  fi
+}
+
+function __gschrank_complete_v1 {
+  builtin emulate -L zsh
+  builtin unsetopt XTRACE VERBOSE
+  if (( CURRENT == 2 )); then
+    builtin compadd -Q -- config init status doctor backup restore rebuild reset purge recovery import profile set remove startup load reload unload --help --version
+    return
+  fi
+  case "${words[2]-}" in
+    config)
+      if [[ "${words[CURRENT-1]-}" == --rc-file ]] && (( ${+functions[_files]} )); then
+        _files
+      elif (( CURRENT == 3 )); then
+        builtin compadd -Q -- --rc-file
+      fi
+      ;;
+    backup|restore)
+      if (( CURRENT == 3 && ${+functions[_files]} )); then
+        _files
+      fi
+      ;;
+    profile)
+      if (( CURRENT == 3 )); then
+        builtin compadd -Q -- create rename delete list inspect
+      else
+        case "${words[3]-}" in
+          rename|delete|inspect)
+            if (( CURRENT == 4 )); then
+              __gschrank_complete_profiles_v1
+            fi
+            ;;
+        esac
+      fi
+      ;;
+    set)
+      if (( CURRENT == 3 )); then
+        __gschrank_complete_profiles_v1
+      elif (( CURRENT >= 5 )); then
+        builtin compadd -Q -- --stdin
+      fi
+      ;;
+    remove)
+      if (( CURRENT == 3 )); then
+        __gschrank_complete_profiles_v1
+      elif (( CURRENT == 4 )); then
+        __gschrank_complete_variables_v1 "${words[3]-}"
+      fi
+      ;;
+    startup)
+      if (( CURRENT == 3 )); then
+        builtin compadd -Q -- set off
+      elif (( CURRENT == 4 )) && [[ "${words[3]-}" == set ]]; then
+        __gschrank_complete_profiles_v1
+      fi
+      ;;
+    load)
+      if (( CURRENT == 3 )); then
+        __gschrank_complete_profiles_v1
+      fi
+      ;;
+    recovery)
+      if (( CURRENT == 3 )); then
+        builtin compadd -Q -- list restore purge
+      elif (( CURRENT == 4 )) && [[ "${words[3]-}" == restore || "${words[3]-}" == purge ]]; then
+        __gschrank_complete_recovery_v1
+      fi
+      ;;
+    import)
+      if (( CURRENT == 3 )); then
+        builtin compadd -Q -- dotenv
+      elif (( CURRENT == 4 )) && [[ "${words[3]-}" == dotenv ]]; then
+        __gschrank_complete_profiles_v1
+      elif (( CURRENT >= 5 )); then
+        builtin compadd -Q -- --dry-run --replace-existing
+      fi
+      ;;
+  esac
+}
+
+function __gschrank_register_completion_v1 {
+  builtin emulate -L zsh
+  builtin unsetopt XTRACE VERBOSE
+  if [[ ${parameters[_comps]-} != association* ]]; then
+    return 1
+  fi
+  _comps[gschrank]=__gschrank_complete_v1
+  if (( ${+functions[gsch]} )) && [[ ${functions[gsch]} == *'__gschrank_dispatch_v1 "$@"'* ]]; then
+    _comps[gsch]=__gschrank_complete_v1
+  elif [[ ${_comps[gsch]-} == __gschrank_complete_v1 ]]; then
+    builtin unset '_comps[gsch]' 2>/dev/null || return 1
+  fi
+  if [[ ${parameters[precmd_functions]-} == array* ]]; then
+    precmd_functions=("${(@)precmd_functions:#__gschrank_register_completion_v1}")
+  fi
+}
+
+function __gschrank_remove_integration_v1 {
+  builtin emulate -L zsh
+  builtin unsetopt XTRACE VERBOSE
+  builtin typeset _gschrank_function_v1
+  builtin typeset -a _gschrank_private_functions_v1
+  builtin typeset -i _gschrank_cleanup_rc_v1=0
+
+  if [[ ${parameters[_comps]-} == association* ]]; then
+    if [[ ${_comps[gschrank]-} == __gschrank_complete_v1 ]]; then
+      builtin unset '_comps[gschrank]' 2>/dev/null || _gschrank_cleanup_rc_v1=1
+    fi
+    if [[ ${_comps[gsch]-} == __gschrank_complete_v1 ]]; then
+      builtin unset '_comps[gsch]' 2>/dev/null || _gschrank_cleanup_rc_v1=1
+    fi
+  fi
+  if [[ ${parameters[precmd_functions]-} == array* ]]; then
+    precmd_functions=("${(@)precmd_functions:#__gschrank_register_completion_v1}") || _gschrank_cleanup_rc_v1=1
+  fi
+  if (( ${+functions[gschrank]} )) && [[ ${functions[gschrank]} == *'__gschrank_dispatch_v1 "$@"'* ]]; then
+    builtin unfunction -- gschrank 2>/dev/null || _gschrank_cleanup_rc_v1=1
+  fi
+  if (( ${+functions[gsch]} )) && [[ ${functions[gsch]} == *'__gschrank_dispatch_v1 "$@"'* ]]; then
+    builtin unfunction -- gsch 2>/dev/null || _gschrank_cleanup_rc_v1=1
+  fi
+  _gschrank_private_functions_v1=(
+    __gschrank_complete_profiles_v1
+    __gschrank_complete_variables_v1
+    __gschrank_complete_recovery_v1
+    __gschrank_complete_v1
+    __gschrank_register_completion_v1
+    __gschrank_remove_integration_v1
+    __gschrank_dispatch_v1
+  )
+  for _gschrank_function_v1 in "${_gschrank_private_functions_v1[@]}"; do
+    if (( ${+functions[$_gschrank_function_v1]} )); then
+      builtin unfunction -- "$_gschrank_function_v1" 2>/dev/null || _gschrank_cleanup_rc_v1=1
+    fi
+  done
+  return "$_gschrank_cleanup_rc_v1"
+}
+"#;
+
 const SHORTCUT_FUNCTION: &str = r#"function gsch {
   __gschrank_dispatch_v1 "$@"
 }
 "#;
+
+const COMPLETION_REGISTRATION: &str = r"if ! __gschrank_register_completion_v1; then
+  if (( ! ${+parameters[precmd_functions]} )); then
+    builtin typeset -ga precmd_functions
+  fi
+  if [[ ${parameters[precmd_functions]-} == array* ]] && (( ${precmd_functions[(Ie)__gschrank_register_completion_v1]} == 0 )); then
+    precmd_functions+=(__gschrank_register_completion_v1)
+  fi
+fi
+";
 
 const WRAPPER_SUFFIX: &str = ":\n";
 
@@ -498,6 +696,15 @@ const MANAGED_BLOCK_FUNCTIONS: &str = r#"function __gschrank_clear_inherited_v1 
   return "$_gschrank_cleanup_rc_v1"
 }
 
+function __gschrank_forget_completion_v1 {
+  builtin emulate -L zsh
+  builtin unsetopt XTRACE VERBOSE
+  builtin typeset _gschrank_completion_name_v1="$1"
+  if [[ ${parameters[_comps]-} == association* && ${_comps[$_gschrank_completion_name_v1]-} == __gschrank_complete_v1 ]]; then
+    builtin unset "_comps[$_gschrank_completion_name_v1]" 2>/dev/null || return 1
+  fi
+}
+
 function __gschrank_initialize_v1 {
   builtin emulate -L zsh
   builtin unsetopt XTRACE VERBOSE
@@ -506,16 +713,22 @@ function __gschrank_initialize_v1 {
   builtin typeset -i _gschrank_use_shortcut_v1=0
 
   if (( ${+aliases[gschrank]} || ${+builtins[gschrank]} || ${reswords[(Ie)gschrank]} != 0 )); then
+    __gschrank_forget_completion_v1 gschrank || :
+    __gschrank_forget_completion_v1 gsch || :
     __gschrank_clear_inherited_v1 || :
     builtin print -ru2 -- 'gschrank: the canonical shell name is already in use; inherited profile cleanup attempted'
     return 0
   fi
   if (( ${+functions[gschrank]} )) && [[ ${functions[gschrank]} != *'__gschrank_dispatch_v1 "$@"'* ]]; then
+    __gschrank_forget_completion_v1 gschrank || :
+    __gschrank_forget_completion_v1 gsch || :
     __gschrank_clear_inherited_v1 || :
     builtin print -ru2 -- 'gschrank: the canonical shell name is already in use; inherited profile cleanup attempted'
     return 0
   fi
   if (( ! ${+commands[gschrank]} )); then
+    __gschrank_forget_completion_v1 gschrank || :
+    __gschrank_forget_completion_v1 gsch || :
     __gschrank_clear_inherited_v1 || :
     builtin print -ru2 -- 'gschrank: the executable is unavailable; inherited profile cleanup attempted'
     return 0
@@ -527,8 +740,10 @@ const MANAGED_BLOCK_SHORTCUT_ENABLED: &str = r#"
     if (( ${+functions[gsch]} )) && [[ ${functions[gsch]} == *'__gschrank_dispatch_v1 "$@"'* ]]; then
       builtin unfunction -- gsch
     fi
+    __gschrank_forget_completion_v1 gsch || :
     builtin print -ru2 -- "gschrank: the optional 'gsch' shortcut is already in use; continuing without it"
   elif (( ${+functions[gsch]} )) && [[ ${functions[gsch]} != *'__gschrank_dispatch_v1 "$@"'* ]]; then
+    __gschrank_forget_completion_v1 gsch || :
     builtin print -ru2 -- "gschrank: the optional 'gsch' shortcut is already in use; continuing without it"
   else
     _gschrank_use_shortcut_v1=1
@@ -539,6 +754,7 @@ const MANAGED_BLOCK_SHORTCUT_DISABLED: &str = r#"
   if (( ${+functions[gsch]} )) && [[ ${functions[gsch]} == *'__gschrank_dispatch_v1 "$@"'* ]]; then
     builtin unfunction -- gsch
   fi
+  __gschrank_forget_completion_v1 gsch || :
 "#;
 
 const MANAGED_BLOCK_WRAPPER_INIT: &str = r#"
@@ -567,7 +783,7 @@ const MANAGED_BLOCK_WRAPPER_INIT: &str = r#"
 const MANAGED_BLOCK_SUFFIX: &str = r"}
 
 __gschrank_initialize_v1
-builtin unfunction -- __gschrank_initialize_v1 __gschrank_clear_inherited_v1
+builtin unfunction -- __gschrank_initialize_v1 __gschrank_clear_inherited_v1 __gschrank_forget_completion_v1
 ";
 
 #[cfg(test)]
@@ -835,11 +1051,30 @@ mod tests {
         let wrapper = ZshEmitter::new().emit_wrapper(true);
         assert!(wrapper.contains("function gschrank"));
         assert!(wrapper.contains("function gsch"));
+        assert!(wrapper.contains("function __gschrank_complete_v1"));
+        assert!(wrapper.contains("create rename delete list inspect"));
         assert!(!wrapper.contains("API_TOKEN"));
         assert!(wrapper.ends_with(":\n"));
         let output = run_zsh(wrapper.as_bytes(), b"");
         assert!(output.status.success(), "generated wrapper is invalid Zsh");
         assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn wrapper_registers_one_completion_for_both_public_functions() {
+        let wrapper = ZshEmitter::new().emit_wrapper(true);
+        let output = run_zsh_parts(
+            b"",
+            wrapper.as_bytes(),
+            b"[[ ${precmd_functions[(Ie)__gschrank_register_completion_v1]} != 0 ]] || exit 90\nautoload -Uz compinit\ncompinit -D\nfor GSCHRANK_TEST_HOOK in \"${precmd_functions[@]}\"; do $GSCHRANK_TEST_HOOK; done\nbuiltin print -r -- ${_comps[gschrank]-missing}\nbuiltin print -r -- ${_comps[gsch]-missing}\n[[ ${precmd_functions[(Ie)__gschrank_register_completion_v1]} == 0 ]] || exit 91\n",
+        );
+
+        assert!(output.status.success(), "completion registration failed");
+        assert_eq!(
+            output.stdout,
+            b"__gschrank_complete_v1\n__gschrank_complete_v1\n"
+        );
         assert!(output.stderr.is_empty());
     }
 
@@ -874,6 +1109,27 @@ mod tests {
             Some(fake.path()),
         );
         assert!(output.status.success(), "startup-off fixture failed");
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn disabling_the_shortcut_removes_only_its_managed_completion() {
+        let fake = TestDirectory::with_fake_gschrank(
+            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-init ]]; then\n  builtin print -rn -- 'function __gschrank_dispatch_v1 { return 0; }; function gschrank { __gschrank_dispatch_v1 \"$@\"; };:'\n  exit 0\nfi\nexit 2\n",
+        );
+        let block = ZshEmitter::emit_managed_block(StartupConfiguration::new(None, false));
+        let output = run_zsh_parts_with_path(
+            b"autoload -Uz compinit\ncompinit -D\nfunction gsch { __gschrank_dispatch_v1 \"$@\"; }\n_comps[gsch]=__gschrank_complete_v1\n_comps[unrelated]=_unrelated\n",
+            block.source(),
+            b"if (( ${+functions[gsch]} )); then exit 90; fi\nif [[ -n ${_comps[gsch]-} ]]; then exit 91; fi\n[[ ${_comps[unrelated]-} == _unrelated ]] || exit 92\n",
+            Some(fake.path()),
+        );
+
+        assert!(
+            output.status.success(),
+            "shortcut completion cleanup failed"
+        );
         assert!(output.stdout.is_empty());
         assert!(output.stderr.is_empty());
     }
@@ -1082,11 +1338,11 @@ mod tests {
         let fake = TestDirectory::with_fake_gschrank(
             "#!/bin/zsh -f\nif [[ \"$1\" == __emit-zsh ]]; then\n  builtin print -rn -- 'builtin unset -- ACTIVE_VALUE GSCHRANK_ENV_PROTOCOL GSCHRANK_ACTIVE_PROFILE GSCHRANK_MANAGED_KEYS;'\n  exit 0\nfi\nif [[ \"$1\" == __purge-from-zsh ]]; then\n  builtin print -r -- 'Purged local encrypted vault state.'\n  exit 0\nfi\nexit 99\n",
         );
-        let wrapper = ZshEmitter::new().emit_wrapper(false);
+        let wrapper = ZshEmitter::new().emit_wrapper(true);
         let output = run_zsh_parts_with_path(
-            b"builtin export ACTIVE_VALUE=CANARY-purge-active GSCHRANK_ENV_PROTOCOL=1 GSCHRANK_ACTIVE_PROFILE=work GSCHRANK_MANAGED_KEYS=ACTIVE_VALUE\n",
+            b"autoload -Uz compinit\ncompinit -D\nbuiltin export ACTIVE_VALUE=CANARY-purge-active GSCHRANK_ENV_PROTOCOL=1 GSCHRANK_ACTIVE_PROFILE=work GSCHRANK_MANAGED_KEYS=ACTIVE_VALUE\n",
             wrapper.as_bytes(),
-            b"gschrank purge\nGSCHRANK_TEST_RC=$?\nif builtin command /usr/bin/printenv ACTIVE_VALUE >/dev/null; then exit 96; fi\nif builtin command /usr/bin/printenv GSCHRANK_ACTIVE_PROFILE >/dev/null; then exit 95; fi\nexit $GSCHRANK_TEST_RC\n",
+            b"gschrank purge\nGSCHRANK_TEST_RC=$?\nif builtin command /usr/bin/printenv ACTIVE_VALUE >/dev/null; then exit 96; fi\nif builtin command /usr/bin/printenv GSCHRANK_ACTIVE_PROFILE >/dev/null; then exit 95; fi\nfor GSCHRANK_TEST_FUNCTION in gschrank gsch __gschrank_dispatch_v1 __gschrank_complete_v1 __gschrank_register_completion_v1 __gschrank_remove_integration_v1; do\n  if (( ${+functions[$GSCHRANK_TEST_FUNCTION]} )); then exit 94; fi\ndone\nif [[ -n ${_comps[gschrank]-} || -n ${_comps[gsch]-} ]]; then exit 93; fi\nexit $GSCHRANK_TEST_RC\n",
             Some(fake.path()),
         );
 
@@ -1102,15 +1358,33 @@ mod tests {
     }
 
     #[test]
+    fn full_purge_preserves_a_shortcut_claimed_later_by_an_unrelated_tool() {
+        let fake = TestDirectory::with_fake_gschrank(
+            "#!/bin/zsh -f\nif [[ \"$1\" == __emit-zsh ]]; then\n  builtin print -rn -- 'builtin unset -- GSCHRANK_ENV_PROTOCOL GSCHRANK_ACTIVE_PROFILE GSCHRANK_MANAGED_KEYS;'\n  exit 0\nfi\nif [[ \"$1\" == __purge-from-zsh ]]; then\n  exit 0\nfi\nexit 99\n",
+        );
+        let wrapper = ZshEmitter::new().emit_wrapper(true);
+        let output = run_zsh_parts_with_path(
+            b"autoload -Uz compinit\ncompinit -D\n",
+            wrapper.as_bytes(),
+            b"function gsch { return 55; }\n_comps[gsch]=_unrelated\ngschrank purge\nGSCHRANK_TEST_RC=$?\n(( ${+functions[gsch]} )) || exit 93\n[[ ${_comps[gsch]-} == _unrelated ]] || exit 94\ngsch\n[[ $? == 55 ]] || exit 95\nexit $GSCHRANK_TEST_RC\n",
+            Some(fake.path()),
+        );
+
+        assert!(output.status.success(), "unrelated shortcut was removed");
+        assert_eq!(output.stdout, b"\n");
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
     fn failed_full_purge_preserves_the_invoking_shell_snapshot() {
         let fake = TestDirectory::with_fake_gschrank(
             "#!/bin/zsh -f\nif [[ \"$1\" == __emit-zsh ]]; then\n  builtin print -rn -- 'builtin unset -- ACTIVE_VALUE GSCHRANK_ENV_PROTOCOL GSCHRANK_ACTIVE_PROFILE GSCHRANK_MANAGED_KEYS;'\n  exit 0\nfi\nif [[ \"$1\" == __purge-from-zsh ]]; then\n  exit 14\nfi\nexit 99\n",
         );
-        let wrapper = ZshEmitter::new().emit_wrapper(false);
+        let wrapper = ZshEmitter::new().emit_wrapper(true);
         let output = run_zsh_parts_with_path(
-            b"builtin export ACTIVE_VALUE=CANARY-purge-preserved GSCHRANK_ENV_PROTOCOL=1 GSCHRANK_ACTIVE_PROFILE=work GSCHRANK_MANAGED_KEYS=ACTIVE_VALUE\n",
+            b"autoload -Uz compinit\ncompinit -D\nbuiltin export ACTIVE_VALUE=CANARY-purge-preserved GSCHRANK_ENV_PROTOCOL=1 GSCHRANK_ACTIVE_PROFILE=work GSCHRANK_MANAGED_KEYS=ACTIVE_VALUE\n",
             wrapper.as_bytes(),
-            b"gschrank purge\nGSCHRANK_TEST_RC=$?\nbuiltin command /usr/bin/printenv ACTIVE_VALUE\nexit $GSCHRANK_TEST_RC\n",
+            b"gschrank purge\nGSCHRANK_TEST_RC=$?\nbuiltin command /usr/bin/printenv ACTIVE_VALUE\n(( ${+functions[gschrank]} )) || exit 93\n(( ${+functions[gsch]} )) || exit 94\n[[ ${_comps[gschrank]-} == __gschrank_complete_v1 ]] || exit 95\n[[ ${_comps[gsch]-} == __gschrank_complete_v1 ]] || exit 96\nexit $GSCHRANK_TEST_RC\n",
             Some(fake.path()),
         );
 
