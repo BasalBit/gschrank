@@ -188,6 +188,24 @@ where
         .map(|(receipt, ())| receipt)
     }
 
+    pub(crate) fn preflight_rename(
+        &self,
+        old: &ProfileName,
+        new: &ProfileName,
+        interaction: InteractionPolicy,
+    ) -> Result<(), ProfileOperationError> {
+        self.store.shared_read(|read| {
+            let (opened, _key) = self.open_current(read, interaction)?;
+            if !opened.vault.contains_profile(old) {
+                return Err(DomainError::ProfileNotFound.into());
+            }
+            if opened.vault.contains_profile(new) {
+                return Err(DomainError::ProfileAlreadyExists.into());
+            }
+            Ok(())
+        })
+    }
+
     pub(crate) fn delete(
         &self,
         profile: &ProfileName,
@@ -542,6 +560,34 @@ mod tests {
         assert_eq!(
             error,
             ProfileOperationError::Domain(DomainError::ProfileNotFound)
+        );
+        assert_eq!(store.live().unwrap(), before);
+    }
+
+    #[test]
+    fn rename_preflight_authenticates_both_names_without_rewriting() {
+        let (keys, store) = initialized();
+        let operations = ProfileOperations::new(&keys, &store);
+        let work = profile("work");
+        let existing = profile("existing");
+        operations.create(work.clone(), INTERACTION).unwrap();
+        operations.create(existing.clone(), INTERACTION).unwrap();
+        let before = store.live().unwrap();
+
+        operations
+            .preflight_rename(&work, &profile("new"), INTERACTION)
+            .unwrap();
+        assert_eq!(
+            operations
+                .preflight_rename(&profile("missing"), &profile("new"), INTERACTION)
+                .unwrap_err(),
+            ProfileOperationError::Domain(DomainError::ProfileNotFound)
+        );
+        assert_eq!(
+            operations
+                .preflight_rename(&work, &existing, INTERACTION)
+                .unwrap_err(),
+            ProfileOperationError::Domain(DomainError::ProfileAlreadyExists)
         );
         assert_eq!(store.live().unwrap(), before);
     }

@@ -13,16 +13,20 @@ master key in the login Keychain. Authenticated `profile create`, `rename`,
 `delete`, `list`, and names-only `inspect` operations atomically rewrite that
 vault. `set` accepts a value only through a no-echo terminal prompt or explicit
 non-terminal `--stdin`; `remove` deletes a named value, and neither command
-prints secret data. The versioned Zsh wrapper and private apply protocol now
-support transactional profile replacement, reload, and unload with inherited
-names-only metadata. Automated `.zshrc` installation and startup-profile
-configuration are the next implementation slice, so public current-shell
-commands still fail with installation guidance until that managed block is in
-place.
+prints secret data. `gschrank startup set <profile>` now safely installs or
+updates one versioned `.zshrc` block, while `gschrank startup off` keeps shell
+integration installed but clears inherited managed values in future shells.
+The editor refuses symlinks, malformed markers, conflicting shell names,
+concurrent changes, and compiled `.zshrc.zwc` shadowing; it preserves file mode,
+keeps a first-change backup, and replaces through a synced same-directory file.
+The versioned Zsh wrapper and private apply protocol support transactional
+profile replacement, reload, and unload with inherited names-only metadata.
+Profile rename follows the configured startup reference, and deletion refuses
+the startup profile until another profile is selected or automatic loading is
+turned off.
 
-The canonical executable is `gschrank`. Configured interactive Zsh shells will
-also be able to expose the optional `gsch` function once shell integration is
-implemented.
+The canonical executable is `gschrank`. Configured interactive Zsh shells also
+expose the optional conflict-checked `gsch` function when that name is free.
 
 ## Development
 

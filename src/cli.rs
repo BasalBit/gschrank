@@ -10,10 +10,11 @@ use crate::{
     DomainError, EnvironmentName, Mutation, ProfileName,
     init::{InitOutcome, Initializer},
     key_provider::InteractionPolicy,
-    profiles::{ProfileInspection, ProfileOperations},
+    profiles::{ProfileInspection, ProfileOperationError, ProfileOperations},
     secret_input::{SecretInputMode, read_secret},
     set_command::execute_set,
     shell::{ShellEmitter, ZshEmitter},
+    shell_config::{ShellConfigEdit, StartupConfiguration},
     shell_transition::{
         ACTIVE_PROFILE_NAME, ENV_PROTOCOL_NAME, MANAGED_KEYS_NAME, ManagedState, ManagedStateError,
         OperationContext, ShellTransition,
@@ -21,7 +22,10 @@ use crate::{
 };
 
 #[cfg(target_os = "macos")]
-use crate::platform::macos::{LocalVaultStore, MacOsKeychainProvider, MacOsPathError, MacOsPaths};
+use crate::platform::macos::{
+    LocalVaultStore, MacOsKeychainProvider, MacOsPathError, MacOsPaths, ZshConfigEditor,
+    ZshConfigError,
+};
 
 const HELP: &str = concat!(
     "gschrank ",
@@ -39,6 +43,8 @@ Usage:
   gschrank profile inspect <profile>
   gschrank set <profile> <variable> [--stdin]
   gschrank remove <profile> <variable>
+  gschrank startup set <profile>
+  gschrank startup off
   gschrank load <profile>
   gschrank reload
   gschrank unload
@@ -50,6 +56,7 @@ Commands:
   profile    Create, rename, delete, list, or inspect profiles
   set        Create or update a variable using hidden or explicit stdin input
   remove     Remove a variable from a profile
+  startup    Select a profile for new Zsh shells, or turn automatic loading off
   load       Load a profile through the installed current-shell wrapper
   reload     Reload the active profile through the current-shell wrapper
   unload     Clear the active profile through the current-shell wrapper
@@ -73,6 +80,7 @@ enum Command {
         profile: ProfileName,
         variable: EnvironmentName,
     },
+    Startup(StartupCommand),
     ShellParent(ShellParentCommand),
     ShellInit {
         shortcut: bool,
@@ -88,6 +96,11 @@ enum ShellParentCommand {
     StartupLoad(ProfileName),
     Reload,
     Unload,
+}
+
+enum StartupCommand {
+    Set(ProfileName),
+    Off,
 }
 
 enum EmitOperation {
@@ -124,6 +137,64 @@ enum ProfileSuccess {
     },
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+enum ProfileCommandError {
+    Profile(ProfileOperationError),
+    ShellConfig(ZshConfigError),
+    ConfiguredStartupProfile,
+    RenameRollbackFailed,
+}
+
+#[cfg(target_os = "macos")]
+impl ProfileCommandError {
+    const fn exit_code(&self) -> u8 {
+        match self {
+            Self::Profile(error) => error.exit_code(),
+            Self::ShellConfig(error) => error.exit_code(),
+            Self::ConfiguredStartupProfile => 14,
+            Self::RenameRollbackFailed => 15,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Display for ProfileCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Profile(error) => error.fmt(formatter),
+            Self::ShellConfig(error) => error.fmt(formatter),
+            Self::ConfiguredStartupProfile => formatter.write_str(
+                "the profile is configured for new shells; select another startup profile or run 'gschrank startup off' first",
+            ),
+            Self::RenameRollbackFailed => formatter.write_str(
+                "profile rename failed and the startup configuration could not be restored; inspect both states before retrying",
+            ),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<ProfileOperationError> for ProfileCommandError {
+    fn from(error: ProfileOperationError) -> Self {
+        Self::Profile(error)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<ZshConfigError> for ProfileCommandError {
+    fn from(error: ZshConfigError) -> Self {
+        Self::ShellConfig(error)
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct StartupSuccess {
+    edit: ShellConfigEdit,
+    configuration: StartupConfiguration,
+    shortcut_conflict: bool,
+}
+
 enum ParseError {
     InvalidGrammar,
     InvalidName(DomainError),
@@ -158,6 +229,7 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
             input,
         }) => run_set(&profile, variable, input),
         Ok(Command::Remove { profile, variable }) => run_remove(&profile, &variable),
+        Ok(Command::Startup(command)) => run_startup(command),
         Ok(Command::ShellParent(command)) => run_shell_parent(command),
         Ok(Command::ShellInit { shortcut }) => run_shell_init(shortcut),
         Ok(Command::EmitZsh { context, operation }) => run_emit_zsh(context, operation),
@@ -206,6 +278,12 @@ fn parse(arguments: &[OsString]) -> Result<Command, ParseError> {
             profile: parse_profile_name(profile)?,
             variable: parse_environment_name(variable)?,
         }),
+        [startup, set, profile] if startup == "startup" && set == "set" => Ok(Command::Startup(
+            StartupCommand::Set(parse_profile_name(profile)?),
+        )),
+        [startup, off] if startup == "startup" && off == "off" => {
+            Ok(Command::Startup(StartupCommand::Off))
+        }
         [load, profile] if load == "load" => Ok(Command::ShellParent(ShellParentCommand::Load(
             parse_profile_name(profile)?,
         ))),
@@ -218,6 +296,12 @@ fn parse(arguments: &[OsString]) -> Result<Command, ParseError> {
         }
         [reload] if reload == "reload" => Ok(Command::ShellParent(ShellParentCommand::Reload)),
         [unload] if unload == "unload" => Ok(Command::ShellParent(ShellParentCommand::Unload)),
+        _ => parse_private(arguments),
+    }
+}
+
+fn parse_private(arguments: &[OsString]) -> Result<Command, ParseError> {
+    match arguments {
         [shell_init, shell, protocol]
             if shell_init == "__shell-init" && shell == "zsh" && protocol == "1" =>
         {
@@ -398,30 +482,36 @@ fn run_profile(command: ProfileCommand) -> ExitCode {
     let operations = ProfileOperations::new(&keys, &store);
     let interaction = interaction_policy();
 
-    let result = match command {
+    let result: Result<ProfileSuccess, ProfileCommandError> = match command {
         ProfileCommand::Create(profile) => {
             let output = profile.clone();
             operations
                 .create(profile, interaction)
                 .map(|_| ProfileSuccess::Created(output))
+                .map_err(Into::into)
         }
         ProfileCommand::Rename { old, new } => {
             let output_old = old.clone();
             let output_new = new.clone();
-            operations
-                .rename(&old, new, interaction)
-                .map(|_| ProfileSuccess::Renamed {
+            rename_profile_and_startup(&operations, &old, new, interaction).map(|()| {
+                ProfileSuccess::Renamed {
                     old: output_old,
                     new: output_new,
-                })
+                }
+            })
         }
-        ProfileCommand::Delete(profile) => operations
-            .delete(&profile, interaction)
-            .map(|_| ProfileSuccess::Deleted(profile)),
-        ProfileCommand::List => operations.list(interaction).map(ProfileSuccess::Listed),
+        ProfileCommand::Delete(profile) => {
+            delete_profile_with_startup_guard(&operations, &profile, interaction)
+                .map(|()| ProfileSuccess::Deleted(profile))
+        }
+        ProfileCommand::List => operations
+            .list(interaction)
+            .map(ProfileSuccess::Listed)
+            .map_err(Into::into),
         ProfileCommand::Inspect(profile) => operations
             .inspect(&profile, interaction)
-            .map(ProfileSuccess::Inspected),
+            .map(ProfileSuccess::Inspected)
+            .map_err(Into::into),
     };
 
     match result {
@@ -434,6 +524,102 @@ fn run_profile(command: ProfileCommand) -> ExitCode {
             ExitCode::from(error.exit_code())
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_profile_and_startup<K, S>(
+    operations: &ProfileOperations<'_, K, S>,
+    old: &ProfileName,
+    new: ProfileName,
+    interaction: InteractionPolicy,
+) -> Result<(), ProfileCommandError>
+where
+    K: crate::key_provider::KeyProvider,
+    S: crate::vault_store::VaultStore,
+{
+    let editor = ZshConfigEditor::discover()?;
+    rename_profile_and_startup_using(&editor, operations, old, new, interaction)
+}
+
+#[cfg(target_os = "macos")]
+fn rename_profile_and_startup_using<K, S>(
+    editor: &ZshConfigEditor,
+    operations: &ProfileOperations<'_, K, S>,
+    old: &ProfileName,
+    new: ProfileName,
+    interaction: InteractionPolicy,
+) -> Result<(), ProfileCommandError>
+where
+    K: crate::key_provider::KeyProvider,
+    S: crate::vault_store::VaultStore,
+{
+    let state = editor.inspect()?;
+    let Some(configuration) = state.configuration() else {
+        operations.rename(old, new, interaction)?;
+        return Ok(());
+    };
+    if configuration.profile() != Some(old) {
+        operations.rename(old, new, interaction)?;
+        return Ok(());
+    }
+
+    operations.preflight_rename(old, &new, interaction)?;
+    let previous = configuration.clone();
+    let replacement = configuration.with_profile(Some(new.clone()));
+    let replacement_block = ZshEmitter::emit_managed_block(replacement);
+    editor.configure(&replacement_block)?;
+
+    match operations.rename(old, new, interaction) {
+        Ok(_) => Ok(()),
+        Err(ProfileOperationError::CommitOutcomeIndeterminate) => Err(
+            ProfileCommandError::Profile(ProfileOperationError::CommitOutcomeIndeterminate),
+        ),
+        Err(error) => {
+            let rollback = ZshEmitter::emit_managed_block(previous);
+            if editor.configure(&rollback).is_err() {
+                Err(ProfileCommandError::RenameRollbackFailed)
+            } else {
+                Err(ProfileCommandError::Profile(error))
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn delete_profile_with_startup_guard<K, S>(
+    operations: &ProfileOperations<'_, K, S>,
+    profile: &ProfileName,
+    interaction: InteractionPolicy,
+) -> Result<(), ProfileCommandError>
+where
+    K: crate::key_provider::KeyProvider,
+    S: crate::vault_store::VaultStore,
+{
+    let editor = ZshConfigEditor::discover()?;
+    delete_profile_with_startup_guard_using(&editor, operations, profile, interaction)
+}
+
+#[cfg(target_os = "macos")]
+fn delete_profile_with_startup_guard_using<K, S>(
+    editor: &ZshConfigEditor,
+    operations: &ProfileOperations<'_, K, S>,
+    profile: &ProfileName,
+    interaction: InteractionPolicy,
+) -> Result<(), ProfileCommandError>
+where
+    K: crate::key_provider::KeyProvider,
+    S: crate::vault_store::VaultStore,
+{
+    if editor
+        .inspect()?
+        .configuration()
+        .and_then(StartupConfiguration::profile)
+        == Some(profile)
+    {
+        return Err(ProfileCommandError::ConfiguredStartupProfile);
+    }
+    operations.delete(profile, interaction)?;
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -507,6 +693,123 @@ fn run_remove(profile: &ProfileName, variable: &EnvironmentName) -> ExitCode {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn run_startup(command: StartupCommand) -> ExitCode {
+    let editor = match ZshConfigEditor::discover() {
+        Ok(editor) => editor,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+
+    let requested_profile = match command {
+        StartupCommand::Set(profile) => {
+            let paths = match MacOsPaths::discover() {
+                Ok(paths) => paths,
+                Err(error) => {
+                    eprintln!("gschrank: {error}");
+                    return ExitCode::from(13);
+                }
+            };
+            let keys = MacOsKeychainProvider::new();
+            let store = LocalVaultStore::new(paths.data_directory().to_owned());
+            if let Err(error) =
+                ProfileOperations::new(&keys, &store).inspect(&profile, interaction_policy())
+            {
+                eprintln!("gschrank: {error}");
+                return ExitCode::from(error.exit_code());
+            }
+            Some(profile)
+        }
+        StartupCommand::Off => None,
+    };
+
+    let state = match editor.inspect() {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let base = state
+        .configuration()
+        .cloned()
+        .unwrap_or_else(|| StartupConfiguration::new(None, true));
+    let requested = base.with_profile(requested_profile);
+
+    match configure_startup(&editor, requested) {
+        Ok(success) => {
+            if success.shortcut_conflict {
+                eprintln!(
+                    "gschrank: the optional 'gsch' name is already in use; installed only the canonical 'gschrank' function"
+                );
+            }
+            print!("{}", render_startup_success(&success));
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn configure_startup(
+    editor: &ZshConfigEditor,
+    requested: StartupConfiguration,
+) -> Result<StartupSuccess, ZshConfigError> {
+    let block = ZshEmitter::emit_managed_block(requested.clone());
+    match editor.configure(&block) {
+        Ok(edit) => Ok(StartupSuccess {
+            edit,
+            configuration: requested,
+            shortcut_conflict: false,
+        }),
+        Err(ZshConfigError::ShortcutNameConflict) if requested.shortcut() => {
+            let configuration = requested.without_shortcut();
+            let block = ZshEmitter::emit_managed_block(configuration.clone());
+            let edit = editor.configure(&block)?;
+            Ok(StartupSuccess {
+                edit,
+                configuration,
+                shortcut_conflict: true,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn render_startup_success(success: &StartupSuccess) -> String {
+    let mut output = String::new();
+    match (success.configuration.profile(), success.edit) {
+        (Some(profile), ShellConfigEdit::Unchanged) => {
+            output.push_str("Profile '");
+            output.push_str(profile.as_str());
+            output.push_str("' is already configured for new Zsh shells; nothing changed.\n");
+        }
+        (Some(profile), ShellConfigEdit::Installed | ShellConfigEdit::Updated) => {
+            output.push_str("Configured profile '");
+            output.push_str(profile.as_str());
+            output.push_str("' for new Zsh shells.\n");
+        }
+        (None, ShellConfigEdit::Unchanged) => {
+            output.push_str("Automatic profile loading is already off; nothing changed.\n");
+        }
+        (None, ShellConfigEdit::Installed | ShellConfigEdit::Updated) => {
+            output.push_str(
+                "Turned off automatic profile loading for new Zsh shells; shell integration remains installed.\n",
+            );
+        }
+    }
+    if success.edit != ShellConfigEdit::Unchanged {
+        output.push_str("The current shell was not changed; open a new shell or run 'exec zsh'.\n");
+    }
+    output
+}
+
 fn run_shell_parent(command: ShellParentCommand) -> ExitCode {
     let operation = match command {
         ShellParentCommand::Load(_profile) | ShellParentCommand::StartupLoad(_profile) => "load",
@@ -569,7 +872,7 @@ fn run_emit_zsh(context: OperationContext, operation: EmitOperation) -> ExitCode
     let source = match operation {
         EmitOperation::Unload => emitter.emit_cleanup(current.managed_names()),
         EmitOperation::Load(profile) => {
-            match authenticated_snapshot(&profile, interaction_for_context(context)) {
+            match authenticated_snapshot(&profile, interaction_policy()) {
                 Ok(snapshot) => {
                     let transition = ShellTransition::load(current, snapshot, context);
                     emitter.emit_apply(&transition)
@@ -588,7 +891,7 @@ fn run_emit_zsh(context: OperationContext, operation: EmitOperation) -> ExitCode
                     return ExitCode::from(16);
                 }
             };
-            match authenticated_snapshot(&profile, interaction_for_context(context)) {
+            match authenticated_snapshot(&profile, interaction_policy()) {
                 Ok(snapshot) => {
                     let transition = ShellTransition::load(current, snapshot, context);
                     emitter.emit_apply(&transition)
@@ -659,13 +962,6 @@ impl std::fmt::Display for SnapshotLoadError {
 }
 
 #[cfg(target_os = "macos")]
-fn interaction_for_context(context: OperationContext) -> InteractionPolicy {
-    match context {
-        OperationContext::Explicit => interaction_policy(),
-        OperationContext::AutomaticStartup => InteractionPolicy::FailFast,
-    }
-}
-
 #[cfg(not(target_os = "macos"))]
 fn run_emit_zsh(_context: OperationContext, _operation: EmitOperation) -> ExitCode {
     eprintln!("gschrank: this build does not support encrypted profiles on this platform");
@@ -697,6 +993,12 @@ fn run_set(
 #[cfg(not(target_os = "macos"))]
 fn run_remove(_profile: &ProfileName, _variable: &EnvironmentName) -> ExitCode {
     eprintln!("gschrank: this build does not support encrypted profiles on this platform");
+    ExitCode::from(1)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_startup(_command: StartupCommand) -> ExitCode {
+    eprintln!("gschrank: this build does not support Zsh startup configuration on this platform");
     ExitCode::from(1)
 }
 
@@ -805,6 +1107,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_exact_startup_configuration_grammar() {
+        assert!(matches!(
+            parse(&["startup".into(), "set".into(), "dev".into()]),
+            Ok(Command::Startup(StartupCommand::Set(_)))
+        ));
+        assert!(matches!(
+            parse(&["startup".into(), "off".into()]),
+            Ok(Command::Startup(StartupCommand::Off))
+        ));
+        assert!(parse(&["startup".into()]).is_err());
+        assert!(parse(&["startup".into(), "set".into()]).is_err());
+        assert!(parse(&["startup".into(), "off".into(), "extra".into()]).is_err());
+    }
+
+    #[test]
     fn profile_rendering_contains_names_but_no_value_fields() {
         let inspection = ProfileInspection {
             profile: ProfileName::new("dev").unwrap(),
@@ -839,5 +1156,186 @@ mod tests {
             }),
             "Removed variable 'API_TOKEN' from profile 'dev'.\n"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    mod macos {
+        use std::{
+            fs,
+            os::unix::fs::PermissionsExt,
+            path::PathBuf,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+
+        use super::*;
+        use crate::{
+            init::Initializer,
+            testing::{MemoryKeyProvider, MemoryVaultStore, ReplacementFault},
+        };
+
+        static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+        struct TestDirectory(PathBuf);
+
+        impl TestDirectory {
+            fn new() -> Self {
+                let id = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+                let root = std::env::temp_dir().join(format!(
+                    "gschrank-cli-startup-test-{}-{id}",
+                    std::process::id()
+                ));
+                fs::create_dir(&root).unwrap();
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+                Self(root)
+            }
+
+            fn editor(&self) -> ZshConfigEditor {
+                ZshConfigEditor::at_path(self.0.join(".zshrc"))
+            }
+        }
+
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn initialized() -> (MemoryKeyProvider, MemoryVaultStore) {
+            let keys = MemoryKeyProvider::new();
+            let store = MemoryVaultStore::new();
+            Initializer::new(&keys, &store)
+                .initialize(InteractionPolicy::FailFast)
+                .unwrap();
+            (keys, store)
+        }
+
+        fn install_startup(editor: &ZshConfigEditor, profile: &ProfileName) {
+            let configuration = StartupConfiguration::new(Some(profile.clone()), false);
+            let block = ZshEmitter::emit_managed_block(configuration);
+            editor.configure(&block).unwrap();
+        }
+
+        #[test]
+        fn profile_rename_updates_startup_and_delete_guards_the_configured_profile() {
+            let test = TestDirectory::new();
+            let editor = test.editor();
+            let (keys, store) = initialized();
+            let operations = ProfileOperations::new(&keys, &store);
+            let old = ProfileName::new("work").unwrap();
+            let new = ProfileName::new("office").unwrap();
+            operations
+                .create(old.clone(), InteractionPolicy::FailFast)
+                .unwrap();
+            install_startup(&editor, &old);
+
+            rename_profile_and_startup_using(
+                &editor,
+                &operations,
+                &old,
+                new.clone(),
+                InteractionPolicy::FailFast,
+            )
+            .unwrap();
+            assert_eq!(
+                operations.list(InteractionPolicy::FailFast).unwrap(),
+                vec![new.clone()]
+            );
+            assert_eq!(
+                editor
+                    .inspect()
+                    .unwrap()
+                    .configuration()
+                    .and_then(StartupConfiguration::profile),
+                Some(&new)
+            );
+
+            assert!(matches!(
+                delete_profile_with_startup_guard_using(
+                    &editor,
+                    &operations,
+                    &new,
+                    InteractionPolicy::FailFast,
+                ),
+                Err(ProfileCommandError::ConfiguredStartupProfile)
+            ));
+            assert_eq!(
+                operations.list(InteractionPolicy::FailFast).unwrap(),
+                vec![new.clone()]
+            );
+
+            let off = ZshEmitter::emit_managed_block(StartupConfiguration::new(None, false));
+            editor.configure(&off).unwrap();
+            delete_profile_with_startup_guard_using(
+                &editor,
+                &operations,
+                &new,
+                InteractionPolicy::FailFast,
+            )
+            .unwrap();
+            assert!(
+                operations
+                    .list(InteractionPolicy::FailFast)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn failed_vault_rename_restores_the_previous_startup_reference() {
+            let test = TestDirectory::new();
+            let editor = test.editor();
+            let (keys, store) = initialized();
+            let operations = ProfileOperations::new(&keys, &store);
+            let old = ProfileName::new("work").unwrap();
+            let new = ProfileName::new("office").unwrap();
+            operations
+                .create(old.clone(), InteractionPolicy::FailFast)
+                .unwrap();
+            install_startup(&editor, &old);
+            store.fail_next_replacement(ReplacementFault::NotCommitted);
+
+            assert!(matches!(
+                rename_profile_and_startup_using(
+                    &editor,
+                    &operations,
+                    &old,
+                    new,
+                    InteractionPolicy::FailFast,
+                ),
+                Err(ProfileCommandError::Profile(
+                    ProfileOperationError::CommitNotCompleted
+                ))
+            ));
+            assert_eq!(
+                editor
+                    .inspect()
+                    .unwrap()
+                    .configuration()
+                    .and_then(StartupConfiguration::profile),
+                Some(&old)
+            );
+            assert_eq!(
+                operations.list(InteractionPolicy::FailFast).unwrap(),
+                vec![old]
+            );
+        }
+
+        #[test]
+        fn startup_success_output_distinguishes_edits_from_noops() {
+            let profile = ProfileName::new("work").unwrap();
+            let changed = StartupSuccess {
+                edit: ShellConfigEdit::Installed,
+                configuration: StartupConfiguration::new(Some(profile.clone()), true),
+                shortcut_conflict: false,
+            };
+            assert!(render_startup_success(&changed).contains("open a new shell"));
+
+            let unchanged = StartupSuccess {
+                edit: ShellConfigEdit::Unchanged,
+                configuration: StartupConfiguration::new(Some(profile), true),
+                shortcut_conflict: false,
+            };
+            assert!(!render_startup_success(&unchanged).contains("open a new shell"));
+        }
     }
 }

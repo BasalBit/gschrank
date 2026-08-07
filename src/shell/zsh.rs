@@ -7,6 +7,7 @@ use zeroize::Zeroizing;
 use crate::{
     EnvironmentName,
     shell::ShellEmitError,
+    shell_config::StartupConfiguration,
     shell_transition::{
         ACTIVE_PROFILE_NAME, ENV_PROTOCOL_NAME, ENV_PROTOCOL_VERSION, MANAGED_KEYS_NAME,
         ShellTransition,
@@ -19,12 +20,78 @@ const SOURCE_BASE_CAPACITY: usize = 2_048;
 const TARGET_CAPACITY: usize = 2_048;
 const VALUE_BYTE_CAPACITY: usize = 7;
 
+pub(crate) const ZSH_MANAGED_BLOCK_START: &[u8] = b"# >>> gschrank initialize v1 >>>";
+pub(crate) const ZSH_MANAGED_BLOCK_END: &[u8] = b"# <<< gschrank initialize v1 <<<";
+pub(crate) const ZSH_STARTUP_METADATA: &[u8] = b"# gschrank startup profile: ";
+pub(crate) const ZSH_SHORTCUT_METADATA: &[u8] = b"# gschrank shortcut: ";
+
+/// A complete non-secret block ready for safe placement in `.zshrc`.
+pub(crate) struct ZshManagedBlock {
+    configuration: StartupConfiguration,
+    source: Vec<u8>,
+}
+
+impl ZshManagedBlock {
+    pub(crate) fn configuration(&self) -> &StartupConfiguration {
+        &self.configuration
+    }
+
+    pub(crate) fn source(&self) -> &[u8] {
+        &self.source
+    }
+}
+
 /// Version-one Zsh source generator.
 pub(crate) struct ZshEmitter;
 
 impl ZshEmitter {
     pub(crate) const fn new() -> Self {
         Self
+    }
+
+    pub(crate) fn emit_managed_block(configuration: StartupConfiguration) -> ZshManagedBlock {
+        let mut source = Vec::with_capacity(8_192);
+        source.extend_from_slice(ZSH_MANAGED_BLOCK_START);
+        source.push(b'\n');
+        source.extend_from_slice(ZSH_STARTUP_METADATA);
+        match configuration.profile() {
+            Some(profile) => source.extend_from_slice(profile.as_str().as_bytes()),
+            None => source.push(b'-'),
+        }
+        source.push(b'\n');
+        source.extend_from_slice(ZSH_SHORTCUT_METADATA);
+        source.extend_from_slice(if configuration.shortcut() {
+            b"enabled"
+        } else {
+            b"disabled"
+        });
+        source.push(b'\n');
+        source.extend_from_slice(MANAGED_BLOCK_FUNCTIONS.as_bytes());
+        if configuration.shortcut() {
+            source.extend_from_slice(MANAGED_BLOCK_SHORTCUT_ENABLED.as_bytes());
+        } else {
+            source.extend_from_slice(MANAGED_BLOCK_SHORTCUT_DISABLED.as_bytes());
+        }
+        source.extend_from_slice(MANAGED_BLOCK_WRAPPER_INIT.as_bytes());
+        match configuration.profile() {
+            Some(profile) => {
+                source.extend_from_slice(b"  if ! gschrank load --startup -- '");
+                source.extend_from_slice(profile.as_str().as_bytes());
+                source.extend_from_slice(
+                    b"'; then\n    __gschrank_clear_inherited_v1 || :\n    builtin print -ru2 -- 'gschrank: startup profile failed; inherited profile cleanup attempted'\n  fi\n",
+                );
+            }
+            None => source.extend_from_slice(
+                b"  if ! __gschrank_clear_inherited_v1; then\n    builtin print -ru2 -- 'gschrank: inherited profile cleanup was incomplete; close the parent shell or unload manually'\n  fi\n",
+            ),
+        }
+        source.extend_from_slice(MANAGED_BLOCK_SUFFIX.as_bytes());
+        source.extend_from_slice(ZSH_MANAGED_BLOCK_END);
+        source.push(b'\n');
+        ZshManagedBlock {
+            configuration,
+            source,
+        }
     }
 }
 
@@ -357,6 +424,96 @@ const SHORTCUT_FUNCTION: &str = r#"function gsch {
 
 const WRAPPER_SUFFIX: &str = ":\n";
 
+const MANAGED_BLOCK_FUNCTIONS: &str = r#"function __gschrank_clear_inherited_v1 {
+  builtin emulate -L zsh
+  builtin unsetopt XTRACE VERBOSE
+  builtin typeset _gschrank_key_v1
+  builtin typeset -a _gschrank_keys_v1
+  builtin typeset -i _gschrank_cleanup_rc_v1=0
+  _gschrank_keys_v1=("${(@s.:.)GSCHRANK_MANAGED_KEYS}")
+  for _gschrank_key_v1 in "${_gschrank_keys_v1[@]}"; do
+    if [[ -n "$_gschrank_key_v1" && "$_gschrank_key_v1" != [0-9]* && "$_gschrank_key_v1" != *[^A-Za-z0-9_]* ]]; then
+      builtin unset -- "$_gschrank_key_v1" 2>/dev/null || _gschrank_cleanup_rc_v1=1
+    fi
+  done
+  builtin unset -- GSCHRANK_ENV_PROTOCOL 2>/dev/null || _gschrank_cleanup_rc_v1=1
+  builtin unset -- GSCHRANK_ACTIVE_PROFILE 2>/dev/null || _gschrank_cleanup_rc_v1=1
+  builtin unset -- GSCHRANK_MANAGED_KEYS 2>/dev/null || _gschrank_cleanup_rc_v1=1
+  return "$_gschrank_cleanup_rc_v1"
+}
+
+function __gschrank_initialize_v1 {
+  builtin emulate -L zsh
+  builtin unsetopt XTRACE VERBOSE
+  builtin typeset _gschrank_init_payload_v1=''
+  builtin typeset -a _gschrank_init_args_v1
+  builtin typeset -i _gschrank_use_shortcut_v1=0
+
+  if (( ${+aliases[gschrank]} || ${+builtins[gschrank]} || ${reswords[(Ie)gschrank]} != 0 )); then
+    __gschrank_clear_inherited_v1 || :
+    builtin print -ru2 -- 'gschrank: the canonical shell name is already in use; inherited profile cleanup attempted'
+    return 0
+  fi
+  if (( ${+functions[gschrank]} )) && [[ ${functions[gschrank]} != *'__gschrank_dispatch_v1 "$@"'* ]]; then
+    __gschrank_clear_inherited_v1 || :
+    builtin print -ru2 -- 'gschrank: the canonical shell name is already in use; inherited profile cleanup attempted'
+    return 0
+  fi
+  if (( ! ${+commands[gschrank]} )); then
+    __gschrank_clear_inherited_v1 || :
+    builtin print -ru2 -- 'gschrank: the executable is unavailable; inherited profile cleanup attempted'
+    return 0
+  fi
+"#;
+
+const MANAGED_BLOCK_SHORTCUT_ENABLED: &str = r#"
+  if (( ${+aliases[gsch]} || ${+builtins[gsch]} || ${reswords[(Ie)gsch]} != 0 || ${+commands[gsch]} )); then
+    if (( ${+functions[gsch]} )) && [[ ${functions[gsch]} == *'__gschrank_dispatch_v1 "$@"'* ]]; then
+      builtin unfunction -- gsch
+    fi
+    builtin print -ru2 -- "gschrank: the optional 'gsch' shortcut is already in use; continuing without it"
+  elif (( ${+functions[gsch]} )) && [[ ${functions[gsch]} != *'__gschrank_dispatch_v1 "$@"'* ]]; then
+    builtin print -ru2 -- "gschrank: the optional 'gsch' shortcut is already in use; continuing without it"
+  else
+    _gschrank_use_shortcut_v1=1
+  fi
+"#;
+
+const MANAGED_BLOCK_SHORTCUT_DISABLED: &str = r#"
+  if (( ${+functions[gsch]} )) && [[ ${functions[gsch]} == *'__gschrank_dispatch_v1 "$@"'* ]]; then
+    builtin unfunction -- gsch
+  fi
+"#;
+
+const MANAGED_BLOCK_WRAPPER_INIT: &str = r#"
+  if (( _gschrank_use_shortcut_v1 )); then
+    _gschrank_init_args_v1=(--shortcut)
+  else
+    _gschrank_init_args_v1=()
+  fi
+  if _gschrank_init_payload_v1="$(builtin command gschrank __shell-init zsh 1 "${_gschrank_init_args_v1[@]}")"; then
+    :
+  else
+    builtin unset _gschrank_init_payload_v1
+    __gschrank_clear_inherited_v1 || :
+    builtin print -ru2 -- 'gschrank: shell initialization failed; inherited profile cleanup attempted'
+    return 0
+  fi
+  if ! builtin eval -- "$_gschrank_init_payload_v1"; then
+    builtin unset _gschrank_init_payload_v1
+    __gschrank_clear_inherited_v1 || :
+    builtin print -ru2 -- 'gschrank: shell integration was rejected; inherited profile cleanup attempted'
+    return 0
+  fi
+  builtin unset _gschrank_init_payload_v1
+"#;
+
+const MANAGED_BLOCK_SUFFIX: &str = r"}
+
+__gschrank_initialize_v1
+builtin unfunction -- __gschrank_initialize_v1 __gschrank_clear_inherited_v1
+";
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -390,6 +547,12 @@ mod tests {
             fs::write(&executable, source).unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
             Self(directory)
+        }
+
+        fn add_executable(&self, name: &str, source: &str) {
+            let executable = self.0.join(name);
+            fs::write(&executable, source).unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         }
 
         fn path(&self) -> &Path {
@@ -449,6 +612,18 @@ mod tests {
 
     fn run_zsh(source: &[u8], suffix: &[u8]) -> std::process::Output {
         run_zsh_parts(b"", source, suffix)
+    }
+
+    fn check_zsh_syntax(source: &[u8]) -> std::process::Output {
+        let mut child = Command::new("/bin/zsh")
+            .args(["-n", "-f"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(source).unwrap();
+        child.wait_with_output().unwrap()
     }
 
     #[test]
@@ -610,6 +785,108 @@ mod tests {
         assert!(output.status.success(), "generated wrapper is invalid Zsh");
         assert!(output.stdout.is_empty());
         assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn managed_startup_blocks_are_valid_names_only_zsh_source() {
+        for configuration in [
+            StartupConfiguration::new(Some(ProfileName::new("work.dev").unwrap()), true),
+            StartupConfiguration::new(None, false),
+        ] {
+            let block = ZshEmitter::emit_managed_block(configuration.clone());
+            assert_eq!(block.configuration(), &configuration);
+            assert!(block.source().starts_with(ZSH_MANAGED_BLOCK_START));
+            assert!(block.source().ends_with(b"<<<\n"));
+            assert!(!block.source().windows(9).any(|bytes| bytes == b"API_TOKEN"));
+            let output = check_zsh_syntax(block.source());
+            assert!(output.status.success(), "managed block is invalid Zsh");
+            assert!(output.stdout.is_empty());
+            assert!(output.stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn startup_off_clears_inherited_values_but_keeps_the_wrapper() {
+        let fake = TestDirectory::with_fake_gschrank(
+            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-init ]]; then\n  builtin print -rn -- 'function __gschrank_dispatch_v1 { return 0; }; function gschrank { __gschrank_dispatch_v1 \"$@\"; };:'\n  exit 0\nfi\nexit 2\n",
+        );
+        let block = ZshEmitter::emit_managed_block(StartupConfiguration::new(None, false));
+        let output = run_zsh_parts_with_path(
+            b"builtin export OLD_VALUE=CANARY-inherited GSCHRANK_ENV_PROTOCOL=1 GSCHRANK_ACTIVE_PROFILE=old GSCHRANK_MANAGED_KEYS=OLD_VALUE\n",
+            block.source(),
+            b"for _gschrank_test_name in OLD_VALUE GSCHRANK_ENV_PROTOCOL GSCHRANK_ACTIVE_PROFILE GSCHRANK_MANAGED_KEYS; do\n  if builtin command /usr/bin/printenv $_gschrank_test_name >/dev/null; then exit 91; fi\ndone\n(( ${+functions[gschrank]} )) || exit 92\n",
+            Some(fake.path()),
+        );
+        assert!(output.status.success(), "startup-off fixture failed");
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn failed_automatic_startup_attempts_fail_closed_and_leave_zsh_open() {
+        let fake = TestDirectory::with_fake_gschrank(
+            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-init ]]; then\n  builtin print -rn -- 'function __gschrank_dispatch_v1 { return 42; }; function gschrank { __gschrank_dispatch_v1 \"$@\"; };:'\n  exit 0\nfi\nexit 2\n",
+        );
+        let block = ZshEmitter::emit_managed_block(StartupConfiguration::new(
+            Some(ProfileName::new("work").unwrap()),
+            false,
+        ));
+        let output = run_zsh_parts_with_path(
+            b"builtin export OLD_VALUE=CANARY-inherited GSCHRANK_ENV_PROTOCOL=1 GSCHRANK_ACTIVE_PROFILE=old GSCHRANK_MANAGED_KEYS=OLD_VALUE\n",
+            block.source(),
+            b"if builtin command /usr/bin/printenv OLD_VALUE >/dev/null; then exit 93; fi\nbuiltin print -r -- shell-opened\n",
+            Some(fake.path()),
+        );
+        assert!(output.status.success(), "failed-startup fixture closed Zsh");
+        assert_eq!(output.stdout, b"shell-opened\n");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("startup profile failed"));
+        assert!(
+            !output
+                .stderr
+                .windows(b"CANARY-inherited".len())
+                .any(|window| window == b"CANARY-inherited")
+        );
+    }
+
+    #[test]
+    fn managed_block_never_evaluates_partial_output_from_failed_wrapper_initialization() {
+        let fake = TestDirectory::with_fake_gschrank(
+            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-init ]]; then\n  builtin print -rn -- 'function gschrank { builtin export SHOULD_NOT_APPLY=partial; };'\n  exit 42\nfi\nexit 2\n",
+        );
+        let block = ZshEmitter::emit_managed_block(StartupConfiguration::new(None, false));
+        let output = run_zsh_parts_with_path(
+            b"builtin export OLD_VALUE=CANARY-inherited GSCHRANK_ENV_PROTOCOL=1 GSCHRANK_ACTIVE_PROFILE=old GSCHRANK_MANAGED_KEYS=OLD_VALUE\n",
+            block.source(),
+            b"if (( ${+parameters[SHOULD_NOT_APPLY]} )); then exit 94; fi\nif builtin command /usr/bin/printenv OLD_VALUE >/dev/null; then exit 95; fi\nbuiltin print -r -- shell-opened\n",
+            Some(fake.path()),
+        );
+        assert!(output.status.success(), "wrapper-init failure closed Zsh");
+        assert_eq!(output.stdout, b"shell-opened\n");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("shell initialization failed"));
+        assert!(
+            !output
+                .stderr
+                .windows(b"CANARY-inherited".len())
+                .any(|window| window == b"CANARY-inherited")
+        );
+    }
+
+    #[test]
+    fn a_late_shortcut_conflict_is_not_shadowed_at_shell_startup() {
+        let fake = TestDirectory::with_fake_gschrank(
+            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-init ]]; then\n  if [[ \"$4\" == --shortcut ]]; then\n    builtin print -rn -- 'function __gschrank_dispatch_v1 { return 0; }; function gschrank { __gschrank_dispatch_v1 \"$@\"; }; function gsch { __gschrank_dispatch_v1 \"$@\"; };:'\n  else\n    builtin print -rn -- 'function __gschrank_dispatch_v1 { return 0; }; function gschrank { __gschrank_dispatch_v1 \"$@\"; };:'\n  fi\n  exit 0\nfi\nexit 2\n",
+        );
+        fake.add_executable("gsch", "#!/bin/zsh -f\nbuiltin print -r -- external-gsch\n");
+        let block = ZshEmitter::emit_managed_block(StartupConfiguration::new(None, true));
+        let output = run_zsh_parts_with_path(
+            b"",
+            block.source(),
+            b"if (( ${+functions[gsch]} )); then exit 96; fi\nbuiltin command gsch\n",
+            Some(fake.path()),
+        );
+        assert!(output.status.success(), "shortcut-conflict fixture failed");
+        assert_eq!(output.stdout, b"external-gsch\n");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("shortcut is already in use"));
     }
 
     #[test]
