@@ -16,8 +16,8 @@ use crate::{
     init::{InitOutcome, Initializer},
     key_provider::InteractionPolicy,
     profiles::{
-        ImportOperationError, ProfileInspection, ProfileOperationError, ProfileOperations,
-        VaultInspection, VaultReadiness,
+        BackupReceipt, ImportOperationError, ProfileInspection, ProfileOperationError,
+        ProfileOperations, VaultInspection, VaultReadiness,
     },
     secret_input::{SecretInputMode, read_secret},
     set_command::execute_set,
@@ -31,9 +31,9 @@ use crate::{
 
 #[cfg(target_os = "macos")]
 use crate::platform::macos::{
-    LocalVaultStore, MacOsKeychainProvider, MacOsPathError, MacOsPaths, PreferenceError,
-    ShellPreferenceStore, ShellPreferences, ShortcutDiagnostic, ZshConfigEditor, ZshConfigError,
-    ZshDiagnostic,
+    EncryptedBackupWriter, LocalVaultStore, MacOsKeychainProvider, MacOsPathError, MacOsPaths,
+    PreferenceError, ShellPreferenceStore, ShellPreferences, ShortcutDiagnostic, ZshConfigEditor,
+    ZshConfigError, ZshDiagnostic,
 };
 
 const HELP: &str = concat!(
@@ -48,6 +48,7 @@ Usage:
   gschrank init
   gschrank status
   gschrank doctor
+  gschrank backup <absolute-destination>
   gschrank import dotenv <profile> [--dry-run] [--replace-existing]
   gschrank profile create <profile>
   gschrank profile rename <old> <new>
@@ -69,6 +70,7 @@ Commands:
   init       Create an empty encrypted vault, or validate the existing vault
   status     Show authenticated names-only vault and current-shell state
   doctor     Check vault and shell readiness without showing decrypted names
+  backup     Create a Keychain-bound encrypted vault backup without overwriting
   import     Add a strict stdin-only dotenv document to an existing profile
   profile    Create, rename, delete, list, or inspect profiles
   set        Create or update a variable using hidden or explicit stdin input
@@ -92,6 +94,7 @@ enum Command {
     Init,
     Status,
     Doctor,
+    Backup(PathBuf),
     Import {
         profile: ProfileName,
         options: ImportOptions,
@@ -374,6 +377,7 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
         Ok(Command::Init) => run_init(),
         Ok(Command::Status) => run_status(),
         Ok(Command::Doctor) => run_doctor(),
+        Ok(Command::Backup(destination)) => run_backup(destination),
         Ok(Command::Import { profile, options }) => run_import(&profile, options),
         Ok(Command::Profile(command)) => run_profile(command),
         Ok(Command::Set {
@@ -407,6 +411,9 @@ fn parse(arguments: &[OsString]) -> Result<Command, ParseError> {
         [argument] if argument == "init" => Ok(Command::Init),
         [argument] if argument == "status" => Ok(Command::Status),
         [argument] if argument == "doctor" => Ok(Command::Doctor),
+        [backup, destination] if backup == "backup" => {
+            Ok(Command::Backup(PathBuf::from(destination)))
+        }
         [import, dotenv, arguments @ ..] if import == "import" && dotenv == "dotenv" => {
             parse_import(arguments)
         }
@@ -801,6 +808,41 @@ fn run_doctor() -> ExitCode {
     print!("{}", render_doctor(&report));
     report_diagnostic_errors(&report.vault, &report.shell, &report.current_shell);
     ExitCode::from(report.exit_code())
+}
+
+#[cfg(target_os = "macos")]
+fn run_backup(destination: PathBuf) -> ExitCode {
+    let paths = match MacOsPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(13);
+        }
+    };
+    let keys = MacOsKeychainProvider::new();
+    let store = LocalVaultStore::new(paths.data_directory().to_owned());
+    let operations = ProfileOperations::new(&keys, &store);
+    let writer = EncryptedBackupWriter::new(destination);
+    match operations.backup_to(interaction_policy(), |envelope| writer.create(envelope)) {
+        Ok(receipt) => {
+            print!("{}", render_backup_success(receipt));
+            eprintln!(
+                "gschrank: this backup requires its exact macOS Keychain item; no master key was exported"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
+fn render_backup_success(receipt: BackupReceipt) -> String {
+    format!(
+        "Created an encrypted vault backup at revision {}.\n",
+        receipt.revision
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -1809,6 +1851,12 @@ fn run_doctor() -> ExitCode {
 }
 
 #[cfg(not(target_os = "macos"))]
+fn run_backup(_destination: PathBuf) -> ExitCode {
+    eprintln!("gschrank: this build does not support encrypted backups on this platform");
+    ExitCode::from(1)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn run_profile(_command: ProfileCommand) -> ExitCode {
     eprintln!("gschrank: this build does not support encrypted profiles on this platform");
     ExitCode::from(1)
@@ -1945,6 +1993,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_only_the_exact_backup_grammar() {
+        assert!(matches!(
+            parse(&["backup".into(), "/tmp/vault.backup".into()]),
+            Ok(Command::Backup(_))
+        ));
+        assert!(parse(&["backup".into()]).is_err());
+        assert!(parse(&["backup".into(), "/tmp/vault.backup".into(), "extra".into()]).is_err());
+    }
+
+    #[test]
     fn parses_the_exact_guided_configuration_grammar() {
         assert!(matches!(
             parse(&["config".into()]),
@@ -2033,6 +2091,18 @@ mod tests {
         assert!(output.contains("REPLACED"));
         assert!(!output.contains("value"));
         assert!(!output.contains("CANARY"));
+    }
+
+    #[test]
+    fn backup_success_reports_only_safe_revision_metadata() {
+        let output = render_backup_success(BackupReceipt { revision: 42 });
+        assert_eq!(
+            output,
+            "Created an encrypted vault backup at revision 42.\n"
+        );
+        assert!(!output.contains("CANARY"));
+        assert!(!output.contains("key"));
+        assert!(!output.contains("value"));
     }
 
     #[test]

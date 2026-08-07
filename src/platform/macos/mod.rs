@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+mod backup;
 mod keychain;
 mod paths;
 mod preferences;
@@ -12,6 +13,7 @@ mod system;
 #[allow(unsafe_code)]
 mod terminal;
 
+pub(crate) use backup::EncryptedBackupWriter;
 pub(crate) use keychain::MacOsKeychainProvider;
 pub(crate) use paths::{MacOsPathError, MacOsPaths};
 pub(crate) use preferences::{PreferenceError, ShellPreferenceStore, ShellPreferences};

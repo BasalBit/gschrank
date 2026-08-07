@@ -2,6 +2,8 @@
 
 use std::{error::Error, fmt};
 
+use zeroize::Zeroizing;
+
 use crate::{
     DomainError, EnvelopeError, EnvironmentName, KeyId, MasterKey, Mutation, ProfileName,
     SecretValue, Vault, VaultId,
@@ -33,6 +35,96 @@ pub(crate) struct VaultInspection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct VaultReadiness {
     pub(crate) revision: u64,
+}
+
+/// Safe metadata confirming an exact authenticated encrypted backup copy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackupReceipt {
+    pub(crate) revision: u64,
+}
+
+/// Portable, value-free failure categories for a user-selected backup path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackupDestinationError {
+    UnsafePath,
+    UnsupportedStorage,
+    AlreadyExists,
+    PermissionDenied,
+    IoFailure,
+    OutcomeIndeterminate,
+}
+
+impl BackupDestinationError {
+    pub(crate) const fn exit_code(self) -> u8 {
+        match self {
+            Self::UnsafePath | Self::UnsupportedStorage | Self::PermissionDenied => 13,
+            Self::AlreadyExists => 14,
+            Self::OutcomeIndeterminate => 15,
+            Self::IoFailure => 1,
+        }
+    }
+}
+
+impl fmt::Display for BackupDestinationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsafePath => "the backup destination path is unsafe",
+            Self::UnsupportedStorage => "the backup destination is not on supported local APFS storage",
+            Self::AlreadyExists => "the backup destination already exists; it was not replaced",
+            Self::PermissionDenied => "permission to create the encrypted backup was denied",
+            Self::IoFailure => "the encrypted backup could not be created",
+            Self::OutcomeIndeterminate => {
+                "the backup creation outcome is indeterminate; inspect the destination before retrying"
+            }
+        })
+    }
+}
+
+impl Error for BackupDestinationError {}
+
+/// A value-free authenticated backup failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackupOperationError {
+    Profile(ProfileOperationError),
+    Destination(BackupDestinationError),
+}
+
+impl BackupOperationError {
+    pub(crate) const fn exit_code(self) -> u8 {
+        match self {
+            Self::Profile(error) => error.exit_code(),
+            Self::Destination(error) => error.exit_code(),
+        }
+    }
+}
+
+impl fmt::Display for BackupOperationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Profile(error) => error.fmt(formatter),
+            Self::Destination(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for BackupOperationError {}
+
+impl From<ProfileOperationError> for BackupOperationError {
+    fn from(error: ProfileOperationError) -> Self {
+        Self::Profile(error)
+    }
+}
+
+impl From<BackupDestinationError> for BackupOperationError {
+    fn from(error: BackupDestinationError) -> Self {
+        Self::Destination(error)
+    }
+}
+
+impl From<VaultStoreError> for BackupOperationError {
+    fn from(error: VaultStoreError) -> Self {
+        Self::Profile(error.into())
+    }
 }
 
 /// Safe metadata confirming an authenticated vault mutation.
@@ -448,6 +540,26 @@ where
         })
     }
 
+    pub(crate) fn backup_to(
+        &self,
+        interaction: InteractionPolicy,
+        destination: impl FnOnce(&[u8]) -> Result<(), BackupDestinationError>,
+    ) -> Result<BackupReceipt, BackupOperationError> {
+        self.store.shared_read(|read| {
+            let (opened, key, envelope) = self.open_current_with_envelope(read, interaction)?;
+            let receipt = BackupReceipt {
+                revision: opened.vault.revision(),
+            };
+            // The destination needs only the already-authenticated ciphertext.
+            // Drop decrypted values and key material before filesystem I/O while
+            // retaining the shared vault lock for the exact snapshot copy.
+            drop(opened);
+            drop(key);
+            destination(&envelope)?;
+            Ok(receipt)
+        })
+    }
+
     pub(crate) fn snapshot(
         &self,
         profile: &ProfileName,
@@ -495,6 +607,15 @@ where
         read: &mut dyn VaultRead,
         interaction: InteractionPolicy,
     ) -> Result<(crate::OpenedVault, MasterKey), ProfileOperationError> {
+        let (opened, key, _envelope) = self.open_current_with_envelope(read, interaction)?;
+        Ok((opened, key))
+    }
+
+    fn open_current_with_envelope(
+        &self,
+        read: &mut dyn VaultRead,
+        interaction: InteractionPolicy,
+    ) -> Result<(crate::OpenedVault, MasterKey, Zeroizing<Vec<u8>>), ProfileOperationError> {
         let envelope = read
             .read_live()?
             .ok_or(ProfileOperationError::NotInitialized)?;
@@ -504,7 +625,7 @@ where
             .load(&metadata.key_id, interaction)
             .map_err(ProfileOperationError::from_key_provider)?;
         let opened = open_envelope(&envelope, &key)?;
-        Ok((opened, key))
+        Ok((opened, key, envelope))
     }
 
     fn verify_commit(
