@@ -12,7 +12,8 @@ use zeroize::Zeroizing;
 use crate::{
     MAX_ENVELOPE_SIZE,
     vault_store::{
-        CommitOutcome, VaultRead, VaultStore, VaultStoreError, VaultStoreErrorKind,
+        CommitOutcome, RecoveryArtifacts, RecoveryBundle, RecoveryBundleId, RecoveryBundleMetadata,
+        RecoveryReason, VaultRead, VaultStore, VaultStoreError, VaultStoreErrorKind,
         VaultTransaction,
     },
 };
@@ -22,6 +23,15 @@ use super::system;
 const LIVE_FILE: &str = "vault";
 const LOCK_FILE: &str = "vault.lock";
 const INIT_PENDING_FILE: &str = "vault.init.pending";
+const RECOVERY_DIRECTORY: &str = "recovery";
+const RECOVERY_MANIFEST_FILE: &str = "manifest";
+const RECOVERY_LIVE_FILE: &str = "vault";
+const RECOVERY_INIT_FILE: &str = "vault.init.pending";
+const RECOVERY_MANIFEST_MAGIC: &[u8; 8] = b"GSCHRCV1";
+const RECOVERY_MANIFEST_VERSION: u16 = 1;
+const RECOVERY_MANIFEST_LENGTH: usize = 40;
+const RECOVERY_FLAG_LIVE: u8 = 0b0000_0001;
+const RECOVERY_FLAG_INIT: u8 = 0b0000_0010;
 const TEMP_ATTEMPTS: usize = 16;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -42,12 +52,14 @@ impl LocalVaultStore {
     }
 
     fn prepare_directory(&self, create: bool) -> Result<(), VaultStoreError> {
+        let mut created = false;
         match fs::symlink_metadata(&self.directory) {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
                 let mut builder = DirBuilder::new();
                 builder.mode(0o700);
                 builder.create(&self.directory).map_err(map_directory_io)?;
+                created = true;
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Err(VaultStoreError::new(VaultStoreErrorKind::MissingState));
@@ -61,6 +73,14 @@ impl LocalVaultStore {
             return Err(VaultStoreError::new(
                 VaultStoreErrorKind::UnsupportedStorage,
             ));
+        }
+        if created {
+            let parent = self
+                .directory
+                .parent()
+                .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::UnsafePath))?;
+            sync_directory(parent)
+                .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::OutcomeIndeterminate))?;
         }
         Ok(())
     }
@@ -142,13 +162,17 @@ impl VaultRead for LocalTransaction<'_> {
     fn read_live(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError> {
         read_artifact(self.directory, LIVE_FILE)
     }
-}
 
-impl VaultTransaction for LocalTransaction<'_> {
     fn read_init_pending(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError> {
         read_artifact(self.directory, INIT_PENDING_FILE)
     }
 
+    fn read_recovery_bundles(&mut self) -> Result<Vec<RecoveryBundle>, VaultStoreError> {
+        read_recovery_bundles(self.directory)
+    }
+}
+
+impl VaultTransaction for LocalTransaction<'_> {
     fn create_init_pending(&mut self, envelope: &[u8]) -> Result<(), VaultStoreError> {
         if artifact_exists(self.directory, LIVE_FILE)?
             || artifact_exists(self.directory, INIT_PENDING_FILE)?
@@ -168,22 +192,28 @@ impl VaultTransaction for LocalTransaction<'_> {
         if read_artifact(self.directory, INIT_PENDING_FILE)?.is_none() {
             return Ok(());
         }
-        fs::remove_file(self.directory.join(INIT_PENDING_FILE)).map_err(map_file_io)
+        fs::remove_file(self.directory.join(INIT_PENDING_FILE)).map_err(map_file_io)?;
+        sync_directory(self.directory)
+            .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::OutcomeIndeterminate))
     }
 
     fn promote_init_pending(&mut self) -> Result<CommitOutcome, VaultStoreError> {
         if artifact_exists(self.directory, LIVE_FILE)? {
             return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
         }
-        if read_artifact(self.directory, INIT_PENDING_FILE)?.is_none() {
-            return Err(VaultStoreError::new(VaultStoreErrorKind::MissingState));
-        }
-
+        let pending = read_artifact(self.directory, INIT_PENDING_FILE)?
+            .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::MissingState))?;
         match fs::rename(
             self.directory.join(INIT_PENDING_FILE),
             self.directory.join(LIVE_FILE),
         ) {
-            Ok(()) => Ok(CommitOutcome::Committed),
+            Ok(()) => {
+                sync_directory(self.directory)
+                    .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::OutcomeIndeterminate))?;
+                verify_artifact(self.directory, LIVE_FILE, &pending)
+                    .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::OutcomeIndeterminate))?;
+                Ok(CommitOutcome::Committed)
+            }
             Err(error) => Err(map_file_io(error)),
         }
     }
@@ -195,6 +225,14 @@ impl VaultTransaction for LocalTransaction<'_> {
             envelope,
             DestinationState::Present,
         )
+    }
+
+    fn preserve_recovery(
+        &mut self,
+        metadata: RecoveryBundleMetadata,
+        artifacts: RecoveryArtifacts<'_>,
+    ) -> Result<CommitOutcome, VaultStoreError> {
+        preserve_recovery_bundle(self.directory, metadata, artifacts)
     }
 }
 
@@ -274,6 +312,10 @@ fn durably_install(
             drop(file);
             validate_destination_state(directory, destination, destination_state)?;
             fs::rename(&temporary_path, directory.join(destination)).map_err(map_file_io)?;
+            sync_directory(directory)
+                .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::OutcomeIndeterminate))?;
+            verify_artifact(directory, destination, envelope)
+                .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::OutcomeIndeterminate))?;
             Ok(CommitOutcome::Committed)
         })();
 
@@ -284,6 +326,303 @@ fn durably_install(
     }
 
     Err(VaultStoreError::new(VaultStoreErrorKind::Conflict))
+}
+
+#[allow(dead_code)]
+fn preserve_recovery_bundle(
+    directory: &Path,
+    metadata: RecoveryBundleMetadata,
+    artifacts: RecoveryArtifacts<'_>,
+) -> Result<CommitOutcome, VaultStoreError> {
+    if artifacts.live.is_none() && artifacts.init_pending.is_none() {
+        return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+    }
+    for envelope in [artifacts.live, artifacts.init_pending]
+        .into_iter()
+        .flatten()
+    {
+        if envelope.len() > MAX_ENVELOPE_SIZE {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::IoFailure));
+        }
+    }
+
+    let recovery = ensure_recovery_directory(directory)?;
+    let _existing = read_recovery_bundles(directory)?;
+    let bundle_name = metadata.id.to_hex();
+    let destination = recovery.join(&bundle_name);
+    match fs::symlink_metadata(&destination) {
+        Ok(existing) => {
+            validate_directory(&existing)?;
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(map_directory_io(error)),
+    }
+
+    let temporary = recovery.join(format!(".gschrank-recovery-{bundle_name}.pending"));
+    let mut builder = DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(&temporary).map_err(map_directory_io)?;
+    validate_directory(&fs::symlink_metadata(&temporary).map_err(map_directory_io)?)?;
+
+    let prepare_result = (|| {
+        if let Some(live) = artifacts.live {
+            write_new_synced(&temporary, RECOVERY_LIVE_FILE, live)?;
+        }
+        if let Some(pending) = artifacts.init_pending {
+            write_new_synced(&temporary, RECOVERY_INIT_FILE, pending)?;
+        }
+        let manifest = encode_recovery_manifest(metadata, artifacts);
+        write_new_synced(&temporary, RECOVERY_MANIFEST_FILE, &manifest)?;
+        sync_directory(&temporary).map_err(map_directory_io)
+    })();
+    if let Err(error) = prepare_result {
+        cleanup_recovery_temporary(&temporary);
+        return Err(error);
+    }
+
+    if let Err(error) = fs::rename(&temporary, &destination) {
+        cleanup_recovery_temporary(&temporary);
+        return Err(map_directory_io(error));
+    }
+    sync_directory(&recovery)
+        .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::OutcomeIndeterminate))?;
+    let committed = read_recovery_bundle(&destination, metadata.id)
+        .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::OutcomeIndeterminate))?;
+    if committed.metadata != metadata
+        || committed.live.as_ref().map(|bytes| bytes.as_slice()) != artifacts.live
+        || committed
+            .init_pending
+            .as_ref()
+            .map(|bytes| bytes.as_slice())
+            != artifacts.init_pending
+    {
+        return Err(VaultStoreError::new(
+            VaultStoreErrorKind::OutcomeIndeterminate,
+        ));
+    }
+    Ok(CommitOutcome::Committed)
+}
+
+#[allow(dead_code)]
+fn ensure_recovery_directory(directory: &Path) -> Result<PathBuf, VaultStoreError> {
+    let recovery = directory.join(RECOVERY_DIRECTORY);
+    match fs::symlink_metadata(&recovery) {
+        Ok(metadata) => validate_directory(&metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(&recovery).map_err(map_directory_io)?;
+            validate_directory(&fs::symlink_metadata(&recovery).map_err(map_directory_io)?)?;
+            sync_directory(directory).map_err(map_directory_io)?;
+        }
+        Err(error) => return Err(map_directory_io(error)),
+    }
+    Ok(recovery)
+}
+
+fn read_recovery_bundles(directory: &Path) -> Result<Vec<RecoveryBundle>, VaultStoreError> {
+    let recovery = directory.join(RECOVERY_DIRECTORY);
+    match fs::symlink_metadata(&recovery) {
+        Ok(metadata) => validate_directory(&metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(map_directory_io(error)),
+    }
+
+    let mut bundles = Vec::new();
+    for entry in fs::read_dir(&recovery).map_err(map_directory_io)? {
+        let entry = entry.map_err(map_directory_io)?;
+        let entry_metadata = fs::symlink_metadata(entry.path()).map_err(map_directory_io)?;
+        validate_directory(&entry_metadata)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))?;
+        let id = parse_recovery_bundle_id(&name)?;
+        bundles.push(read_recovery_bundle(&entry.path(), id)?);
+    }
+    bundles.sort_by_key(|bundle| (bundle.metadata.created_at_unix_seconds, bundle.metadata.id));
+    Ok(bundles)
+}
+
+fn read_recovery_bundle(
+    directory: &Path,
+    expected_id: RecoveryBundleId,
+) -> Result<RecoveryBundle, VaultStoreError> {
+    validate_directory(&fs::symlink_metadata(directory).map_err(map_directory_io)?)?;
+    let manifest = read_exact_file(directory, RECOVERY_MANIFEST_FILE, RECOVERY_MANIFEST_LENGTH)?;
+    let (metadata, flags) = decode_recovery_manifest(&manifest)?;
+    if metadata.id != expected_id {
+        return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+    }
+
+    let live = if flags & RECOVERY_FLAG_LIVE != 0 {
+        Some(
+            read_artifact(directory, RECOVERY_LIVE_FILE)?
+                .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::Conflict))?,
+        )
+    } else {
+        None
+    };
+    let init_pending = if flags & RECOVERY_FLAG_INIT != 0 {
+        Some(
+            read_artifact(directory, RECOVERY_INIT_FILE)?
+                .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::Conflict))?,
+        )
+    } else {
+        None
+    };
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(directory).map_err(map_directory_io)? {
+        let entry = entry.map_err(map_directory_io)?;
+        entries.push(
+            entry
+                .file_name()
+                .into_string()
+                .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))?,
+        );
+    }
+    entries.sort();
+    let mut expected = vec![RECOVERY_MANIFEST_FILE];
+    if live.is_some() {
+        expected.push(RECOVERY_LIVE_FILE);
+    }
+    if init_pending.is_some() {
+        expected.push(RECOVERY_INIT_FILE);
+    }
+    expected.sort_unstable();
+    if entries != expected {
+        return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+    }
+    Ok(RecoveryBundle {
+        metadata,
+        live,
+        init_pending,
+    })
+}
+
+#[allow(dead_code)]
+fn encode_recovery_manifest(
+    metadata: RecoveryBundleMetadata,
+    artifacts: RecoveryArtifacts<'_>,
+) -> [u8; RECOVERY_MANIFEST_LENGTH] {
+    let mut bytes = [0_u8; RECOVERY_MANIFEST_LENGTH];
+    bytes[..8].copy_from_slice(RECOVERY_MANIFEST_MAGIC);
+    bytes[8..10].copy_from_slice(&RECOVERY_MANIFEST_VERSION.to_be_bytes());
+    bytes[10] = match metadata.reason {
+        RecoveryReason::Restore => 1,
+        RecoveryReason::Reset => 2,
+        RecoveryReason::Rebuild => 3,
+    };
+    bytes[11] = (u8::from(artifacts.live.is_some()) * RECOVERY_FLAG_LIVE)
+        | (u8::from(artifacts.init_pending.is_some()) * RECOVERY_FLAG_INIT);
+    bytes[12..20].copy_from_slice(&metadata.created_at_unix_seconds.to_be_bytes());
+    bytes[20..36].copy_from_slice(metadata.id.as_bytes());
+    bytes
+}
+
+fn decode_recovery_manifest(bytes: &[u8]) -> Result<(RecoveryBundleMetadata, u8), VaultStoreError> {
+    if bytes.len() != RECOVERY_MANIFEST_LENGTH
+        || &bytes[..8] != RECOVERY_MANIFEST_MAGIC
+        || u16::from_be_bytes([bytes[8], bytes[9]]) != RECOVERY_MANIFEST_VERSION
+        || bytes[36..].iter().any(|byte| *byte != 0)
+    {
+        return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+    }
+    let reason = match bytes[10] {
+        1 => RecoveryReason::Restore,
+        2 => RecoveryReason::Reset,
+        3 => RecoveryReason::Rebuild,
+        _ => return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict)),
+    };
+    let flags = bytes[11];
+    if flags == 0 || flags & !(RECOVERY_FLAG_LIVE | RECOVERY_FLAG_INIT) != 0 {
+        return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+    }
+    let created_at_unix_seconds = u64::from_be_bytes(
+        bytes[12..20]
+            .try_into()
+            .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))?,
+    );
+    let id = RecoveryBundleId::from_bytes(
+        bytes[20..36]
+            .try_into()
+            .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))?,
+    );
+    Ok((
+        RecoveryBundleMetadata {
+            id,
+            created_at_unix_seconds,
+            reason,
+        },
+        flags,
+    ))
+}
+
+fn parse_recovery_bundle_id(name: &str) -> Result<RecoveryBundleId, VaultStoreError> {
+    RecoveryBundleId::from_hex(name)
+        .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::Conflict))
+}
+
+#[allow(dead_code)]
+fn write_new_synced(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), VaultStoreError> {
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let mut file = options.open(directory.join(name)).map_err(map_file_io)?;
+    validate_regular_file(&file.metadata().map_err(map_file_io)?)?;
+    file.write_all(bytes).map_err(map_file_io)?;
+    file.flush().map_err(map_file_io)?;
+    system::full_sync(&file).map_err(map_file_io)
+}
+
+fn read_exact_file(
+    directory: &Path,
+    name: &str,
+    expected_length: usize,
+) -> Result<Vec<u8>, VaultStoreError> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let mut file = options.open(directory.join(name)).map_err(map_file_io)?;
+    let metadata = file.metadata().map_err(map_file_io)?;
+    validate_regular_file(&metadata)?;
+    if metadata.len() != expected_length as u64 {
+        return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+    }
+    let mut bytes = Vec::with_capacity(expected_length);
+    file.read_to_end(&mut bytes).map_err(map_file_io)?;
+    Ok(bytes)
+}
+
+#[allow(dead_code)]
+fn cleanup_recovery_temporary(directory: &Path) {
+    for name in [
+        RECOVERY_MANIFEST_FILE,
+        RECOVERY_LIVE_FILE,
+        RECOVERY_INIT_FILE,
+    ] {
+        let _ = fs::remove_file(directory.join(name));
+    }
+    let _ = fs::remove_dir(directory);
+}
+
+fn verify_artifact(directory: &Path, name: &str, expected: &[u8]) -> Result<(), VaultStoreError> {
+    let actual = read_artifact(directory, name)?
+        .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::MissingState))?;
+    if actual.as_slice() == expected {
+        Ok(())
+    } else {
+        Err(VaultStoreError::new(VaultStoreErrorKind::IoFailure))
+    }
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
 }
 
 fn validate_destination_state(
@@ -385,7 +724,11 @@ mod tests {
         init::{InitOutcome, Initializer},
         key_provider::InteractionPolicy,
         profiles::{ProfileOperationError, ProfileOperations},
+        recovery::{RecoveryAuthentication, RecoveryOperations},
         testing::MemoryKeyProvider,
+        vault_store::{
+            RecoveryArtifacts, RecoveryBundleId, RecoveryBundleMetadata, RecoveryReason,
+        },
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -459,6 +802,214 @@ mod tests {
             );
         }
         assert!(!test.data().join(INIT_PENDING_FILE).exists());
+    }
+
+    #[test]
+    fn preserves_exact_recovery_bundles_with_restrictive_durable_structure() {
+        let test = TestDirectory::new();
+        let store = LocalVaultStore::new(test.data());
+        let metadata = RecoveryBundleMetadata {
+            id: RecoveryBundleId::from_bytes([0x5a; 16]),
+            created_at_unix_seconds: 1_765_000_000,
+            reason: RecoveryReason::Reset,
+        };
+        let live = b"opaque-live-envelope";
+        let pending = b"opaque-init-envelope";
+
+        store
+            .initialization_transaction::<_, VaultStoreError, _>(|transaction| {
+                assert_eq!(
+                    transaction.preserve_recovery(
+                        metadata,
+                        RecoveryArtifacts {
+                            live: Some(live),
+                            init_pending: Some(pending),
+                        },
+                    )?,
+                    CommitOutcome::Committed
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let bundles = store
+            .shared_read::<_, VaultStoreError, _>(|read| read.read_recovery_bundles())
+            .unwrap();
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].metadata, metadata);
+        assert_eq!(bundles[0].live.as_ref().unwrap().as_slice(), live);
+        assert_eq!(
+            bundles[0].init_pending.as_ref().unwrap().as_slice(),
+            pending
+        );
+
+        let recovery = test.data().join(RECOVERY_DIRECTORY);
+        let bundle = recovery.join(metadata.id.to_hex());
+        assert_eq!(
+            fs::metadata(&recovery).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&bundle).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for name in [
+            RECOVERY_MANIFEST_FILE,
+            RECOVERY_LIVE_FILE,
+            RECOVERY_INIT_FILE,
+        ] {
+            assert_eq!(
+                fs::metadata(bundle.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(fs::read_dir(recovery).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn recovery_manifest_round_trips_all_reasons_and_rejects_noncanonical_bytes() {
+        for (reason, expected_reason) in [
+            (RecoveryReason::Restore, RecoveryReason::Restore),
+            (RecoveryReason::Reset, RecoveryReason::Reset),
+            (RecoveryReason::Rebuild, RecoveryReason::Rebuild),
+        ] {
+            let metadata = RecoveryBundleMetadata {
+                id: RecoveryBundleId::from_bytes([9; 16]),
+                created_at_unix_seconds: u64::MAX,
+                reason,
+            };
+            let artifacts = RecoveryArtifacts {
+                live: Some(b"live"),
+                init_pending: Some(b"pending"),
+            };
+            let encoded = encode_recovery_manifest(metadata, artifacts);
+            let (decoded, flags) = decode_recovery_manifest(&encoded).unwrap();
+            assert_eq!(decoded.reason, expected_reason);
+            assert_eq!(decoded, metadata);
+            assert_eq!(flags, RECOVERY_FLAG_LIVE | RECOVERY_FLAG_INIT);
+        }
+
+        let metadata = RecoveryBundleMetadata {
+            id: RecoveryBundleId::from_bytes([1; 16]),
+            created_at_unix_seconds: 1,
+            reason: RecoveryReason::Restore,
+        };
+        let mut noncanonical = encode_recovery_manifest(
+            metadata,
+            RecoveryArtifacts {
+                live: Some(b"live"),
+                init_pending: None,
+            },
+        );
+        noncanonical[39] = 1;
+        assert!(decode_recovery_manifest(&noncanonical).is_err());
+        noncanonical[39] = 0;
+        noncanonical[11] = 0;
+        assert!(decode_recovery_manifest(&noncanonical).is_err());
+    }
+
+    #[test]
+    fn authenticated_recovery_round_trip_keeps_canary_values_encrypted() {
+        let test = TestDirectory::new();
+        let keys = MemoryKeyProvider::new();
+        let store = LocalVaultStore::new(test.data());
+        Initializer::new(&keys, &store)
+            .initialize(InteractionPolicy::FailFast)
+            .unwrap();
+        let profiles = ProfileOperations::new(&keys, &store);
+        let profile = ProfileName::new("private").unwrap();
+        profiles
+            .create(profile.clone(), InteractionPolicy::FailFast)
+            .unwrap();
+        profiles
+            .set(
+                &profile,
+                EnvironmentName::new("TOKEN").unwrap(),
+                SecretValue::from_string("CANARY-recovery-secret".to_owned()).unwrap(),
+                InteractionPolicy::FailFast,
+            )
+            .unwrap();
+        let live = store
+            .shared_read::<_, VaultStoreError, _>(|read| {
+                read.read_live()?
+                    .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::MissingState))
+            })
+            .unwrap();
+        let metadata = RecoveryBundleMetadata {
+            id: RecoveryBundleId::from_bytes([0x33; 16]),
+            created_at_unix_seconds: 1_765_000_001,
+            reason: RecoveryReason::Rebuild,
+        };
+        store
+            .exclusive_transaction::<_, VaultStoreError, _>(|transaction| {
+                transaction.preserve_recovery(
+                    metadata,
+                    RecoveryArtifacts {
+                        live: Some(&live),
+                        init_pending: None,
+                    },
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let recovered = fs::read(
+            test.data()
+                .join(RECOVERY_DIRECTORY)
+                .join(metadata.id.to_hex())
+                .join(RECOVERY_LIVE_FILE),
+        )
+        .unwrap();
+        assert_eq!(recovered, live.as_slice());
+        assert!(!recovered.windows(6).any(|window| window == b"CANARY"));
+        let listed = RecoveryOperations::new(&keys, &store)
+            .list(InteractionPolicy::FailFast)
+            .unwrap();
+        assert_eq!(
+            listed.bundles[0].authentication,
+            RecoveryAuthentication::Authenticated
+        );
+    }
+
+    #[test]
+    fn freezes_ambiguous_or_unsafe_recovery_directory_state() {
+        let unexpected = TestDirectory::new();
+        let store = LocalVaultStore::new(unexpected.data());
+        store
+            .initialization_transaction::<_, VaultStoreError, _>(|_| Ok(()))
+            .unwrap();
+        let recovery = unexpected.data().join(RECOVERY_DIRECTORY);
+        let mut builder = DirBuilder::new();
+        builder.mode(0o700).create(&recovery).unwrap();
+        builder
+            .mode(0o700)
+            .create(recovery.join(".gschrank-recovery-abandoned.pending"))
+            .unwrap();
+        let result =
+            store.shared_read::<_, VaultStoreError, _>(|read| read.read_recovery_bundles());
+        assert!(matches!(
+            result,
+            Err(error) if error.kind() == VaultStoreErrorKind::Conflict
+        ));
+
+        let linked = TestDirectory::new();
+        let store = LocalVaultStore::new(linked.data());
+        store
+            .initialization_transaction::<_, VaultStoreError, _>(|_| Ok(()))
+            .unwrap();
+        let outside = linked.0.join("outside-recovery");
+        builder.mode(0o700).create(&outside).unwrap();
+        symlink(&outside, linked.data().join(RECOVERY_DIRECTORY)).unwrap();
+        let result =
+            store.shared_read::<_, VaultStoreError, _>(|read| read.read_recovery_bundles());
+        assert!(matches!(
+            result,
+            Err(error) if error.kind() == VaultStoreErrorKind::UnsafePath
+        ));
     }
 
     #[test]

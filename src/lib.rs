@@ -17,6 +17,7 @@ mod import_command;
 mod init;
 mod key_provider;
 mod profiles;
+mod recovery;
 mod secret_input;
 mod set_command;
 mod shell;

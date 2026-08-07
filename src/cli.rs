@@ -19,6 +19,7 @@ use crate::{
         BackupReceipt, ImportOperationError, ProfileInspection, ProfileOperationError,
         ProfileOperations, VaultInspection, VaultReadiness,
     },
+    recovery::{RecoveryList, RecoveryOperationError, RecoveryOperations, RecoveryOverview},
     secret_input::{SecretInputMode, read_secret},
     set_command::execute_set,
     shell::{ShellEmitter, ZshEmitter},
@@ -49,6 +50,7 @@ Usage:
   gschrank status
   gschrank doctor
   gschrank backup <absolute-destination>
+  gschrank recovery list
   gschrank import dotenv <profile> [--dry-run] [--replace-existing]
   gschrank profile create <profile>
   gschrank profile rename <old> <new>
@@ -71,6 +73,7 @@ Commands:
   status     Show authenticated names-only vault and current-shell state
   doctor     Check vault and shell readiness without showing decrypted names
   backup     Create a Keychain-bound encrypted vault backup without overwriting
+  recovery   List and validate durable internal recovery bundles
   import     Add a strict stdin-only dotenv document to an existing profile
   profile    Create, rename, delete, list, or inspect profiles
   set        Create or update a variable using hidden or explicit stdin input
@@ -95,6 +98,7 @@ enum Command {
     Status,
     Doctor,
     Backup(PathBuf),
+    RecoveryList,
     Import {
         profile: ProfileName,
         options: ImportOptions,
@@ -300,6 +304,7 @@ struct StartupSuccess {
 #[cfg(target_os = "macos")]
 struct StatusReport {
     vault: Result<VaultInspection, ProfileOperationError>,
+    recovery: Result<RecoveryOverview, RecoveryOperationError>,
     shell: Result<ZshDiagnostic, ShellConfigurationError>,
     current_shell: Result<ManagedState, ManagedStateError>,
 }
@@ -307,8 +312,21 @@ struct StatusReport {
 #[cfg(target_os = "macos")]
 impl StatusReport {
     fn exit_code(&self) -> u8 {
-        if let Err(error) = self.vault {
+        if matches!(self.vault, Err(ProfileOperationError::NotInitialized))
+            && self
+                .recovery
+                .is_ok_and(|overview| overview.initialization_pending)
+        {
+            14
+        } else if let Err(error) = self.vault {
             error.exit_code()
+        } else if let Err(error) = self.recovery {
+            error.exit_code()
+        } else if self
+            .recovery
+            .is_ok_and(|overview| overview.initialization_pending)
+        {
+            14
         } else if let Err(error) = self.shell {
             error.exit_code()
         } else if self.current_shell.is_err() {
@@ -322,6 +340,7 @@ impl StatusReport {
 #[cfg(target_os = "macos")]
 struct DoctorReport {
     vault: Result<VaultReadiness, ProfileOperationError>,
+    recovery: Result<RecoveryOverview, RecoveryOperationError>,
     shell: Result<ZshDiagnostic, ShellConfigurationError>,
     current_shell: Result<ManagedState, ManagedStateError>,
 }
@@ -329,8 +348,24 @@ struct DoctorReport {
 #[cfg(target_os = "macos")]
 impl DoctorReport {
     fn exit_code(&self) -> u8 {
+        if matches!(self.vault, Err(ProfileOperationError::NotInitialized))
+            && self
+                .recovery
+                .is_ok_and(|overview| overview.initialization_pending)
+        {
+            return 14;
+        }
         if let Err(error) = self.vault {
             return error.exit_code();
+        }
+        if let Err(error) = self.recovery {
+            return error.exit_code();
+        }
+        if self
+            .recovery
+            .is_ok_and(|overview| overview.initialization_pending)
+        {
+            return 14;
         }
         let shell = match &self.shell {
             Ok(shell) => shell,
@@ -378,6 +413,7 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
         Ok(Command::Status) => run_status(),
         Ok(Command::Doctor) => run_doctor(),
         Ok(Command::Backup(destination)) => run_backup(destination),
+        Ok(Command::RecoveryList) => run_recovery_list(),
         Ok(Command::Import { profile, options }) => run_import(&profile, options),
         Ok(Command::Profile(command)) => run_profile(command),
         Ok(Command::Set {
@@ -414,6 +450,7 @@ fn parse(arguments: &[OsString]) -> Result<Command, ParseError> {
         [backup, destination] if backup == "backup" => {
             Ok(Command::Backup(PathBuf::from(destination)))
         }
+        [recovery, list] if recovery == "recovery" && list == "list" => Ok(Command::RecoveryList),
         [import, dotenv, arguments @ ..] if import == "import" && dotenv == "dotenv" => {
             parse_import(arguments)
         }
@@ -773,15 +810,22 @@ fn run_status() -> ExitCode {
     let keys = MacOsKeychainProvider::new();
     let store = LocalVaultStore::new(paths.data_directory().to_owned());
     let vault = ProfileOperations::new(&keys, &store).inspect_all(interaction_policy());
+    let recovery = RecoveryOperations::new(&keys, &store).overview();
     let shell = diagnose_zsh(&paths);
     let current_shell = inherited_managed_state();
     let report = StatusReport {
         vault,
+        recovery,
         shell,
         current_shell,
     };
     print!("{}", render_status(&report));
-    report_diagnostic_errors(&report.vault, &report.shell, &report.current_shell);
+    report_diagnostic_errors(
+        &report.vault,
+        &report.recovery,
+        &report.shell,
+        &report.current_shell,
+    );
     ExitCode::from(report.exit_code())
 }
 
@@ -798,15 +842,22 @@ fn run_doctor() -> ExitCode {
     let keys = MacOsKeychainProvider::new();
     let store = LocalVaultStore::new(paths.data_directory().to_owned());
     let vault = ProfileOperations::new(&keys, &store).readiness(interaction_policy());
+    let recovery = RecoveryOperations::new(&keys, &store).overview();
     let shell = diagnose_zsh(&paths);
     let current_shell = inherited_managed_state();
     let report = DoctorReport {
         vault,
+        recovery,
         shell,
         current_shell,
     };
     print!("{}", render_doctor(&report));
-    report_diagnostic_errors(&report.vault, &report.shell, &report.current_shell);
+    report_diagnostic_errors(
+        &report.vault,
+        &report.recovery,
+        &report.shell,
+        &report.current_shell,
+    );
     ExitCode::from(report.exit_code())
 }
 
@@ -846,6 +897,61 @@ fn render_backup_success(receipt: BackupReceipt) -> String {
 }
 
 #[cfg(target_os = "macos")]
+fn run_recovery_list() -> ExitCode {
+    let paths = match MacOsPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(13);
+        }
+    };
+    let keys = MacOsKeychainProvider::new();
+    let store = LocalVaultStore::new(paths.data_directory().to_owned());
+    match RecoveryOperations::new(&keys, &store).list(interaction_policy()) {
+        Ok(list) => {
+            print!("{}", render_recovery_list(&list));
+            ExitCode::from(list.exit_code())
+        }
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
+fn render_recovery_list(list: &RecoveryList) -> String {
+    let mut output = String::from("Recovery bundles:\n");
+    if list.bundles.is_empty() {
+        output.push_str("  (none)\n");
+        return output;
+    }
+    for bundle in &list.bundles {
+        output.push_str("  ");
+        output.push_str(&bundle.id.to_hex());
+        output.push_str("\n    Created: ");
+        output.push_str(&bundle.created_at_unix_seconds.to_string());
+        output.push_str(" Unix seconds\n    Reason: ");
+        output.push_str(bundle.reason.label());
+        output.push_str("\n    Vault ID: ");
+        output.push_str(
+            &bundle
+                .vault_id
+                .map_or_else(|| "unavailable".to_owned(), crate::VaultId::to_hex),
+        );
+        output.push_str("\n    Key ID: ");
+        output.push_str(
+            &bundle
+                .key_id
+                .map_or_else(|| "unavailable".to_owned(), crate::KeyId::to_hex),
+        );
+        output.push_str("\n    Authentication: ");
+        output.push_str(bundle.authentication.label());
+        output.push('\n');
+    }
+    output
+}
+
+#[cfg(target_os = "macos")]
 fn diagnose_zsh(paths: &MacOsPaths) -> Result<ZshDiagnostic, ShellConfigurationError> {
     let resolved = resolve_zsh_config(paths, None)?;
     resolved
@@ -857,10 +963,22 @@ fn diagnose_zsh(paths: &MacOsPaths) -> Result<ZshDiagnostic, ShellConfigurationE
 #[cfg(target_os = "macos")]
 fn report_diagnostic_errors<T>(
     vault: &Result<T, ProfileOperationError>,
+    recovery: &Result<RecoveryOverview, RecoveryOperationError>,
     shell: &Result<ZshDiagnostic, ShellConfigurationError>,
     current_shell: &Result<ManagedState, ManagedStateError>,
 ) {
     if let Err(error) = vault {
+        eprintln!("gschrank: {error}");
+    }
+    if let Err(error) = recovery
+        && !matches!(
+            (vault, error.kind()),
+            (
+                Err(ProfileOperationError::NotInitialized),
+                crate::vault_store::VaultStoreErrorKind::MissingState
+            )
+        )
+    {
         eprintln!("gschrank: {error}");
     }
     if let Err(error) = shell {
@@ -874,7 +992,7 @@ fn report_diagnostic_errors<T>(
 #[cfg(target_os = "macos")]
 fn render_path_failure(command: &str) -> String {
     format!(
-        "{command}: unavailable\nLifecycle: unavailable\nVault: unavailable\nShell integration: unavailable\nRemediation: use private, user-owned local paths and retry.\n"
+        "{command}: unavailable\nLifecycle: unavailable\nVault: unavailable\nInitialization candidate: unknown\nRecovery bundles: unknown\nShell integration: unavailable\nRemediation: use private, user-owned local paths and retry.\n"
     )
 }
 
@@ -885,10 +1003,7 @@ fn render_status(report: &StatusReport) -> String {
     output.push_str(status_outcome(report));
     output.push('\n');
     output.push_str("Lifecycle: ");
-    output.push_str(match report.vault {
-        Ok(_) => "ready",
-        Err(error) => vault_lifecycle(error),
-    });
+    output.push_str(lifecycle_label(&report.vault, &report.recovery));
     output.push('\n');
     match &report.vault {
         Ok(vault) => {
@@ -898,6 +1013,7 @@ fn render_status(report: &StatusReport) -> String {
         }
         Err(_) => output.push_str("Vault: unavailable\n"),
     }
+    append_recovery_overview(&mut output, &report.recovery);
     append_shell_status(&mut output, report.shell.as_ref().ok());
     append_current_shell_status(&mut output, &report.current_shell, true);
     if let Ok(vault) = &report.vault {
@@ -926,12 +1042,34 @@ fn render_doctor(report: &DoctorReport) -> String {
     output.push_str(doctor_outcome(report));
     output.push('\n');
     append_vault_doctor(&mut output, &report.vault);
+    append_recovery_overview(&mut output, &report.recovery);
     append_shell_status(&mut output, report.shell.as_ref().ok());
     append_current_shell_status(&mut output, &report.current_shell, false);
     output.push_str("Remediation: ");
     output.push_str(doctor_remediation(report));
     output.push('\n');
     output
+}
+
+#[cfg(target_os = "macos")]
+fn append_recovery_overview(
+    output: &mut String,
+    overview: &Result<RecoveryOverview, RecoveryOperationError>,
+) {
+    if let Ok(overview) = overview {
+        output.push_str("Initialization candidate: ");
+        output.push_str(if overview.initialization_pending {
+            "present"
+        } else {
+            "absent"
+        });
+        output.push_str("\nRecovery bundles: ");
+        output.push_str(&overview.bundle_count.to_string());
+        output.push('\n');
+    } else {
+        output.push_str("Initialization candidate: unknown\n");
+        output.push_str("Recovery bundles: unknown\n");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1099,31 +1237,114 @@ const fn vault_lifecycle(error: ProfileOperationError) -> &'static str {
 }
 
 #[cfg(target_os = "macos")]
+fn lifecycle_label<T>(
+    vault: &Result<T, ProfileOperationError>,
+    recovery: &Result<RecoveryOverview, RecoveryOperationError>,
+) -> &'static str {
+    match (vault, recovery) {
+        (
+            Err(ProfileOperationError::NotInitialized),
+            Ok(RecoveryOverview {
+                initialization_pending: true,
+                ..
+            }),
+        ) => "initialization pending",
+        (
+            Ok(_),
+            Ok(RecoveryOverview {
+                initialization_pending: true,
+                ..
+            }),
+        ) => "ready with conflicting initialization state",
+        (Ok(_), Ok(_)) => "ready",
+        (Err(error), _) => vault_lifecycle(*error),
+        (Ok(_), Err(_)) => "unavailable",
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn status_outcome(report: &StatusReport) -> &'static str {
-    match report.vault {
-        Err(error) => vault_lifecycle(error),
-        Ok(_) if report.exit_code() == 0 => "ready",
-        Ok(_) => "action required",
+    match (&report.vault, &report.recovery) {
+        (
+            Err(ProfileOperationError::NotInitialized),
+            Ok(RecoveryOverview {
+                initialization_pending: true,
+                ..
+            }),
+        ) => "initialization pending",
+        _ => match report.vault {
+            Err(error) => vault_lifecycle(error),
+            Ok(_) if report.exit_code() == 0 => "ready",
+            Ok(_) => "action required",
+        },
     }
 }
 
 #[cfg(target_os = "macos")]
 fn doctor_outcome(report: &DoctorReport) -> &'static str {
-    match report.vault {
-        Err(ProfileOperationError::NotInitialized) => "not initialized",
-        Err(
-            ProfileOperationError::VaultKeyMissing
-            | ProfileOperationError::InvalidKeyMaterial
-            | ProfileOperationError::Vault(_),
-        ) => "frozen",
-        Err(_) => "unhealthy",
-        Ok(_) if report.exit_code() == 0 => "healthy",
-        Ok(_) => "action required",
+    match (&report.vault, &report.recovery) {
+        (
+            Err(ProfileOperationError::NotInitialized),
+            Ok(RecoveryOverview {
+                initialization_pending: true,
+                ..
+            }),
+        ) => "initialization pending",
+        _ => match report.vault {
+            Err(ProfileOperationError::NotInitialized) => "not initialized",
+            Err(
+                ProfileOperationError::VaultKeyMissing
+                | ProfileOperationError::InvalidKeyMaterial
+                | ProfileOperationError::Vault(_),
+            ) => "frozen",
+            Err(_) => "unhealthy",
+            Ok(_) if report.exit_code() == 0 => "healthy",
+            Ok(_) => "action required",
+        },
     }
 }
 
 #[cfg(target_os = "macos")]
 fn doctor_remediation(report: &DoctorReport) -> &'static str {
+    if matches!(
+        (&report.vault, &report.recovery),
+        (
+            Err(ProfileOperationError::NotInitialized),
+            Ok(RecoveryOverview {
+                initialization_pending: true,
+                ..
+            })
+        )
+    ) {
+        return "run 'gschrank init' to safely resume the reserved initialization.";
+    }
+    if report.vault.is_ok()
+        && report
+            .recovery
+            .is_ok_and(|overview| overview.initialization_pending)
+    {
+        return "preserve the conflicting initialization candidate and resolve it through an explicit recovery lifecycle operation.";
+    }
+    if let Err(error) = report.recovery
+        && report.vault.is_ok()
+    {
+        return match error.kind() {
+            crate::vault_store::VaultStoreErrorKind::Conflict => {
+                "leave recovery state unchanged and inspect the ambiguous internal recovery artifacts before retrying."
+            }
+            crate::vault_store::VaultStoreErrorKind::OutcomeIndeterminate => {
+                "leave recovery state unchanged and inspect whether the last recovery commit completed before retrying."
+            }
+            crate::vault_store::VaultStoreErrorKind::MissingState
+            | crate::vault_store::VaultStoreErrorKind::UnsafePath
+            | crate::vault_store::VaultStoreErrorKind::PermissionDenied
+            | crate::vault_store::VaultStoreErrorKind::LockFailure
+            | crate::vault_store::VaultStoreErrorKind::UnsupportedStorage
+            | crate::vault_store::VaultStoreErrorKind::IoFailure => {
+                "leave recovery state unchanged, restore private local storage, and retry."
+            }
+        };
+    }
     match report.vault {
         Err(ProfileOperationError::NotInitialized) => {
             "run 'gschrank config' for guided setup or 'gschrank init' for an empty vault."
@@ -1851,6 +2072,12 @@ fn run_doctor() -> ExitCode {
 }
 
 #[cfg(not(target_os = "macos"))]
+fn run_recovery_list() -> ExitCode {
+    eprintln!("gschrank: this build does not support vault recovery on this platform");
+    ExitCode::from(1)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn run_backup(_destination: PathBuf) -> ExitCode {
     eprintln!("gschrank: this build does not support encrypted backups on this platform");
     ExitCode::from(1)
@@ -1990,6 +2217,16 @@ mod tests {
         );
         assert!(!HELP.contains("__emit-zsh"));
         assert!(!HELP.contains("__shell-init"));
+    }
+
+    #[test]
+    fn parses_only_the_exact_recovery_list_grammar() {
+        assert!(matches!(
+            parse(&["recovery".into(), "list".into()]),
+            Ok(Command::RecoveryList)
+        ));
+        assert!(parse(&["recovery".into()]).is_err());
+        assert!(parse(&["recovery".into(), "list".into(), "extra".into()]).is_err());
     }
 
     #[test]
@@ -2351,6 +2588,40 @@ mod tests {
             }
         }
 
+        fn clear_recovery() -> RecoveryOverview {
+            RecoveryOverview {
+                initialization_pending: false,
+                bundle_count: 0,
+            }
+        }
+
+        #[test]
+        fn recovery_list_renders_only_safe_metadata_and_authentication_state() {
+            use crate::{
+                KeyId, VaultId,
+                recovery::{RecoveryAuthentication, RecoveryInspection},
+                vault_store::{RecoveryBundleId, RecoveryReason},
+            };
+
+            let output = render_recovery_list(&RecoveryList {
+                bundles: vec![RecoveryInspection {
+                    id: RecoveryBundleId::from_bytes([1; 16]),
+                    created_at_unix_seconds: 1_765_000_000,
+                    reason: RecoveryReason::Restore,
+                    vault_id: Some(VaultId::from_bytes([2; 16])),
+                    key_id: Some(KeyId::from_bytes([3; 16])),
+                    authentication: RecoveryAuthentication::Authenticated,
+                }],
+            });
+
+            assert!(output.contains("01010101010101010101010101010101"));
+            assert!(output.contains("Reason: restore"));
+            assert!(output.contains("Authentication: authenticated"));
+            assert!(!output.contains("profile"));
+            assert!(!output.contains("TOKEN"));
+            assert!(!output.contains("CANARY-super-secret"));
+        }
+
         #[test]
         fn status_renders_authenticated_names_but_never_secret_values() {
             let report = StatusReport {
@@ -2361,6 +2632,7 @@ mod tests {
                         variables: vec![EnvironmentName::new("API_TOKEN").unwrap()],
                     }],
                 }),
+                recovery: Ok(clear_recovery()),
                 shell: Ok(installed_shell()),
                 current_shell: ManagedState::from_metadata(
                     Some("1"),
@@ -2382,6 +2654,7 @@ mod tests {
         fn failed_status_never_renders_cached_vault_names() {
             let report = StatusReport {
                 vault: Err(ProfileOperationError::VaultKeyMissing),
+                recovery: Ok(clear_recovery()),
                 shell: Ok(installed_shell()),
                 current_shell: Ok(ManagedState::empty()),
             };
@@ -2394,9 +2667,30 @@ mod tests {
         }
 
         #[test]
+        fn diagnostics_distinguish_pending_initialization_from_uninitialized_state() {
+            let report = DoctorReport {
+                vault: Err(ProfileOperationError::NotInitialized),
+                recovery: Ok(RecoveryOverview {
+                    initialization_pending: true,
+                    bundle_count: 2,
+                }),
+                shell: Ok(installed_shell()),
+                current_shell: Ok(ManagedState::empty()),
+            };
+
+            let output = render_doctor(&report);
+            assert!(output.contains("Doctor: initialization pending"));
+            assert!(output.contains("Initialization candidate: present"));
+            assert!(output.contains("Recovery bundles: 2"));
+            assert!(output.contains("run 'gschrank init'"));
+            assert_eq!(report.exit_code(), 14);
+        }
+
+        #[test]
         fn doctor_is_name_free_and_maps_lifecycle_failures_to_stable_exits() {
             let healthy = DoctorReport {
                 vault: Ok(VaultReadiness { revision: 9 }),
+                recovery: Ok(clear_recovery()),
                 shell: Ok(installed_shell()),
                 current_shell: ManagedState::from_metadata(
                     Some("1"),
@@ -2416,6 +2710,7 @@ mod tests {
 
             let not_initialized = DoctorReport {
                 vault: Err(ProfileOperationError::NotInitialized),
+                recovery: Ok(clear_recovery()),
                 shell: Ok(installed_shell()),
                 current_shell: Ok(ManagedState::empty()),
             };
@@ -2424,6 +2719,7 @@ mod tests {
 
             let frozen = DoctorReport {
                 vault: Err(ProfileOperationError::VaultKeyMissing),
+                recovery: Ok(clear_recovery()),
                 shell: Ok(installed_shell()),
                 current_shell: Ok(ManagedState::empty()),
             };
@@ -2437,6 +2733,7 @@ mod tests {
         fn doctor_requires_installed_canonical_shell_integration_and_valid_metadata() {
             let absent = DoctorReport {
                 vault: Ok(VaultReadiness { revision: 0 }),
+                recovery: Ok(clear_recovery()),
                 shell: Ok(ZshDiagnostic {
                     integration: ShellIntegrationState::Absent,
                     shortcut: ShortcutDiagnostic::Disabled,
@@ -2449,6 +2746,7 @@ mod tests {
 
             let conflict = DoctorReport {
                 vault: Ok(VaultReadiness { revision: 0 }),
+                recovery: Ok(clear_recovery()),
                 shell: Ok(ZshDiagnostic {
                     canonical_conflict: true,
                     ..installed_shell()
@@ -2460,6 +2758,7 @@ mod tests {
 
             let invalid_metadata = DoctorReport {
                 vault: Ok(VaultReadiness { revision: 0 }),
+                recovery: Ok(clear_recovery()),
                 shell: Ok(installed_shell()),
                 current_shell: Err(ManagedStateError::Incomplete),
             };

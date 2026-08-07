@@ -11,8 +11,8 @@ use crate::{
     KeyId, MasterKey,
     key_provider::{InteractionPolicy, KeyProvider, KeyProviderError, KeyProviderErrorKind},
     vault_store::{
-        CommitOutcome, VaultRead, VaultStore, VaultStoreError, VaultStoreErrorKind,
-        VaultTransaction,
+        CommitOutcome, RecoveryArtifacts, RecoveryBundle, RecoveryBundleMetadata, VaultRead,
+        VaultStore, VaultStoreError, VaultStoreErrorKind, VaultTransaction,
     },
 };
 
@@ -132,8 +132,10 @@ pub(crate) struct MemoryVaultStore {
 struct MemoryVaultState {
     live: Option<Zeroizing<Vec<u8>>>,
     init_pending: Option<Zeroizing<Vec<u8>>>,
+    recovery: Vec<RecoveryBundle>,
     next_promotion: Option<PromotionFault>,
     next_replacement: Option<ReplacementFault>,
+    next_recovery_preservation: Option<RecoveryPreservationFault>,
 }
 
 #[derive(Clone, Copy)]
@@ -145,6 +147,13 @@ pub(crate) enum PromotionFault {
 
 #[derive(Clone, Copy)]
 pub(crate) enum ReplacementFault {
+    NotCommitted,
+    IndeterminateBeforeCommit,
+    IndeterminateAfterCommit,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RecoveryPreservationFault {
     NotCommitted,
     IndeterminateBeforeCommit,
     IndeterminateAfterCommit,
@@ -173,6 +182,10 @@ impl MemoryVaultStore {
         self.state().next_replacement = Some(fault);
     }
 
+    pub(crate) fn fail_next_recovery_preservation(&self, fault: RecoveryPreservationFault) {
+        self.state().next_recovery_preservation = Some(fault);
+    }
+
     pub(crate) fn live(&self) -> Option<Vec<u8>> {
         self.state().live.as_ref().map(|bytes| bytes.to_vec())
     }
@@ -197,13 +210,26 @@ impl VaultRead for MemoryTransaction<'_> {
     fn read_live(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError> {
         Ok(self.state.live.clone())
     }
-}
 
-impl VaultTransaction for MemoryTransaction<'_> {
     fn read_init_pending(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError> {
         Ok(self.state.init_pending.clone())
     }
 
+    fn read_recovery_bundles(&mut self) -> Result<Vec<RecoveryBundle>, VaultStoreError> {
+        Ok(self
+            .state
+            .recovery
+            .iter()
+            .map(|bundle| RecoveryBundle {
+                metadata: bundle.metadata,
+                live: bundle.live.clone(),
+                init_pending: bundle.init_pending.clone(),
+            })
+            .collect())
+    }
+}
+
+impl VaultTransaction for MemoryTransaction<'_> {
     fn create_init_pending(&mut self, envelope: &[u8]) -> Result<(), VaultStoreError> {
         if self.state.live.is_some() || self.state.init_pending.is_some() {
             return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
@@ -251,9 +277,56 @@ impl VaultTransaction for MemoryTransaction<'_> {
         self.state.live = Some(Zeroizing::new(envelope.to_vec()));
         Ok(CommitOutcome::Committed)
     }
+
+    fn preserve_recovery(
+        &mut self,
+        metadata: RecoveryBundleMetadata,
+        artifacts: RecoveryArtifacts<'_>,
+    ) -> Result<CommitOutcome, VaultStoreError> {
+        if artifacts.live.is_none() && artifacts.init_pending.is_none() {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+        }
+        if self
+            .state
+            .recovery
+            .iter()
+            .any(|bundle| bundle.metadata.id == metadata.id)
+        {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+        }
+        match self.state.next_recovery_preservation.take() {
+            Some(RecoveryPreservationFault::NotCommitted) => {
+                return Ok(CommitOutcome::NotCommitted);
+            }
+            Some(RecoveryPreservationFault::IndeterminateBeforeCommit) => {
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            Some(RecoveryPreservationFault::IndeterminateAfterCommit) => {
+                self.commit_recovery(metadata, artifacts);
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            None => {}
+        }
+        self.commit_recovery(metadata, artifacts);
+        Ok(CommitOutcome::Committed)
+    }
 }
 
 impl MemoryTransaction<'_> {
+    fn commit_recovery(
+        &mut self,
+        metadata: RecoveryBundleMetadata,
+        artifacts: RecoveryArtifacts<'_>,
+    ) {
+        self.state.recovery.push(RecoveryBundle {
+            metadata,
+            live: artifacts.live.map(|bytes| Zeroizing::new(bytes.to_vec())),
+            init_pending: artifacts
+                .init_pending
+                .map(|bytes| Zeroizing::new(bytes.to_vec())),
+        });
+    }
+
     fn promote(&mut self) -> Result<(), VaultStoreError> {
         if self.state.live.is_some() {
             return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
