@@ -2,8 +2,8 @@
 id: WF-010
 title: Decide the no-leak security and acceptance contract
 label: wayfinder:grilling
-status: open
-assignee:
+status: closed
+assignee: eraldo
 parent: WF-001
 blocked_by:
   - WF-003
@@ -13,7 +13,7 @@ blocked_by:
   - WF-009
   - WF-011
   - WF-012
-resolution:
+resolution: ../comments/WF-010-resolution.md
 ---
 
 ## Question

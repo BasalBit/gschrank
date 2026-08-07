@@ -2,8 +2,8 @@
 id: WF-009
 title: Decide the portability seams for Bash and Linux
 label: wayfinder:grilling
-status: open
-assignee:
+status: closed
+assignee: eraldo
 parent: WF-001
 blocked_by:
   - WF-002
@@ -12,7 +12,7 @@ blocked_by:
   - WF-005
   - WF-011
   - WF-012
-resolution:
+resolution: ../comments/WF-009-resolution.md
 ---
 
 ## Question

@@ -2,15 +2,15 @@
 id: WF-006
 title: Decide vault initialization, lifecycle, and recovery behavior
 label: wayfinder:grilling
-status: open
-assignee:
+status: closed
+assignee: eraldo
 parent: WF-001
 blocked_by:
   - WF-002
   - WF-003
   - WF-011
   - WF-012
-resolution:
+resolution: ../comments/WF-006-resolution.md
 ---
 
 ## Question

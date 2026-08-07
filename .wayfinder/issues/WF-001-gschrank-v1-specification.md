@@ -2,11 +2,11 @@
 id: WF-001
 title: Find the way to an implementation-ready Gschrank v1 specification
 label: wayfinder:map
-status: open
-assignee:
+status: closed
+assignee: eraldo
 parent:
 blocked_by: []
-resolution:
+resolution: ../comments/WF-001-resolution.md
 ---
 
 ## Destination
@@ -52,18 +52,16 @@ startup activation, safe profile replacement, and no routine plaintext output.
 - [Decide the macOS Keychain backend and startup interaction policy](WF-011-decide-keychain-policy.md) — V1 uses a restricted login-Keychain item through a create-only native adapter, with explicit prompt policy and fail-closed automatic startup.
 - [Prototype the Zsh setup and profile-activation contract](WF-007-prototype-zsh-integration.md) — A dynamic, idempotently managed Zsh wrapper provides transactional explicit operations, fail-closed startup, upgrade-safe initialization, and non-destructive uninstall behavior.
 - [Decide the v1 vault envelope, payload, and persistence contract](WF-012-decide-vault-contract.md) — A single bounded XChaCha20-Poly1305 vault uses strict versioned binary formats, serialized atomic replacement, defensive permissions, and explicit security limits.
+- [Decide vault initialization, lifecycle, and recovery behavior](WF-006-decide-vault-lifecycle.md) — Explicit crash-recoverable initialization, frozen failure states, encrypted backup and recovery bundles, recoverable reset/rebuild, and staged purge govern the full v1 vault lifecycle.
+- [Prototype the v1 CLI and onboarding journey](WF-008-prototype-cli-onboarding.md) — A guided `config` flow and compact names-only command surface cover setup, profile editing, shell activation, diagnostics, and explicit recovery without value arguments or plaintext output.
+- [Decide the portability seams for Bash and Linux](WF-009-decide-portability-seams.md) — A policy-rich portable core uses narrow secure-store, transactional-vault, platform-path, shell-emitter, and shell-editor interfaces with conformance-tested adapters and one stable format.
+- [Decide the no-leak security and acceptance contract](WF-010-decide-security-contract.md) — V1 fixes explicit secret channels, forbidden observations, redaction and failure invariants, dependency controls, precise limitations, and a release-blocking canary/fault-injection suite.
+- [Decide whether and how v1 imports existing environment files](WF-013-decide-env-import.md) — V1 provides a strict stdin-only, names-only-previewed, additive and transactional dotenv migration with explicit collision replacement and no plaintext-output or source-deletion path.
+- [Decide the v1 executable name and command compatibility strategy](WF-014-decide-executable-name.md) — `gschrank` remains the sole canonical executable and stable namespace, while configured shells may safely expose the optional conflict-checked `gsch` shortcut through the same transactional wrapper.
 
 ## Not yet specified
 
-- The post-v1 proxy execution mode (`gschrank run --profile … -- command`) and
-  its authorization, process-replacement, signal, and environment-minimization
-  behavior.
-- The exact Bash and Linux implementations once the v1 portability seams are
-  known.
-- Packaging and distribution beyond what the v1 installation contract may
-  require.
-- Migration helpers, including `.env` import, until the core profile lifecycle
-  and command model are settled.
+- None currently.
 
 ## Out of scope
 
@@ -72,3 +70,13 @@ startup activation, safe profile replacement, and no routine plaintext output.
 - Defending secrets after they have been deliberately loaded into a process
   environment.
 - Plaintext `show` or `get` commands.
+- In-place master-key rotation and automatic old-key retirement; v1 uses a
+  fresh-vault rebuild that retains the previous recovery pair.
+- Raw master-key export and passphrase-encrypted portable recovery archives;
+  v1 backups remain bound to their exact Keychain item.
+- The post-v1 proxy execution mode (`gschrank run --profile … -- command`) and
+  its authorization, process-replacement, signal, and environment-minimization
+  behavior.
+- Concrete Bash and Linux adapters and their support claims; v1 fixes and
+  tests their seams but implements only macOS/Zsh production adapters.
+- Packaging and distribution beyond the v1 installation contract.
