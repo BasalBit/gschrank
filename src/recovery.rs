@@ -58,6 +58,7 @@ pub(crate) struct RecoveryInspection {
 pub(crate) struct RecoveryList {
     pub(crate) bundles: Vec<RecoveryInspection>,
     pub(crate) purge_pending: Vec<RecoveryBundleId>,
+    pub(crate) full_purge_pending: bool,
 }
 
 impl RecoveryList {
@@ -68,7 +69,7 @@ impl RecoveryList {
             .map(|bundle| bundle.authentication.exit_code())
             .max()
             .unwrap_or(0);
-        if self.purge_pending.is_empty() {
+        if self.purge_pending.is_empty() && !self.full_purge_pending {
             bundle_exit
         } else {
             bundle_exit.max(14)
@@ -83,6 +84,7 @@ pub(crate) struct RecoveryOverview {
     pub(crate) rebuild_pending: bool,
     pub(crate) bundle_count: usize,
     pub(crate) purge_pending_count: usize,
+    pub(crate) full_purge_pending: bool,
 }
 
 /// A safe recovery inventory failure.
@@ -152,12 +154,22 @@ where
 
     pub(crate) fn overview(&self) -> Result<RecoveryOverview, RecoveryOperationError> {
         self.store.shared_read(|read| {
+            if read.read_full_purge_pending()?.is_some() {
+                return Ok(RecoveryOverview {
+                    initialization_pending: false,
+                    rebuild_pending: false,
+                    bundle_count: 0,
+                    purge_pending_count: 0,
+                    full_purge_pending: true,
+                });
+            }
             let purge_pending_count = read.read_recovery_purge_pending()?.len();
             Ok(RecoveryOverview {
                 initialization_pending: read.read_init_pending()?.is_some(),
                 rebuild_pending: read.read_rebuild_pending()?.is_some(),
                 bundle_count: read.read_recovery_bundles()?.len(),
                 purge_pending_count,
+                full_purge_pending: false,
             })
         })
     }
@@ -167,6 +179,13 @@ where
         interaction: InteractionPolicy,
     ) -> Result<RecoveryList, RecoveryOperationError> {
         self.store.shared_read(|read| {
+            if read.read_full_purge_pending()?.is_some() {
+                return Ok(RecoveryList {
+                    bundles: Vec::new(),
+                    purge_pending: Vec::new(),
+                    full_purge_pending: true,
+                });
+            }
             let mut bundles = read
                 .read_recovery_bundles()?
                 .into_iter()
@@ -182,6 +201,7 @@ where
             Ok(RecoveryList {
                 bundles,
                 purge_pending,
+                full_purge_pending: false,
             })
         })
     }
@@ -366,6 +386,7 @@ mod tests {
                 rebuild_pending: true,
                 bundle_count: 1,
                 purge_pending_count: 0,
+                full_purge_pending: false,
             }
         );
     }
@@ -397,6 +418,35 @@ mod tests {
                 rebuild_pending: false,
                 bundle_count: 0,
                 purge_pending_count: 1,
+                full_purge_pending: false,
+            }
+        );
+    }
+
+    #[test]
+    fn reports_a_staged_full_purge_without_touching_frozen_ordinary_state() {
+        let (keys, store) = initialized_recovery();
+        store
+            .exclusive_transaction::<_, VaultStoreError, _>(|transaction| {
+                assert_eq!(transaction.stage_full_purge()?, CommitOutcome::Committed);
+                Ok(())
+            })
+            .unwrap();
+
+        let operations = RecoveryOperations::new(&keys, &store);
+        let list = operations.list(INTERACTION).unwrap();
+        assert!(list.full_purge_pending);
+        assert!(list.bundles.is_empty());
+        assert!(list.purge_pending.is_empty());
+        assert_eq!(list.exit_code(), 14);
+        assert_eq!(
+            operations.overview().unwrap(),
+            RecoveryOverview {
+                initialization_pending: false,
+                rebuild_pending: false,
+                bundle_count: 0,
+                purge_pending_count: 0,
+                full_purge_pending: true,
             }
         );
     }

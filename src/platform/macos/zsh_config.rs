@@ -103,6 +103,29 @@ impl ZshConfigEditor {
         self.configure_with(block, || {})
     }
 
+    pub(crate) fn remove(&self) -> Result<bool, ZshConfigError> {
+        let snapshot = self.read_snapshot()?;
+        let Some(existing) = parse_managed_block(snapshot.bytes())? else {
+            return Ok(false);
+        };
+        let replacement = replace_managed_block(snapshot.bytes(), Some(existing.range), b"");
+        let parent = self.validated_parent()?;
+        let mode = snapshot.mode().unwrap_or(0o600);
+        let temporary = TemporaryFile::write(&parent, &replacement, mode)?;
+        self.verify_unchanged(&snapshot)?;
+        self.ensure_first_backup(&parent, &snapshot)?;
+        self.verify_unchanged(&snapshot)?;
+        fs::rename(temporary.path(), &self.rc_file).map_err(map_io)?;
+
+        let committed =
+            read_regular_file(&self.rc_file)?.ok_or(ZshConfigError::OutcomeIndeterminate)?;
+        if committed.bytes != replacement {
+            return Err(ZshConfigError::OutcomeIndeterminate);
+        }
+        sync_directory(&parent).map_err(|_| ZshConfigError::OutcomeIndeterminate)?;
+        Ok(true)
+    }
+
     fn configure_with(
         &self,
         block: &ZshManagedBlock,
@@ -832,6 +855,25 @@ mod tests {
         );
         assert_eq!(fs::metadata(test.rc_file()).unwrap().mode() & 0o777, 0o600);
         assert!(!backup_path(&test.rc_file()).exists());
+    }
+
+    #[test]
+    fn removes_only_the_managed_block_and_is_idempotent_when_absent() {
+        let test = TestDirectory::new();
+        let original = b"# user configuration\nexport USER_SETTING=kept\n";
+        fs::write(test.rc_file(), original).unwrap();
+        let editor = test.editor();
+        editor.configure(&block(Some("work"), true)).unwrap();
+
+        assert!(editor.remove().unwrap());
+        assert_eq!(fs::read(test.rc_file()).unwrap(), original);
+        assert_eq!(editor.inspect().unwrap(), ShellIntegrationState::Absent);
+        assert!(!editor.remove().unwrap());
+        assert_eq!(fs::read(backup_path(&test.rc_file())).unwrap(), original);
+
+        let absent = TestDirectory::new();
+        assert!(!absent.editor().remove().unwrap());
+        assert!(!absent.rc_file().exists());
     }
 
     #[test]

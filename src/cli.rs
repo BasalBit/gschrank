@@ -20,6 +20,7 @@ use crate::{
         BackupReceipt, ImportOperationError, ProfileInspection, ProfileOperationError,
         ProfileOperations, VaultInspection, VaultReadiness,
     },
+    purge::{FullPurgeError, FullPurgeOperations, FullPurgePreparationError, FullPurgeReceipt},
     rebuild::{RebuildOperations, RebuildReceipt},
     recovery::{RecoveryList, RecoveryOperationError, RecoveryOperations, RecoveryOverview},
     recovery_purge::{RecoveryPurgeOperations, RecoveryPurgeReceipt},
@@ -59,6 +60,7 @@ Usage:
   gschrank restore <absolute-source>
   gschrank rebuild
   gschrank reset
+  gschrank purge
   gschrank recovery list
   gschrank recovery restore <bundle-id>
   gschrank recovery purge <bundle-id>
@@ -87,6 +89,7 @@ Commands:
   restore    Authenticate and restore a Keychain-bound encrypted vault backup
   rebuild    Re-encrypt every profile under a new vault identity and master key
   reset      Preserve current state and create a new independently keyed empty vault
+  purge      Permanently remove local vault state, integration, and authenticated keys
   recovery   List, validate, restore, or purge durable internal recovery bundles
   import     Add a strict stdin-only dotenv document to an existing profile
   profile    Create, rename, delete, list, or inspect profiles
@@ -115,6 +118,9 @@ enum Command {
     Restore(PathBuf),
     Rebuild,
     Reset {
+        shell_wrapper: bool,
+    },
+    Purge {
         shell_wrapper: bool,
     },
     RecoveryList,
@@ -334,7 +340,8 @@ struct StatusReport {
 impl StatusReport {
     fn exit_code(&self) -> u8 {
         if self.recovery.is_ok_and(|overview| {
-            overview.purge_pending_count > 0
+            overview.full_purge_pending
+                || overview.purge_pending_count > 0
                 || overview.rebuild_pending
                 || (overview.initialization_pending
                     && matches!(self.vault, Err(ProfileOperationError::NotInitialized)))
@@ -371,7 +378,8 @@ struct DoctorReport {
 impl DoctorReport {
     fn exit_code(&self) -> u8 {
         if self.recovery.is_ok_and(|overview| {
-            overview.purge_pending_count > 0
+            overview.full_purge_pending
+                || overview.purge_pending_count > 0
                 || overview.rebuild_pending
                 || (overview.initialization_pending
                     && matches!(self.vault, Err(ProfileOperationError::NotInitialized)))
@@ -439,6 +447,7 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
         Ok(Command::Restore(source)) => run_restore(source),
         Ok(Command::Rebuild) => run_rebuild(),
         Ok(Command::Reset { shell_wrapper }) => run_reset(shell_wrapper),
+        Ok(Command::Purge { shell_wrapper }) => run_full_purge(shell_wrapper),
         Ok(Command::RecoveryList) => run_recovery_list(),
         Ok(Command::RecoveryRestore(bundle_id)) => run_recovery_restore(bundle_id),
         Ok(Command::RecoveryPurge(bundle_id)) => run_recovery_purge(bundle_id),
@@ -481,6 +490,9 @@ fn parse(arguments: &[OsString]) -> Result<Command, ParseError> {
         [restore, source] if restore == "restore" => Ok(Command::Restore(PathBuf::from(source))),
         [rebuild] if rebuild == "rebuild" => Ok(Command::Rebuild),
         [reset] if reset == "reset" => Ok(Command::Reset {
+            shell_wrapper: false,
+        }),
+        [purge] if purge == "purge" => Ok(Command::Purge {
             shell_wrapper: false,
         }),
         [recovery, list] if recovery == "recovery" && list == "list" => Ok(Command::RecoveryList),
@@ -580,6 +592,9 @@ fn parse_import(arguments: &[OsString]) -> Result<Command, ParseError> {
 fn parse_private(arguments: &[OsString]) -> Result<Command, ParseError> {
     match arguments {
         [reset] if reset == "__reset-from-zsh" => Ok(Command::Reset {
+            shell_wrapper: true,
+        }),
+        [purge] if purge == "__purge-from-zsh" => Ok(Command::Purge {
             shell_wrapper: true,
         }),
         [shell_init, shell, protocol]
@@ -1161,6 +1176,82 @@ fn render_reset_success(receipt: ResetReceipt, shell_wrapper: bool) -> String {
 }
 
 #[cfg(target_os = "macos")]
+fn run_full_purge(shell_wrapper: bool) -> ExitCode {
+    let paths = match MacOsPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(13);
+        }
+    };
+    let keys = MacOsKeychainProvider::new();
+    let store = LocalVaultStore::new(paths.data_directory().to_owned());
+    let mut confirmer = TerminalTypedConfirmer;
+    let mut preparation_failure = None;
+    let result =
+        FullPurgeOperations::new(&keys, &store).purge(interaction_policy(), &mut confirmer, || {
+            let prepared = resolve_zsh_config(&paths, None)
+                .and_then(|resolved| remove_persistent_shell_integration(&resolved));
+            prepared.map_err(|error| {
+                let exit_code = error.exit_code();
+                preparation_failure = Some(error);
+                FullPurgePreparationError::new(exit_code)
+            })
+        });
+
+    match result {
+        Ok(receipt) => {
+            print!("{}", render_full_purge_success(receipt, shell_wrapper));
+            ExitCode::SUCCESS
+        }
+        Err(FullPurgeError::PreparationFailed(error)) => {
+            if let Some(source) = preparation_failure {
+                eprintln!(
+                    "gschrank: {source}; persistent shell integration may require inspection and destructive vault purge did not continue"
+                );
+            } else {
+                eprintln!("gschrank: {}", FullPurgeError::PreparationFailed(error));
+            }
+            ExitCode::from(error.exit_code())
+        }
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_persistent_shell_integration(
+    resolved: &ResolvedZshConfig,
+) -> Result<(), ShellConfigurationError> {
+    resolved.editor.remove()?;
+    resolved.preferences.remove()?;
+    Ok(())
+}
+
+fn render_full_purge_success(receipt: FullPurgeReceipt, shell_wrapper: bool) -> String {
+    let mut output = format!(
+        "Purged local encrypted vault, recovery, and configuration state.\nRetired Keychain items: {}\n",
+        receipt.retired_key_count
+    );
+    if receipt.unauthenticated_artifact_count > 0 {
+        output.push_str("Unauthenticated encrypted artifacts removed without guessing keys: ");
+        output.push_str(&receipt.unauthenticated_artifact_count.to_string());
+        output.push('\n');
+    }
+    output.push_str(
+        "Persistent Zsh integration was removed.\nThis operation does not claim secure erasure.\n",
+    );
+    if !shell_wrapper {
+        output.push_str(
+            "The current shell was not changed; close it before running commands that could inherit its existing environment.\n",
+        );
+    }
+    output
+}
+
+#[cfg(target_os = "macos")]
 fn run_recovery_list() -> ExitCode {
     let paths = match MacOsPaths::discover() {
         Ok(paths) => paths,
@@ -1184,7 +1275,9 @@ fn run_recovery_list() -> ExitCode {
 }
 
 fn render_recovery_list(list: &RecoveryList) -> String {
-    let mut output = String::from("Recovery bundles:\n");
+    let mut output = String::from("Full purge pending: ");
+    output.push_str(if list.full_purge_pending { "yes" } else { "no" });
+    output.push_str("\nRecovery bundles:\n");
     if list.bundles.is_empty() {
         output.push_str("  (none)\n");
     } else {
@@ -1266,7 +1359,7 @@ fn report_diagnostic_errors<T>(
 #[cfg(target_os = "macos")]
 fn render_path_failure(command: &str) -> String {
     format!(
-        "{command}: unavailable\nLifecycle: unavailable\nVault: unavailable\nInitialization candidate: unknown\nRebuild candidate: unknown\nRecovery bundles: unknown\nRecovery purges pending: unknown\nShell integration: unavailable\nRemediation: use private, user-owned local paths and retry.\n"
+        "{command}: unavailable\nLifecycle: unavailable\nVault: unavailable\nInitialization candidate: unknown\nRebuild candidate: unknown\nRecovery bundles: unknown\nRecovery purges pending: unknown\nFull purge pending: unknown\nShell integration: unavailable\nRemediation: use private, user-owned local paths and retry.\n"
     )
 }
 
@@ -1347,12 +1440,19 @@ fn append_recovery_overview(
         output.push_str(&overview.bundle_count.to_string());
         output.push_str("\nRecovery purges pending: ");
         output.push_str(&overview.purge_pending_count.to_string());
+        output.push_str("\nFull purge pending: ");
+        output.push_str(if overview.full_purge_pending {
+            "yes"
+        } else {
+            "no"
+        });
         output.push('\n');
     } else {
         output.push_str("Initialization candidate: unknown\n");
         output.push_str("Rebuild candidate: unknown\n");
         output.push_str("Recovery bundles: unknown\n");
         output.push_str("Recovery purges pending: unknown\n");
+        output.push_str("Full purge pending: unknown\n");
     }
 }
 
@@ -1529,6 +1629,13 @@ fn lifecycle_label<T>(
         (
             _,
             Ok(RecoveryOverview {
+                full_purge_pending: true,
+                ..
+            }),
+        ) => "full purge pending",
+        (
+            _,
+            Ok(RecoveryOverview {
                 purge_pending_count: 1..,
                 ..
             }),
@@ -1566,6 +1673,13 @@ fn status_outcome(report: &StatusReport) -> &'static str {
         (
             _,
             Ok(RecoveryOverview {
+                full_purge_pending: true,
+                ..
+            }),
+        ) => "full purge pending",
+        (
+            _,
+            Ok(RecoveryOverview {
                 purge_pending_count: 1..,
                 ..
             }),
@@ -1595,6 +1709,13 @@ fn status_outcome(report: &StatusReport) -> &'static str {
 #[cfg(target_os = "macos")]
 fn doctor_outcome(report: &DoctorReport) -> &'static str {
     match (&report.vault, &report.recovery) {
+        (
+            _,
+            Ok(RecoveryOverview {
+                full_purge_pending: true,
+                ..
+            }),
+        ) => "full purge pending",
         (
             _,
             Ok(RecoveryOverview {
@@ -1632,11 +1753,8 @@ fn doctor_outcome(report: &DoctorReport) -> &'static str {
 
 #[cfg(target_os = "macos")]
 fn doctor_remediation(report: &DoctorReport) -> &'static str {
-    if report
-        .recovery
-        .is_ok_and(|overview| overview.purge_pending_count > 0)
-    {
-        return "run 'gschrank recovery list', then resume the listed pending purge with 'gschrank recovery purge <bundle-id>'.";
+    if let Some(remediation) = pending_purge_remediation(&report.recovery) {
+        return remediation;
     }
     if matches!(
         (&report.vault, &report.recovery),
@@ -1728,6 +1846,22 @@ fn doctor_remediation(report: &DoctorReport) -> &'static str {
             }
             Ok(_) => "none.",
         },
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn pending_purge_remediation(
+    recovery: &Result<RecoveryOverview, RecoveryOperationError>,
+) -> Option<&'static str> {
+    let overview = recovery.as_ref().ok()?;
+    if overview.full_purge_pending {
+        Some("run 'gschrank purge' to resume the staged destructive purge.")
+    } else if overview.purge_pending_count > 0 {
+        Some(
+            "run 'gschrank recovery list', then resume the listed pending purge with 'gschrank recovery purge <bundle-id>'.",
+        )
+    } else {
+        None
     }
 }
 
@@ -2434,6 +2568,12 @@ fn run_reset(_shell_wrapper: bool) -> ExitCode {
 }
 
 #[cfg(not(target_os = "macos"))]
+fn run_full_purge(_shell_wrapper: bool) -> ExitCode {
+    eprintln!("gschrank: this build does not support destructive vault purge on this platform");
+    ExitCode::from(1)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn run_recovery_restore(_bundle_id: RecoveryBundleId) -> ExitCode {
     eprintln!("gschrank: this build does not support vault recovery on this platform");
     ExitCode::from(1)
@@ -2634,6 +2774,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_only_the_exact_public_and_private_full_purge_grammar() {
+        assert!(matches!(
+            parse(&["purge".into()]),
+            Ok(Command::Purge {
+                shell_wrapper: false
+            })
+        ));
+        assert!(matches!(
+            parse(&["__purge-from-zsh".into()]),
+            Ok(Command::Purge {
+                shell_wrapper: true
+            })
+        ));
+        assert!(parse(&["purge".into(), "--force".into()]).is_err());
+        assert!(parse(&["__purge-from-zsh".into(), "extra".into()]).is_err());
+        assert!(!HELP.contains("__purge-from-zsh"));
+    }
+
+    #[test]
     fn parses_only_the_exact_rebuild_grammar() {
         assert!(matches!(parse(&["rebuild".into()]), Ok(Command::Rebuild)));
         assert!(parse(&["rebuild".into(), "--force".into()]).is_err());
@@ -2808,6 +2967,24 @@ mod tests {
         assert!(output.contains("Retained shared Keychain items: 2"));
         assert!(!output.contains("TOKEN"));
         assert!(!output.contains("CANARY"));
+    }
+
+    #[test]
+    fn full_purge_success_reports_safe_counts_and_current_shell_guidance() {
+        let receipt = FullPurgeReceipt {
+            retired_key_count: 2,
+            unauthenticated_artifact_count: 1,
+        };
+        let direct = render_full_purge_success(receipt, false);
+        assert!(direct.contains("Retired Keychain items: 2"));
+        assert!(direct.contains("without guessing keys: 1"));
+        assert!(direct.contains("current shell was not changed"));
+        assert!(direct.contains("does not claim secure erasure"));
+        assert!(!direct.contains("TOKEN"));
+        assert!(!direct.contains("CANARY"));
+
+        let wrapped = render_full_purge_success(receipt, true);
+        assert!(!wrapped.contains("current shell was not changed"));
     }
 
     #[test]
@@ -3069,6 +3246,33 @@ mod tests {
             assert_eq!(saved.rc_file(), resolved.editor.path());
         }
 
+        #[test]
+        fn full_purge_preparation_removes_managed_integration_and_saved_preferences() {
+            let test = TestDirectory::new();
+            let editor = test.editor();
+            let profile = ProfileName::new("work").unwrap();
+            install_startup(&editor, &profile);
+            let paths = test.paths();
+            let preferences = ShellPreferenceStore::new(paths.data_directory().to_owned());
+            preferences
+                .write(&ShellPreferences::new(editor.path().to_owned(), false).unwrap())
+                .unwrap();
+            let resolved = ResolvedZshConfig {
+                editor,
+                saved: preferences.read().unwrap(),
+                preferences,
+            };
+
+            remove_persistent_shell_integration(&resolved).unwrap();
+
+            assert_eq!(
+                resolved.editor.inspect().unwrap(),
+                ShellIntegrationState::Absent
+            );
+            assert_eq!(resolved.preferences.read().unwrap(), None);
+            remove_persistent_shell_integration(&resolved).unwrap();
+        }
+
         fn installed_shell() -> ZshDiagnostic {
             ZshDiagnostic {
                 integration: ShellIntegrationState::Installed(StartupConfiguration::new(
@@ -3085,6 +3289,7 @@ mod tests {
                 rebuild_pending: false,
                 bundle_count: 0,
                 purge_pending_count: 0,
+                full_purge_pending: false,
             }
         }
 
@@ -3106,6 +3311,7 @@ mod tests {
                     authentication: RecoveryAuthentication::Authenticated,
                 }],
                 purge_pending: vec![RecoveryBundleId::from_bytes([4; 16])],
+                full_purge_pending: false,
             });
 
             assert!(output.contains("01010101010101010101010101010101"));
@@ -3171,6 +3377,7 @@ mod tests {
                     rebuild_pending: false,
                     bundle_count: 2,
                     purge_pending_count: 0,
+                    full_purge_pending: false,
                 }),
                 shell: Ok(installed_shell()),
                 current_shell: Ok(ManagedState::empty()),
@@ -3193,6 +3400,7 @@ mod tests {
                     rebuild_pending: true,
                     bundle_count: 1,
                     purge_pending_count: 0,
+                    full_purge_pending: false,
                 }),
                 shell: Ok(installed_shell()),
                 current_shell: Ok(ManagedState::empty()),
@@ -3215,6 +3423,7 @@ mod tests {
                     rebuild_pending: false,
                     bundle_count: 0,
                     purge_pending_count: 1,
+                    full_purge_pending: false,
                 }),
                 shell: Ok(installed_shell()),
                 current_shell: Ok(ManagedState::empty()),
@@ -3224,6 +3433,37 @@ mod tests {
             assert!(output.contains("Doctor: recovery purge pending"));
             assert!(output.contains("Recovery purges pending: 1"));
             assert!(output.contains("gschrank recovery list"));
+            assert!(!output.contains("TOKEN"));
+            assert_eq!(report.exit_code(), 14);
+        }
+
+        #[test]
+        fn diagnostics_make_an_interrupted_full_purge_actionable() {
+            let report = DoctorReport {
+                vault: Err(ProfileOperationError::Store(
+                    crate::vault_store::VaultStoreError::new(
+                        crate::vault_store::VaultStoreErrorKind::Conflict,
+                    ),
+                )),
+                recovery: Ok(RecoveryOverview {
+                    initialization_pending: false,
+                    rebuild_pending: false,
+                    bundle_count: 0,
+                    purge_pending_count: 0,
+                    full_purge_pending: true,
+                }),
+                shell: Ok(ZshDiagnostic {
+                    integration: ShellIntegrationState::Absent,
+                    shortcut: ShortcutDiagnostic::Disabled,
+                    canonical_conflict: false,
+                }),
+                current_shell: Ok(ManagedState::empty()),
+            };
+
+            let output = render_doctor(&report);
+            assert!(output.contains("Doctor: full purge pending"));
+            assert!(output.contains("Full purge pending: yes"));
+            assert!(output.contains("run 'gschrank purge'"));
             assert!(!output.contains("TOKEN"));
             assert_eq!(report.exit_code(), 14);
         }

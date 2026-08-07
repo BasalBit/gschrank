@@ -13,9 +13,9 @@ use zeroize::Zeroizing;
 use crate::{
     KeyId, MAX_ENVELOPE_SIZE,
     vault_store::{
-        CommitOutcome, RecoveryArtifacts, RecoveryBundle, RecoveryBundleId, RecoveryBundleMetadata,
-        RecoveryPurgePending, RecoveryReason, VaultRead, VaultStore, VaultStoreError,
-        VaultStoreErrorKind, VaultTransaction,
+        CommitOutcome, FullPurgePending, RecoveryArtifacts, RecoveryBundle, RecoveryBundleId,
+        RecoveryBundleMetadata, RecoveryPurgePending, RecoveryReason, VaultRead, VaultStore,
+        VaultStoreError, VaultStoreErrorKind, VaultTransaction,
     },
 };
 
@@ -27,6 +27,13 @@ const INIT_PENDING_FILE: &str = "vault.init.pending";
 const REBUILD_PENDING_FILE: &str = "vault.rebuild.pending";
 const RECOVERY_DIRECTORY: &str = "recovery";
 const RECOVERY_PURGE_DIRECTORY: &str = "recovery-purge.pending";
+const FULL_PURGE_DIRECTORY: &str = "full-purge.pending";
+const FULL_PURGE_PLAN_FILE: &str = "plan";
+const FULL_PURGE_PLAN_TEMP_FILE: &str = "plan.pending";
+const FULL_PURGE_PLAN_MAGIC: &[u8; 8] = b"GSCHALL1";
+const FULL_PURGE_PLAN_VERSION: u16 = 1;
+const FULL_PURGE_PLAN_PREFIX_LENGTH: usize = 16;
+const MAX_FULL_PURGE_KEYS: usize = 65_536;
 const RECOVERY_MANIFEST_FILE: &str = "manifest";
 const RECOVERY_LIVE_FILE: &str = "vault";
 const RECOVERY_INIT_FILE: &str = "vault.init.pending";
@@ -171,30 +178,40 @@ struct LocalTransaction<'directory> {
 
 impl VaultRead for LocalTransaction<'_> {
     fn read_live(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError> {
+        ensure_no_full_purge_pending(self.directory)?;
         read_artifact(self.directory, LIVE_FILE)
     }
 
     fn read_init_pending(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError> {
+        ensure_no_full_purge_pending(self.directory)?;
         read_artifact(self.directory, INIT_PENDING_FILE)
     }
 
     fn read_rebuild_pending(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError> {
+        ensure_no_full_purge_pending(self.directory)?;
         read_artifact(self.directory, REBUILD_PENDING_FILE)
     }
 
     fn read_recovery_bundles(&mut self) -> Result<Vec<RecoveryBundle>, VaultStoreError> {
+        ensure_no_full_purge_pending(self.directory)?;
         read_recovery_bundles(self.directory)
     }
 
     fn read_recovery_purge_pending(
         &mut self,
     ) -> Result<Vec<RecoveryPurgePending>, VaultStoreError> {
+        ensure_no_full_purge_pending(self.directory)?;
         read_recovery_purge_pending(self.directory)
+    }
+
+    fn read_full_purge_pending(&mut self) -> Result<Option<FullPurgePending>, VaultStoreError> {
+        read_full_purge_pending(self.directory)
     }
 }
 
 impl VaultTransaction for LocalTransaction<'_> {
     fn create_init_pending(&mut self, envelope: &[u8]) -> Result<(), VaultStoreError> {
+        ensure_no_full_purge_pending(self.directory)?;
         if artifact_exists(self.directory, LIVE_FILE)?
             || artifact_exists(self.directory, INIT_PENDING_FILE)?
             || artifact_exists(self.directory, REBUILD_PENDING_FILE)?
@@ -211,6 +228,7 @@ impl VaultTransaction for LocalTransaction<'_> {
     }
 
     fn discard_init_pending(&mut self) -> Result<(), VaultStoreError> {
+        ensure_no_full_purge_pending(self.directory)?;
         if read_artifact(self.directory, INIT_PENDING_FILE)?.is_none() {
             return Ok(());
         }
@@ -220,6 +238,7 @@ impl VaultTransaction for LocalTransaction<'_> {
     }
 
     fn promote_init_pending(&mut self) -> Result<CommitOutcome, VaultStoreError> {
+        ensure_no_full_purge_pending(self.directory)?;
         if artifact_exists(self.directory, LIVE_FILE)? {
             return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
         }
@@ -241,6 +260,7 @@ impl VaultTransaction for LocalTransaction<'_> {
     }
 
     fn create_rebuild_pending(&mut self, envelope: &[u8]) -> Result<(), VaultStoreError> {
+        ensure_no_full_purge_pending(self.directory)?;
         if !artifact_exists(self.directory, LIVE_FILE)?
             || artifact_exists(self.directory, INIT_PENDING_FILE)?
             || artifact_exists(self.directory, REBUILD_PENDING_FILE)?
@@ -257,6 +277,7 @@ impl VaultTransaction for LocalTransaction<'_> {
     }
 
     fn discard_rebuild_pending(&mut self) -> Result<(), VaultStoreError> {
+        ensure_no_full_purge_pending(self.directory)?;
         if read_artifact(self.directory, REBUILD_PENDING_FILE)?.is_none() {
             return Ok(());
         }
@@ -266,6 +287,7 @@ impl VaultTransaction for LocalTransaction<'_> {
     }
 
     fn promote_rebuild_pending(&mut self) -> Result<CommitOutcome, VaultStoreError> {
+        ensure_no_full_purge_pending(self.directory)?;
         if !artifact_exists(self.directory, LIVE_FILE)? {
             return Err(VaultStoreError::new(VaultStoreErrorKind::MissingState));
         }
@@ -286,6 +308,7 @@ impl VaultTransaction for LocalTransaction<'_> {
     }
 
     fn clear_root_artifacts(&mut self) -> Result<CommitOutcome, VaultStoreError> {
+        ensure_no_full_purge_pending(self.directory)?;
         let live_exists = read_artifact(self.directory, LIVE_FILE)?.is_some();
         let pending_exists = read_artifact(self.directory, INIT_PENDING_FILE)?.is_some();
         let rebuild_exists = read_artifact(self.directory, REBUILD_PENDING_FILE)?.is_some();
@@ -325,6 +348,7 @@ impl VaultTransaction for LocalTransaction<'_> {
     }
 
     fn replace_live(&mut self, envelope: &[u8]) -> Result<CommitOutcome, VaultStoreError> {
+        ensure_no_full_purge_pending(self.directory)?;
         durably_install(
             self.directory,
             LIVE_FILE,
@@ -334,6 +358,7 @@ impl VaultTransaction for LocalTransaction<'_> {
     }
 
     fn install_live(&mut self, envelope: &[u8]) -> Result<CommitOutcome, VaultStoreError> {
+        ensure_no_full_purge_pending(self.directory)?;
         durably_install(
             self.directory,
             LIVE_FILE,
@@ -347,6 +372,7 @@ impl VaultTransaction for LocalTransaction<'_> {
         metadata: RecoveryBundleMetadata,
         artifacts: RecoveryArtifacts<'_>,
     ) -> Result<CommitOutcome, VaultStoreError> {
+        ensure_no_full_purge_pending(self.directory)?;
         preserve_recovery_bundle(self.directory, metadata, artifacts)
     }
 
@@ -355,6 +381,7 @@ impl VaultTransaction for LocalTransaction<'_> {
         bundle_id: RecoveryBundleId,
         key_ids: &[KeyId],
     ) -> Result<CommitOutcome, VaultStoreError> {
+        ensure_no_full_purge_pending(self.directory)?;
         stage_recovery_purge(self.directory, bundle_id, key_ids)
     }
 
@@ -362,7 +389,567 @@ impl VaultTransaction for LocalTransaction<'_> {
         &mut self,
         bundle_id: RecoveryBundleId,
     ) -> Result<CommitOutcome, VaultStoreError> {
+        ensure_no_full_purge_pending(self.directory)?;
         remove_recovery_purge_pending(self.directory, bundle_id)
+    }
+
+    fn stage_full_purge(&mut self) -> Result<CommitOutcome, VaultStoreError> {
+        stage_full_purge(self.directory)
+    }
+
+    fn write_full_purge_plan(
+        &mut self,
+        key_ids: &[KeyId],
+    ) -> Result<CommitOutcome, VaultStoreError> {
+        write_full_purge_plan(self.directory, key_ids)
+    }
+
+    fn remove_full_purge_pending(&mut self) -> Result<CommitOutcome, VaultStoreError> {
+        remove_full_purge_pending(self.directory)
+    }
+}
+
+fn ensure_no_full_purge_pending(directory: &Path) -> Result<(), VaultStoreError> {
+    match fs::symlink_metadata(directory.join(FULL_PURGE_DIRECTORY)) {
+        Ok(metadata) => {
+            validate_directory(&metadata)?;
+            Err(VaultStoreError::new(VaultStoreErrorKind::Conflict))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(map_directory_io(error)),
+    }
+}
+
+fn read_full_purge_pending(directory: &Path) -> Result<Option<FullPurgePending>, VaultStoreError> {
+    let purge = directory.join(FULL_PURGE_DIRECTORY);
+    match fs::symlink_metadata(&purge) {
+        Ok(metadata) => validate_directory(&metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(map_directory_io(error)),
+    }
+
+    let mut envelopes = Vec::new();
+    let mut trusted_key_ids = BTreeSet::new();
+    collect_full_purge_tree(&purge, &mut envelopes, &mut trusted_key_ids)?;
+    let key_ids = read_full_purge_plan(&purge)?;
+    Ok(Some(FullPurgePending {
+        envelopes,
+        trusted_key_ids: trusted_key_ids.into_iter().collect(),
+        key_ids,
+    }))
+}
+
+fn collect_full_purge_tree(
+    purge: &Path,
+    envelopes: &mut Vec<Zeroizing<Vec<u8>>>,
+    trusted_key_ids: &mut BTreeSet<KeyId>,
+) -> Result<(), VaultStoreError> {
+    for entry in fs::read_dir(purge).map_err(map_directory_io)? {
+        let entry = entry.map_err(map_directory_io)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(map_file_io)?;
+        match name.as_str() {
+            LIVE_FILE | INIT_PENDING_FILE | REBUILD_PENDING_FILE => {
+                validate_regular_file(&metadata)?;
+                if let Some(envelope) = read_purge_envelope(purge, &name)? {
+                    envelopes.push(envelope);
+                }
+            }
+            RECOVERY_DIRECTORY => {
+                validate_directory(&metadata)?;
+                collect_full_purge_recovery(&entry.path(), envelopes)?;
+            }
+            RECOVERY_PURGE_DIRECTORY => {
+                validate_directory(&metadata)?;
+                collect_full_purge_recovery_pending(&entry.path(), envelopes, trusted_key_ids)?;
+            }
+            FULL_PURGE_PLAN_FILE | FULL_PURGE_PLAN_TEMP_FILE => {
+                validate_regular_file(&metadata)?;
+            }
+            _ if is_write_temporary_name(&name) => {
+                validate_regular_file(&metadata)?;
+                if let Some(envelope) = read_purge_envelope(purge, &name)? {
+                    envelopes.push(envelope);
+                }
+            }
+            _ => return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict)),
+        }
+    }
+    Ok(())
+}
+
+fn collect_full_purge_recovery(
+    recovery: &Path,
+    envelopes: &mut Vec<Zeroizing<Vec<u8>>>,
+) -> Result<(), VaultStoreError> {
+    for entry in fs::read_dir(recovery).map_err(map_directory_io)? {
+        let entry = entry.map_err(map_directory_io)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))?;
+        if parse_recovery_bundle_id(&name).is_err() && !is_recovery_temporary_name(&name) {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+        }
+        validate_directory(&fs::symlink_metadata(entry.path()).map_err(map_directory_io)?)?;
+        collect_full_purge_bundle(&entry.path(), envelopes)?;
+    }
+    Ok(())
+}
+
+fn collect_full_purge_recovery_pending(
+    pending: &Path,
+    envelopes: &mut Vec<Zeroizing<Vec<u8>>>,
+    trusted_key_ids: &mut BTreeSet<KeyId>,
+) -> Result<(), VaultStoreError> {
+    for entry in fs::read_dir(pending).map_err(map_directory_io)? {
+        let entry = entry.map_err(map_directory_io)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(map_file_io)?;
+        if metadata.is_dir() {
+            validate_directory(&metadata)?;
+            parse_recovery_bundle_id(&name)?;
+            collect_full_purge_bundle(&entry.path(), envelopes)?;
+        } else if let Some(encoded_id) = name.strip_suffix(RECOVERY_PURGE_PLAN_TEMP_SUFFIX) {
+            validate_regular_file(&metadata)?;
+            parse_recovery_bundle_id(encoded_id)?;
+        } else if let Some(encoded_id) = name.strip_suffix(RECOVERY_PURGE_PLAN_SUFFIX) {
+            validate_regular_file(&metadata)?;
+            let id = parse_recovery_bundle_id(encoded_id)?;
+            match read_recovery_purge_plan(pending, id) {
+                Ok(Some(key_ids)) => trusted_key_ids.extend(key_ids),
+                Ok(None) => {}
+                Err(error) if error.kind() == VaultStoreErrorKind::Conflict => {}
+                Err(error) => return Err(error),
+            }
+        } else {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+        }
+    }
+    Ok(())
+}
+
+fn collect_full_purge_bundle(
+    bundle: &Path,
+    envelopes: &mut Vec<Zeroizing<Vec<u8>>>,
+) -> Result<(), VaultStoreError> {
+    for entry in fs::read_dir(bundle).map_err(map_directory_io)? {
+        let entry = entry.map_err(map_directory_io)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(map_file_io)?;
+        validate_regular_file(&metadata)?;
+        match name.as_str() {
+            RECOVERY_MANIFEST_FILE => {}
+            RECOVERY_LIVE_FILE | RECOVERY_INIT_FILE | RECOVERY_REBUILD_FILE => {
+                if let Some(envelope) = read_purge_envelope(bundle, &name)? {
+                    envelopes.push(envelope);
+                }
+            }
+            _ => return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict)),
+        }
+    }
+    Ok(())
+}
+
+fn read_purge_envelope(
+    directory: &Path,
+    name: &str,
+) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let file = match options.open(directory.join(name)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(map_file_io(error)),
+    };
+    let metadata = file.metadata().map_err(map_file_io)?;
+    validate_regular_file(&metadata)?;
+    if metadata.len() > MAX_ENVELOPE_SIZE as u64 {
+        return Ok(None);
+    }
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::IoFailure))?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(capacity));
+    file.take((MAX_ENVELOPE_SIZE + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(map_file_io)?;
+    if bytes.len() > MAX_ENVELOPE_SIZE {
+        Ok(None)
+    } else {
+        Ok(Some(bytes))
+    }
+}
+
+fn stage_full_purge(directory: &Path) -> Result<CommitOutcome, VaultStoreError> {
+    let purge = ensure_full_purge_directory(directory)?;
+    let existing_plan = read_full_purge_plan(&purge)?;
+    if existing_plan.is_some() && active_full_purge_state_exists(directory)? {
+        return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+    }
+
+    for name in [LIVE_FILE, INIT_PENDING_FILE, REBUILD_PENDING_FILE] {
+        move_full_purge_entry(directory, &purge, name, false)?;
+    }
+    move_full_purge_write_temporaries(directory, &purge)?;
+    move_full_purge_entry(directory, &purge, RECOVERY_DIRECTORY, true)?;
+    move_full_purge_entry(directory, &purge, RECOVERY_PURGE_DIRECTORY, true)?;
+
+    if sync_directory(directory).is_err() || sync_directory(&purge).is_err() {
+        return Ok(CommitOutcome::Indeterminate);
+    }
+    if active_full_purge_state_exists(directory)? || read_full_purge_pending(directory)?.is_none() {
+        Ok(CommitOutcome::Indeterminate)
+    } else {
+        Ok(CommitOutcome::Committed)
+    }
+}
+
+fn ensure_full_purge_directory(directory: &Path) -> Result<PathBuf, VaultStoreError> {
+    let purge = directory.join(FULL_PURGE_DIRECTORY);
+    match fs::symlink_metadata(&purge) {
+        Ok(metadata) => validate_directory(&metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(&purge).map_err(map_directory_io)?;
+            validate_directory(&fs::symlink_metadata(&purge).map_err(map_directory_io)?)?;
+            sync_directory(directory)
+                .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::OutcomeIndeterminate))?;
+        }
+        Err(error) => return Err(map_directory_io(error)),
+    }
+    let mut envelopes = Vec::new();
+    let mut trusted = BTreeSet::new();
+    collect_full_purge_tree(&purge, &mut envelopes, &mut trusted)?;
+    Ok(purge)
+}
+
+fn move_full_purge_entry(
+    directory: &Path,
+    purge: &Path,
+    name: &str,
+    is_directory: bool,
+) -> Result<(), VaultStoreError> {
+    let source = directory.join(name);
+    let destination = purge.join(name);
+    let source_metadata = fs::symlink_metadata(&source);
+    let destination_metadata = fs::symlink_metadata(&destination);
+    match (source_metadata, destination_metadata) {
+        (Err(source_error), Err(destination_error))
+            if source_error.kind() == io::ErrorKind::NotFound
+                && destination_error.kind() == io::ErrorKind::NotFound =>
+        {
+            Ok(())
+        }
+        (Ok(source_metadata), Err(destination_error))
+            if destination_error.kind() == io::ErrorKind::NotFound =>
+        {
+            if is_directory {
+                validate_directory(&source_metadata)?;
+                if name == RECOVERY_DIRECTORY {
+                    collect_full_purge_recovery(&source, &mut Vec::new())?;
+                } else {
+                    collect_full_purge_recovery_pending(
+                        &source,
+                        &mut Vec::new(),
+                        &mut BTreeSet::new(),
+                    )?;
+                }
+            } else {
+                validate_regular_file(&source_metadata)?;
+            }
+            fs::rename(source, destination).map_err(map_file_io)
+        }
+        (Err(source_error), Ok(destination_metadata))
+            if source_error.kind() == io::ErrorKind::NotFound =>
+        {
+            if is_directory {
+                validate_directory(&destination_metadata)
+            } else {
+                validate_regular_file(&destination_metadata)
+            }
+        }
+        (Ok(_), Ok(_)) => Err(VaultStoreError::new(VaultStoreErrorKind::Conflict)),
+        (Err(error), _) | (_, Err(error)) => Err(map_file_io(error)),
+    }
+}
+
+fn active_full_purge_state_exists(directory: &Path) -> Result<bool, VaultStoreError> {
+    for name in [
+        LIVE_FILE,
+        INIT_PENDING_FILE,
+        REBUILD_PENDING_FILE,
+        RECOVERY_DIRECTORY,
+        RECOVERY_PURGE_DIRECTORY,
+    ] {
+        match fs::symlink_metadata(directory.join(name)) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(map_file_io(error)),
+        }
+    }
+    for entry in fs::read_dir(directory).map_err(map_directory_io)? {
+        let name = entry
+            .map_err(map_directory_io)?
+            .file_name()
+            .into_string()
+            .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))?;
+        if is_write_temporary_name(&name) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn move_full_purge_write_temporaries(
+    directory: &Path,
+    purge: &Path,
+) -> Result<(), VaultStoreError> {
+    let names = fs::read_dir(directory)
+        .map_err(map_directory_io)?
+        .map(|entry| {
+            entry
+                .map_err(map_directory_io)?
+                .file_name()
+                .into_string()
+                .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for name in names
+        .into_iter()
+        .filter(|name| is_write_temporary_name(name))
+    {
+        move_full_purge_entry(directory, purge, &name, false)?;
+    }
+    Ok(())
+}
+
+fn is_write_temporary_name(name: &str) -> bool {
+    name.strip_prefix(".gschrank-write-")
+        .and_then(|name| name.strip_suffix(".tmp"))
+        .is_some_and(is_lower_hex_identifier)
+}
+
+fn is_recovery_temporary_name(name: &str) -> bool {
+    name.strip_prefix(".gschrank-recovery-")
+        .and_then(|name| name.strip_suffix(".pending"))
+        .is_some_and(is_lower_hex_identifier)
+}
+
+fn is_lower_hex_identifier(encoded: &str) -> bool {
+    encoded.len() == 32
+        && encoded
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn write_full_purge_plan(
+    directory: &Path,
+    key_ids: &[KeyId],
+) -> Result<CommitOutcome, VaultStoreError> {
+    validate_full_purge_key_ids(key_ids)?;
+    let purge = directory.join(FULL_PURGE_DIRECTORY);
+    validate_directory(&fs::symlink_metadata(&purge).map_err(map_directory_io)?)?;
+    match read_full_purge_plan(&purge)? {
+        Some(existing) if existing == key_ids => {
+            return if sync_directory(&purge).is_ok() {
+                Ok(CommitOutcome::Committed)
+            } else {
+                Ok(CommitOutcome::Indeterminate)
+            };
+        }
+        Some(_) => return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict)),
+        None => {}
+    }
+    let bytes = encode_full_purge_plan(key_ids)?;
+    let outcome = publish_full_purge_plan(&purge, &bytes)?;
+    let exact = read_full_purge_plan(&purge)?.as_deref() == Some(key_ids);
+    if exact {
+        Ok(outcome)
+    } else {
+        Ok(CommitOutcome::Indeterminate)
+    }
+}
+
+fn validate_full_purge_key_ids(key_ids: &[KeyId]) -> Result<(), VaultStoreError> {
+    if key_ids.len() > MAX_FULL_PURGE_KEYS || key_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+        Err(VaultStoreError::new(VaultStoreErrorKind::Conflict))
+    } else {
+        Ok(())
+    }
+}
+
+fn encode_full_purge_plan(key_ids: &[KeyId]) -> Result<Vec<u8>, VaultStoreError> {
+    validate_full_purge_key_ids(key_ids)?;
+    let mut bytes = Vec::with_capacity(FULL_PURGE_PLAN_PREFIX_LENGTH + key_ids.len() * 16);
+    bytes.extend_from_slice(FULL_PURGE_PLAN_MAGIC);
+    bytes.extend_from_slice(&FULL_PURGE_PLAN_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&0_u16.to_be_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(key_ids.len())
+            .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))?
+            .to_be_bytes(),
+    );
+    for key_id in key_ids {
+        bytes.extend_from_slice(key_id.as_bytes());
+    }
+    Ok(bytes)
+}
+
+fn read_full_purge_plan(purge: &Path) -> Result<Option<Vec<KeyId>>, VaultStoreError> {
+    let Some(bytes) = read_artifact(purge, FULL_PURGE_PLAN_FILE)? else {
+        return Ok(None);
+    };
+    if bytes.len() < FULL_PURGE_PLAN_PREFIX_LENGTH
+        || &bytes[..8] != FULL_PURGE_PLAN_MAGIC
+        || u16::from_be_bytes([bytes[8], bytes[9]]) != FULL_PURGE_PLAN_VERSION
+        || bytes[10..12].iter().any(|byte| *byte != 0)
+    {
+        return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+    }
+    let count = usize::try_from(u32::from_be_bytes(
+        bytes[12..16]
+            .try_into()
+            .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))?,
+    ))
+    .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))?;
+    let expected = FULL_PURGE_PLAN_PREFIX_LENGTH
+        .checked_add(count * 16)
+        .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::Conflict))?;
+    if bytes.len() != expected || count > MAX_FULL_PURGE_KEYS {
+        return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+    }
+    let key_ids = bytes[FULL_PURGE_PLAN_PREFIX_LENGTH..]
+        .chunks_exact(16)
+        .map(|bytes| {
+            KeyId::from_bytes(
+                bytes
+                    .try_into()
+                    .expect("full-purge key identifier has fixed width"),
+            )
+        })
+        .collect::<Vec<_>>();
+    validate_full_purge_key_ids(&key_ids)?;
+    Ok(Some(key_ids))
+}
+
+fn publish_full_purge_plan(purge: &Path, bytes: &[u8]) -> Result<CommitOutcome, VaultStoreError> {
+    let destination = purge.join(FULL_PURGE_PLAN_FILE);
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) => {
+            validate_regular_file(&metadata)?;
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(map_file_io(error)),
+    }
+    let temporary = purge.join(FULL_PURGE_PLAN_TEMP_FILE);
+    match fs::symlink_metadata(&temporary) {
+        Ok(metadata) => {
+            validate_regular_file(&metadata)?;
+            fs::remove_file(&temporary).map_err(map_file_io)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(map_file_io(error)),
+    }
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let mut file = options.open(&temporary).map_err(map_file_io)?;
+        validate_regular_file(&file.metadata().map_err(map_file_io)?)?;
+        file.write_all(bytes).map_err(map_file_io)?;
+        file.flush().map_err(map_file_io)?;
+        system::full_sync(&file).map_err(map_file_io)?;
+        drop(file);
+        fs::rename(&temporary, &destination).map_err(map_file_io)?;
+        if sync_directory(purge).is_err() {
+            Ok(CommitOutcome::Indeterminate)
+        } else {
+            Ok(CommitOutcome::Committed)
+        }
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+fn remove_full_purge_pending(directory: &Path) -> Result<CommitOutcome, VaultStoreError> {
+    let purge = directory.join(FULL_PURGE_DIRECTORY);
+    let pending = read_full_purge_pending(directory)?
+        .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::MissingState))?;
+    if pending.key_ids.is_none() {
+        return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+    }
+
+    for name in [
+        LIVE_FILE,
+        INIT_PENDING_FILE,
+        REBUILD_PENDING_FILE,
+        RECOVERY_DIRECTORY,
+        RECOVERY_PURGE_DIRECTORY,
+        FULL_PURGE_PLAN_TEMP_FILE,
+    ] {
+        remove_full_purge_entry(&purge.join(name))?;
+    }
+    let temporary_names = fs::read_dir(&purge)
+        .map_err(map_directory_io)?
+        .map(|entry| {
+            entry
+                .map_err(map_directory_io)?
+                .file_name()
+                .into_string()
+                .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for name in temporary_names
+        .into_iter()
+        .filter(|name| is_write_temporary_name(name))
+    {
+        remove_full_purge_entry(&purge.join(name))?;
+    }
+    remove_full_purge_entry(&purge.join(FULL_PURGE_PLAN_FILE))?;
+    fs::remove_dir(&purge).map_err(map_directory_io)?;
+    if sync_directory(directory).is_err() {
+        return Ok(CommitOutcome::Indeterminate);
+    }
+    if read_full_purge_pending(directory)?.is_none() {
+        Ok(CommitOutcome::Committed)
+    } else {
+        Ok(CommitOutcome::Indeterminate)
+    }
+}
+
+fn remove_full_purge_entry(path: &Path) -> Result<(), VaultStoreError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(map_file_io(error)),
+    };
+    if metadata.is_dir() {
+        validate_directory(&metadata)?;
+        for entry in fs::read_dir(path).map_err(map_directory_io)? {
+            remove_full_purge_entry(&entry.map_err(map_directory_io)?.path())?;
+        }
+        fs::remove_dir(path).map_err(map_directory_io)
+    } else {
+        validate_regular_file(&metadata)?;
+        fs::remove_file(path).map_err(map_file_io)
     }
 }
 
@@ -1630,6 +2217,136 @@ mod tests {
             read_recovery_purge_plan(&purge, id).unwrap(),
             Some(key_ids.to_vec())
         );
+    }
+
+    #[test]
+    fn stages_every_vault_artifact_for_full_purge_and_freezes_ordinary_access() {
+        let test = TestDirectory::new();
+        let store = LocalVaultStore::new(test.data());
+        let active_id = RecoveryBundleId::from_bytes([0x71; 16]);
+        let pending_id = RecoveryBundleId::from_bytes([0x72; 16]);
+        let trusted_key_id = KeyId::from_bytes([0x73; 16]);
+        store
+            .initialization_transaction::<_, VaultStoreError, _>(|transaction| {
+                transaction.create_init_pending(b"root-envelope")?;
+                transaction.promote_init_pending()?;
+                for (id, envelope) in [
+                    (active_id, &b"active-recovery"[..]),
+                    (pending_id, &b"pending-recovery"[..]),
+                ] {
+                    transaction.preserve_recovery(
+                        RecoveryBundleMetadata {
+                            id,
+                            created_at_unix_seconds: 3,
+                            reason: RecoveryReason::Rebuild,
+                        },
+                        RecoveryArtifacts {
+                            live: Some(envelope),
+                            init_pending: None,
+                            rebuild_pending: None,
+                        },
+                    )?;
+                }
+                transaction.stage_recovery_purge(pending_id, &[trusted_key_id])?;
+                assert_eq!(transaction.stage_full_purge()?, CommitOutcome::Committed);
+
+                let pending = transaction.read_full_purge_pending()?.unwrap();
+                assert_eq!(pending.envelopes.len(), 3);
+                assert_eq!(pending.trusted_key_ids, vec![trusted_key_id]);
+                assert!(pending.key_ids.is_none());
+                assert_eq!(
+                    transaction.read_live().unwrap_err().kind(),
+                    VaultStoreErrorKind::Conflict
+                );
+
+                assert_eq!(
+                    transaction.write_full_purge_plan(&[trusted_key_id])?,
+                    CommitOutcome::Committed
+                );
+                assert_eq!(
+                    transaction.read_full_purge_pending()?.unwrap().key_ids,
+                    Some(vec![trusted_key_id])
+                );
+                assert_eq!(
+                    transaction.remove_full_purge_pending()?,
+                    CommitOutcome::Committed
+                );
+                assert!(transaction.read_full_purge_pending()?.is_none());
+                assert!(transaction.read_live()?.is_none());
+                assert!(transaction.read_recovery_bundles()?.is_empty());
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!test.data().join(FULL_PURGE_DIRECTORY).exists());
+        assert!(test.data().join(LOCK_FILE).is_file());
+    }
+
+    #[test]
+    fn full_purge_tolerates_malformed_ciphertext_and_resumes_partial_cleanup() {
+        let test = TestDirectory::new();
+        let store = LocalVaultStore::new(test.data());
+        store
+            .initialization_transaction::<_, VaultStoreError, _>(|_| Ok(()))
+            .unwrap();
+        let recovery = ensure_recovery_directory(&test.data()).unwrap();
+        let id = RecoveryBundleId::from_bytes([0x74; 16]);
+        let bundle = recovery.join(id.to_hex());
+        let mut builder = DirBuilder::new();
+        builder.mode(0o700).create(&bundle).unwrap();
+        write_new_synced(&bundle, RECOVERY_LIVE_FILE, b"malformed-envelope").unwrap();
+        let recovery_temporary = recovery.join(format!(
+            ".gschrank-recovery-{}.pending",
+            RecoveryBundleId::from_bytes([0x75; 16]).to_hex()
+        ));
+        let mut builder = DirBuilder::new();
+        builder.mode(0o700).create(&recovery_temporary).unwrap();
+        write_new_synced(
+            &recovery_temporary,
+            RECOVERY_INIT_FILE,
+            b"partial-recovery-envelope",
+        )
+        .unwrap();
+        let write_temporary = ".gschrank-write-76767676767676767676767676767676.tmp";
+        write_new_synced(&test.data(), write_temporary, b"partial-write-envelope").unwrap();
+
+        store
+            .exclusive_transaction::<_, VaultStoreError, _>(|transaction| {
+                assert_eq!(transaction.stage_full_purge()?, CommitOutcome::Committed);
+                let pending = transaction.read_full_purge_pending()?.unwrap();
+                assert_eq!(pending.envelopes.len(), 3);
+                assert!(pending.trusted_key_ids.is_empty());
+                assert_eq!(
+                    transaction.write_full_purge_plan(&[])?,
+                    CommitOutcome::Committed
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let purge = test.data().join(FULL_PURGE_DIRECTORY);
+        assert!(!test.data().join(write_temporary).exists());
+        assert!(purge.join(write_temporary).is_file());
+        fs::remove_file(
+            purge
+                .join(RECOVERY_DIRECTORY)
+                .join(id.to_hex())
+                .join(RECOVERY_LIVE_FILE),
+        )
+        .unwrap();
+        let pending = store
+            .shared_read::<_, VaultStoreError, _>(|read| read.read_full_purge_pending())
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.key_ids, Some(Vec::new()));
+
+        store
+            .exclusive_transaction::<_, VaultStoreError, _>(|transaction| {
+                transaction.remove_full_purge_pending()?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!purge.exists());
     }
 
     #[test]

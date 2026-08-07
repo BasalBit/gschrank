@@ -111,6 +111,59 @@ impl ShellPreferenceStore {
         sync_directory(&self.directory).map_err(|_| PreferenceError::OutcomeIndeterminate)
     }
 
+    pub(crate) fn remove(&self) -> Result<(), PreferenceError> {
+        if !self.prepare_directory(false)? {
+            return Ok(());
+        }
+        let config_path = self.directory.join(CONFIG_FILE);
+        let config_exists = match fs::symlink_metadata(&config_path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(map_file_io(error)),
+        };
+        if !config_exists && config_temporary_paths(&self.directory)?.is_empty() {
+            return Ok(());
+        }
+        let lock = self.open_lock(true)?;
+        lock.lock().map_err(map_lock_io)?;
+
+        let config = open_optional_regular(&config_path)?;
+        if config_exists && config.is_none() {
+            return Err(PreferenceError::ConcurrentChange);
+        }
+        let had_config = config.is_some();
+        let temporary_paths = config_temporary_paths(&self.directory)?;
+        for path in &temporary_paths {
+            if open_optional_regular(path)?.is_none() {
+                return Err(PreferenceError::ConcurrentChange);
+            }
+        }
+        if let Some(config) = config {
+            decode(&read_config_bytes(config)?)?;
+        }
+
+        let mut changed = false;
+        if had_config {
+            fs::remove_file(&config_path).map_err(map_file_io)?;
+            changed = true;
+        }
+        for path in temporary_paths {
+            fs::remove_file(path).map_err(map_file_io)?;
+            changed = true;
+        }
+        if !changed {
+            return Ok(());
+        }
+        sync_directory(&self.directory).map_err(|_| PreferenceError::OutcomeIndeterminate)?;
+        if open_optional_regular(&config_path)?.is_some()
+            || !config_temporary_paths(&self.directory)?.is_empty()
+        {
+            Err(PreferenceError::OutcomeIndeterminate)
+        } else {
+            Ok(())
+        }
+    }
+
     fn prepare_directory(&self, create: bool) -> Result<bool, PreferenceError> {
         match fs::symlink_metadata(&self.directory) {
             Ok(metadata) => validate_directory(&metadata)?,
@@ -324,6 +377,30 @@ fn temporary_name() -> Result<String, PreferenceError> {
     Ok(name)
 }
 
+fn config_temporary_paths(directory: &Path) -> Result<Vec<PathBuf>, PreferenceError> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(directory).map_err(map_directory_io)? {
+        let entry = entry.map_err(map_directory_io)?;
+        let name = entry.file_name();
+        if is_config_temporary_name(name.as_bytes()) {
+            paths.push(directory.join(name));
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn is_config_temporary_name(name: &[u8]) -> bool {
+    const PREFIX: &[u8] = b".gschrank-config-";
+    const SUFFIX: &[u8] = b".tmp";
+    name.len() == PREFIX.len() + 32 + SUFFIX.len()
+        && name.starts_with(PREFIX)
+        && name.ends_with(SUFFIX)
+        && name[PREFIX.len()..PREFIX.len() + 32]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
 fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
@@ -459,6 +536,44 @@ mod tests {
     }
 
     #[test]
+    fn removes_valid_saved_preferences_idempotently_without_removing_the_lock() {
+        let test = TestDirectory::new();
+        let data = test.0.join("data");
+        let store = ShellPreferenceStore::new(data.clone());
+        store
+            .write(&ShellPreferences::new(test.0.join(".zshrc"), true).unwrap())
+            .unwrap();
+        let interrupted = data.join(".gschrank-config-0102030405060708090a0b0c0d0e0f10.tmp");
+        fs::write(&interrupted, b"interrupted preference write").unwrap();
+        fs::set_permissions(&interrupted, fs::Permissions::from_mode(0o600)).unwrap();
+
+        store.remove().unwrap();
+
+        assert_eq!(store.read().unwrap(), None);
+        assert!(!data.join(CONFIG_FILE).exists());
+        assert!(!interrupted.exists());
+        assert!(data.join(LOCK_FILE).is_file());
+        store.remove().unwrap();
+    }
+
+    #[test]
+    fn refuses_unsafe_config_temporaries_without_removing_preferences() {
+        let test = TestDirectory::new();
+        let data = test.0.join("data");
+        let store = ShellPreferenceStore::new(data.clone());
+        store
+            .write(&ShellPreferences::new(test.0.join(".zshrc"), true).unwrap())
+            .unwrap();
+        let interrupted = data.join(".gschrank-config-11111111111111111111111111111111.tmp");
+        fs::write(&interrupted, b"unsafe mode").unwrap();
+        fs::set_permissions(&interrupted, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(store.remove().unwrap_err(), PreferenceError::UnsafePath);
+        assert!(data.join(CONFIG_FILE).is_file());
+        assert!(interrupted.is_file());
+    }
+
+    #[test]
     fn rejects_malformed_and_symlinked_preference_files() {
         let test = TestDirectory::new();
         let data = test.0.join("data");
@@ -468,6 +583,7 @@ mod tests {
             .unwrap();
         fs::write(data.join(CONFIG_FILE), b"malformed").unwrap();
         assert_eq!(store.read().unwrap_err(), PreferenceError::InvalidFormat);
+        assert_eq!(store.remove().unwrap_err(), PreferenceError::InvalidFormat);
 
         fs::remove_file(data.join(CONFIG_FILE)).unwrap();
         let target = test.0.join("outside");

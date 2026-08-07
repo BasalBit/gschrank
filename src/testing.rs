@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Mutex, MutexGuard},
 };
 
@@ -11,7 +11,7 @@ use crate::{
     KeyId, MasterKey,
     key_provider::{InteractionPolicy, KeyProvider, KeyProviderError, KeyProviderErrorKind},
     vault_store::{
-        CommitOutcome, RecoveryArtifacts, RecoveryBundle, RecoveryBundleMetadata,
+        CommitOutcome, FullPurgePending, RecoveryArtifacts, RecoveryBundle, RecoveryBundleMetadata,
         RecoveryPurgePending, VaultRead, VaultStore, VaultStoreError, VaultStoreErrorKind,
         VaultTransaction,
     },
@@ -145,6 +145,7 @@ struct MemoryVaultState {
     rebuild_pending: Option<Zeroizing<Vec<u8>>>,
     recovery: Vec<RecoveryBundle>,
     recovery_purge_pending: Vec<RecoveryPurgePending>,
+    full_purge_pending: Option<FullPurgePending>,
     next_promotion: Option<PromotionFault>,
     next_replacement: Option<ReplacementFault>,
     next_recovery_preservation: Option<RecoveryPreservationFault>,
@@ -152,6 +153,9 @@ struct MemoryVaultState {
     next_rebuild_promotion: Option<RebuildPromotionFault>,
     next_recovery_purge_stage: Option<RecoveryPurgeStageFault>,
     next_recovery_purge_removal: Option<RecoveryPurgeRemovalFault>,
+    next_full_purge_stage: Option<FullPurgeFault>,
+    next_full_purge_plan: Option<FullPurgeFault>,
+    next_full_purge_removal: Option<FullPurgeFault>,
 }
 
 #[derive(Clone, Copy)]
@@ -198,6 +202,13 @@ pub(crate) enum RecoveryPurgeStageFault {
 
 #[derive(Clone, Copy)]
 pub(crate) enum RecoveryPurgeRemovalFault {
+    NotCommitted,
+    IndeterminateBeforeCommit,
+    IndeterminateAfterCommit,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum FullPurgeFault {
     NotCommitted,
     IndeterminateBeforeCommit,
     IndeterminateAfterCommit,
@@ -254,6 +265,18 @@ impl MemoryVaultStore {
         self.state().next_recovery_purge_removal = Some(fault);
     }
 
+    pub(crate) fn fail_next_full_purge_stage(&self, fault: FullPurgeFault) {
+        self.state().next_full_purge_stage = Some(fault);
+    }
+
+    pub(crate) fn fail_next_full_purge_plan(&self, fault: FullPurgeFault) {
+        self.state().next_full_purge_plan = Some(fault);
+    }
+
+    pub(crate) fn fail_next_full_purge_removal(&self, fault: FullPurgeFault) {
+        self.state().next_full_purge_removal = Some(fault);
+    }
+
     pub(crate) fn live(&self) -> Option<Vec<u8>> {
         self.state().live.as_ref().map(|bytes| bytes.to_vec())
     }
@@ -283,18 +306,22 @@ struct MemoryTransaction<'state> {
 
 impl VaultRead for MemoryTransaction<'_> {
     fn read_live(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError> {
+        self.ensure_not_full_purge_pending()?;
         Ok(self.state.live.clone())
     }
 
     fn read_init_pending(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError> {
+        self.ensure_not_full_purge_pending()?;
         Ok(self.state.init_pending.clone())
     }
 
     fn read_rebuild_pending(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError> {
+        self.ensure_not_full_purge_pending()?;
         Ok(self.state.rebuild_pending.clone())
     }
 
     fn read_recovery_bundles(&mut self) -> Result<Vec<RecoveryBundle>, VaultStoreError> {
+        self.ensure_not_full_purge_pending()?;
         Ok(self
             .state
             .recovery
@@ -311,6 +338,7 @@ impl VaultRead for MemoryTransaction<'_> {
     fn read_recovery_purge_pending(
         &mut self,
     ) -> Result<Vec<RecoveryPurgePending>, VaultStoreError> {
+        self.ensure_not_full_purge_pending()?;
         Ok(self
             .state
             .recovery_purge_pending
@@ -318,10 +346,19 @@ impl VaultRead for MemoryTransaction<'_> {
             .map(clone_recovery_purge_pending)
             .collect())
     }
+
+    fn read_full_purge_pending(&mut self) -> Result<Option<FullPurgePending>, VaultStoreError> {
+        Ok(self
+            .state
+            .full_purge_pending
+            .as_ref()
+            .map(clone_full_purge_pending))
+    }
 }
 
 impl VaultTransaction for MemoryTransaction<'_> {
     fn create_init_pending(&mut self, envelope: &[u8]) -> Result<(), VaultStoreError> {
+        self.ensure_not_full_purge_pending()?;
         if self.state.live.is_some()
             || self.state.init_pending.is_some()
             || self.state.rebuild_pending.is_some()
@@ -333,11 +370,13 @@ impl VaultTransaction for MemoryTransaction<'_> {
     }
 
     fn discard_init_pending(&mut self) -> Result<(), VaultStoreError> {
+        self.ensure_not_full_purge_pending()?;
         self.state.init_pending = None;
         Ok(())
     }
 
     fn promote_init_pending(&mut self) -> Result<CommitOutcome, VaultStoreError> {
+        self.ensure_not_full_purge_pending()?;
         match self.state.next_promotion.take() {
             Some(PromotionFault::NotCommitted) => return Ok(CommitOutcome::NotCommitted),
             Some(PromotionFault::IndeterminateBeforeCommit) => {
@@ -354,6 +393,7 @@ impl VaultTransaction for MemoryTransaction<'_> {
     }
 
     fn create_rebuild_pending(&mut self, envelope: &[u8]) -> Result<(), VaultStoreError> {
+        self.ensure_not_full_purge_pending()?;
         if self.state.live.is_none()
             || self.state.init_pending.is_some()
             || self.state.rebuild_pending.is_some()
@@ -365,11 +405,13 @@ impl VaultTransaction for MemoryTransaction<'_> {
     }
 
     fn discard_rebuild_pending(&mut self) -> Result<(), VaultStoreError> {
+        self.ensure_not_full_purge_pending()?;
         self.state.rebuild_pending = None;
         Ok(())
     }
 
     fn promote_rebuild_pending(&mut self) -> Result<CommitOutcome, VaultStoreError> {
+        self.ensure_not_full_purge_pending()?;
         if self.state.live.is_none() || self.state.rebuild_pending.is_none() {
             return Err(VaultStoreError::new(VaultStoreErrorKind::MissingState));
         }
@@ -389,6 +431,7 @@ impl VaultTransaction for MemoryTransaction<'_> {
     }
 
     fn clear_root_artifacts(&mut self) -> Result<CommitOutcome, VaultStoreError> {
+        self.ensure_not_full_purge_pending()?;
         if self.state.live.is_none()
             && self.state.init_pending.is_none()
             && self.state.rebuild_pending.is_none()
@@ -415,6 +458,7 @@ impl VaultTransaction for MemoryTransaction<'_> {
     }
 
     fn replace_live(&mut self, envelope: &[u8]) -> Result<CommitOutcome, VaultStoreError> {
+        self.ensure_not_full_purge_pending()?;
         if self.state.live.is_none() {
             return Err(VaultStoreError::new(VaultStoreErrorKind::MissingState));
         }
@@ -434,6 +478,7 @@ impl VaultTransaction for MemoryTransaction<'_> {
     }
 
     fn install_live(&mut self, envelope: &[u8]) -> Result<CommitOutcome, VaultStoreError> {
+        self.ensure_not_full_purge_pending()?;
         if self.state.live.is_some() {
             return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
         }
@@ -457,6 +502,7 @@ impl VaultTransaction for MemoryTransaction<'_> {
         metadata: RecoveryBundleMetadata,
         artifacts: RecoveryArtifacts<'_>,
     ) -> Result<CommitOutcome, VaultStoreError> {
+        self.ensure_not_full_purge_pending()?;
         if artifacts.live.is_none()
             && artifacts.init_pending.is_none()
             && artifacts.rebuild_pending.is_none()
@@ -493,6 +539,7 @@ impl VaultTransaction for MemoryTransaction<'_> {
         bundle_id: crate::vault_store::RecoveryBundleId,
         key_ids: &[KeyId],
     ) -> Result<CommitOutcome, VaultStoreError> {
+        self.ensure_not_full_purge_pending()?;
         match self.state.next_recovery_purge_stage.take() {
             Some(RecoveryPurgeStageFault::NotCommitted) => {
                 return Ok(CommitOutcome::NotCommitted);
@@ -514,6 +561,7 @@ impl VaultTransaction for MemoryTransaction<'_> {
         &mut self,
         bundle_id: crate::vault_store::RecoveryBundleId,
     ) -> Result<CommitOutcome, VaultStoreError> {
+        self.ensure_not_full_purge_pending()?;
         match self.state.next_recovery_purge_removal.take() {
             Some(RecoveryPurgeRemovalFault::NotCommitted) => {
                 return Ok(CommitOutcome::NotCommitted);
@@ -530,9 +578,130 @@ impl VaultTransaction for MemoryTransaction<'_> {
         self.commit_recovery_purge_removal(bundle_id)?;
         Ok(CommitOutcome::Committed)
     }
+
+    fn stage_full_purge(&mut self) -> Result<CommitOutcome, VaultStoreError> {
+        match self.state.next_full_purge_stage.take() {
+            Some(FullPurgeFault::NotCommitted) => return Ok(CommitOutcome::NotCommitted),
+            Some(FullPurgeFault::IndeterminateBeforeCommit) => {
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            Some(FullPurgeFault::IndeterminateAfterCommit) => {
+                self.commit_full_purge_stage();
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            None => {}
+        }
+        self.commit_full_purge_stage();
+        Ok(CommitOutcome::Committed)
+    }
+
+    fn write_full_purge_plan(
+        &mut self,
+        key_ids: &[KeyId],
+    ) -> Result<CommitOutcome, VaultStoreError> {
+        validate_full_purge_key_ids(key_ids)?;
+        match self.state.next_full_purge_plan.take() {
+            Some(FullPurgeFault::NotCommitted) => return Ok(CommitOutcome::NotCommitted),
+            Some(FullPurgeFault::IndeterminateBeforeCommit) => {
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            Some(FullPurgeFault::IndeterminateAfterCommit) => {
+                self.commit_full_purge_plan(key_ids)?;
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            None => {}
+        }
+        self.commit_full_purge_plan(key_ids)?;
+        Ok(CommitOutcome::Committed)
+    }
+
+    fn remove_full_purge_pending(&mut self) -> Result<CommitOutcome, VaultStoreError> {
+        match self.state.next_full_purge_removal.take() {
+            Some(FullPurgeFault::NotCommitted) => return Ok(CommitOutcome::NotCommitted),
+            Some(FullPurgeFault::IndeterminateBeforeCommit) => {
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            Some(FullPurgeFault::IndeterminateAfterCommit) => {
+                self.commit_full_purge_removal()?;
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            None => {}
+        }
+        self.commit_full_purge_removal()?;
+        Ok(CommitOutcome::Committed)
+    }
 }
 
 impl MemoryTransaction<'_> {
+    fn ensure_not_full_purge_pending(&self) -> Result<(), VaultStoreError> {
+        if self.state.full_purge_pending.is_some() {
+            Err(VaultStoreError::new(VaultStoreErrorKind::Conflict))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn commit_full_purge_stage(&mut self) {
+        if self.state.full_purge_pending.is_some() {
+            return;
+        }
+
+        let mut envelopes = Vec::new();
+        envelopes.extend(self.state.live.take());
+        envelopes.extend(self.state.init_pending.take());
+        envelopes.extend(self.state.rebuild_pending.take());
+        for bundle in self.state.recovery.drain(..) {
+            envelopes.extend(bundle.live);
+            envelopes.extend(bundle.init_pending);
+            envelopes.extend(bundle.rebuild_pending);
+        }
+        let mut trusted_key_ids = BTreeSet::new();
+        for pending in self.state.recovery_purge_pending.drain(..) {
+            if let Some(bundle) = pending.bundle {
+                envelopes.extend(bundle.live);
+                envelopes.extend(bundle.init_pending);
+                envelopes.extend(bundle.rebuild_pending);
+            }
+            if let Some(key_ids) = pending.key_ids {
+                trusted_key_ids.extend(key_ids);
+            }
+        }
+        self.state.full_purge_pending = Some(FullPurgePending {
+            envelopes,
+            trusted_key_ids: trusted_key_ids.into_iter().collect(),
+            key_ids: None,
+        });
+    }
+
+    fn commit_full_purge_plan(&mut self, key_ids: &[KeyId]) -> Result<(), VaultStoreError> {
+        let pending = self
+            .state
+            .full_purge_pending
+            .as_mut()
+            .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::MissingState))?;
+        match pending.key_ids.as_deref() {
+            Some(existing) if existing == key_ids => Ok(()),
+            Some(_) => Err(VaultStoreError::new(VaultStoreErrorKind::Conflict)),
+            None => {
+                pending.key_ids = Some(key_ids.to_vec());
+                Ok(())
+            }
+        }
+    }
+
+    fn commit_full_purge_removal(&mut self) -> Result<(), VaultStoreError> {
+        let pending = self
+            .state
+            .full_purge_pending
+            .as_ref()
+            .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::MissingState))?;
+        if pending.key_ids.is_none() {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+        }
+        self.state.full_purge_pending = None;
+        Ok(())
+    }
+
     fn commit_recovery_purge_stage(
         &mut self,
         bundle_id: crate::vault_store::RecoveryBundleId,
@@ -645,6 +814,22 @@ fn clone_recovery_purge_pending(pending: &RecoveryPurgePending) -> RecoveryPurge
         id: pending.id,
         bundle: pending.bundle.as_ref().map(clone_recovery_bundle),
         key_ids: pending.key_ids.clone(),
+    }
+}
+
+fn clone_full_purge_pending(pending: &FullPurgePending) -> FullPurgePending {
+    FullPurgePending {
+        envelopes: pending.envelopes.clone(),
+        trusted_key_ids: pending.trusted_key_ids.clone(),
+        key_ids: pending.key_ids.clone(),
+    }
+}
+
+fn validate_full_purge_key_ids(key_ids: &[KeyId]) -> Result<(), VaultStoreError> {
+    if key_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+        Err(VaultStoreError::new(VaultStoreErrorKind::Conflict))
+    } else {
+        Ok(())
     }
 }
 

@@ -181,6 +181,17 @@ pub(crate) struct RecoveryPurgePending {
     pub(crate) key_ids: Option<Vec<KeyId>>,
 }
 
+/// All encrypted state moved out of service for an explicit full purge.
+///
+/// Recovery-purge plans contribute trusted key identifiers because those
+/// plans were committed only after their source bundles authenticated. A
+/// present full-purge plan is the durable, exact deletion set for retries.
+pub(crate) struct FullPurgePending {
+    pub(crate) envelopes: Vec<Zeroizing<Vec<u8>>>,
+    pub(crate) trusted_key_ids: Vec<KeyId>,
+    pub(crate) key_ids: Option<Vec<KeyId>>,
+}
+
 /// Borrowed encrypted artifacts to preserve as one recovery bundle.
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -198,6 +209,7 @@ pub(crate) trait VaultRead {
     fn read_recovery_bundles(&mut self) -> Result<Vec<RecoveryBundle>, VaultStoreError>;
     fn read_recovery_purge_pending(&mut self)
     -> Result<Vec<RecoveryPurgePending>, VaultStoreError>;
+    fn read_full_purge_pending(&mut self) -> Result<Option<FullPurgePending>, VaultStoreError>;
 }
 
 /// Initialization artifact operations while the exclusive lock is retained.
@@ -228,6 +240,12 @@ pub(crate) trait VaultTransaction: VaultRead {
         &mut self,
         bundle_id: RecoveryBundleId,
     ) -> Result<CommitOutcome, VaultStoreError>;
+    fn stage_full_purge(&mut self) -> Result<CommitOutcome, VaultStoreError>;
+    fn write_full_purge_plan(
+        &mut self,
+        key_ids: &[KeyId],
+    ) -> Result<CommitOutcome, VaultStoreError>;
+    fn remove_full_purge_pending(&mut self) -> Result<CommitOutcome, VaultStoreError>;
 }
 
 /// Transaction-level access to encrypted vault artifacts.
