@@ -132,11 +132,13 @@ pub(crate) struct MemoryVaultStore {
 struct MemoryVaultState {
     live: Option<Zeroizing<Vec<u8>>>,
     init_pending: Option<Zeroizing<Vec<u8>>>,
+    rebuild_pending: Option<Zeroizing<Vec<u8>>>,
     recovery: Vec<RecoveryBundle>,
     next_promotion: Option<PromotionFault>,
     next_replacement: Option<ReplacementFault>,
     next_recovery_preservation: Option<RecoveryPreservationFault>,
     next_root_clear: Option<RootClearFault>,
+    next_rebuild_promotion: Option<RebuildPromotionFault>,
 }
 
 #[derive(Clone, Copy)]
@@ -167,6 +169,13 @@ pub(crate) enum RootClearFault {
     IndeterminateAfterCommit,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum RebuildPromotionFault {
+    NotCommitted,
+    IndeterminateBeforeCommit,
+    IndeterminateAfterCommit,
+}
+
 impl MemoryVaultStore {
     pub(crate) fn new() -> Self {
         Self {
@@ -186,6 +195,10 @@ impl MemoryVaultStore {
         self.state().init_pending = Some(Zeroizing::new(envelope));
     }
 
+    pub(crate) fn set_rebuild_pending(&self, envelope: Vec<u8>) {
+        self.state().rebuild_pending = Some(Zeroizing::new(envelope));
+    }
+
     pub(crate) fn fail_next_promotion(&self, fault: PromotionFault) {
         self.state().next_promotion = Some(fault);
     }
@@ -202,6 +215,10 @@ impl MemoryVaultStore {
         self.state().next_root_clear = Some(fault);
     }
 
+    pub(crate) fn fail_next_rebuild_promotion(&self, fault: RebuildPromotionFault) {
+        self.state().next_rebuild_promotion = Some(fault);
+    }
+
     pub(crate) fn live(&self) -> Option<Vec<u8>> {
         self.state().live.as_ref().map(|bytes| bytes.to_vec())
     }
@@ -209,6 +226,13 @@ impl MemoryVaultStore {
     pub(crate) fn pending(&self) -> Option<Vec<u8>> {
         self.state()
             .init_pending
+            .as_ref()
+            .map(|bytes| bytes.to_vec())
+    }
+
+    pub(crate) fn rebuild_pending(&self) -> Option<Vec<u8>> {
+        self.state()
+            .rebuild_pending
             .as_ref()
             .map(|bytes| bytes.to_vec())
     }
@@ -231,6 +255,10 @@ impl VaultRead for MemoryTransaction<'_> {
         Ok(self.state.init_pending.clone())
     }
 
+    fn read_rebuild_pending(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError> {
+        Ok(self.state.rebuild_pending.clone())
+    }
+
     fn read_recovery_bundles(&mut self) -> Result<Vec<RecoveryBundle>, VaultStoreError> {
         Ok(self
             .state
@@ -240,6 +268,7 @@ impl VaultRead for MemoryTransaction<'_> {
                 metadata: bundle.metadata,
                 live: bundle.live.clone(),
                 init_pending: bundle.init_pending.clone(),
+                rebuild_pending: bundle.rebuild_pending.clone(),
             })
             .collect())
     }
@@ -247,7 +276,10 @@ impl VaultRead for MemoryTransaction<'_> {
 
 impl VaultTransaction for MemoryTransaction<'_> {
     fn create_init_pending(&mut self, envelope: &[u8]) -> Result<(), VaultStoreError> {
-        if self.state.live.is_some() || self.state.init_pending.is_some() {
+        if self.state.live.is_some()
+            || self.state.init_pending.is_some()
+            || self.state.rebuild_pending.is_some()
+        {
             return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
         }
         self.state.init_pending = Some(Zeroizing::new(envelope.to_vec()));
@@ -275,8 +307,46 @@ impl VaultTransaction for MemoryTransaction<'_> {
         Ok(CommitOutcome::Committed)
     }
 
+    fn create_rebuild_pending(&mut self, envelope: &[u8]) -> Result<(), VaultStoreError> {
+        if self.state.live.is_none()
+            || self.state.init_pending.is_some()
+            || self.state.rebuild_pending.is_some()
+        {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+        }
+        self.state.rebuild_pending = Some(Zeroizing::new(envelope.to_vec()));
+        Ok(())
+    }
+
+    fn discard_rebuild_pending(&mut self) -> Result<(), VaultStoreError> {
+        self.state.rebuild_pending = None;
+        Ok(())
+    }
+
+    fn promote_rebuild_pending(&mut self) -> Result<CommitOutcome, VaultStoreError> {
+        if self.state.live.is_none() || self.state.rebuild_pending.is_none() {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::MissingState));
+        }
+        match self.state.next_rebuild_promotion.take() {
+            Some(RebuildPromotionFault::NotCommitted) => return Ok(CommitOutcome::NotCommitted),
+            Some(RebuildPromotionFault::IndeterminateBeforeCommit) => {
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            Some(RebuildPromotionFault::IndeterminateAfterCommit) => {
+                self.promote_rebuild()?;
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            None => {}
+        }
+        self.promote_rebuild()?;
+        Ok(CommitOutcome::Committed)
+    }
+
     fn clear_root_artifacts(&mut self) -> Result<CommitOutcome, VaultStoreError> {
-        if self.state.live.is_none() && self.state.init_pending.is_none() {
+        if self.state.live.is_none()
+            && self.state.init_pending.is_none()
+            && self.state.rebuild_pending.is_none()
+        {
             return Err(VaultStoreError::new(VaultStoreErrorKind::MissingState));
         }
         match self.state.next_root_clear.take() {
@@ -287,12 +357,14 @@ impl VaultTransaction for MemoryTransaction<'_> {
             Some(RootClearFault::IndeterminateAfterCommit) => {
                 self.state.live = None;
                 self.state.init_pending = None;
+                self.state.rebuild_pending = None;
                 return Ok(CommitOutcome::Indeterminate);
             }
             None => {}
         }
         self.state.live = None;
         self.state.init_pending = None;
+        self.state.rebuild_pending = None;
         Ok(CommitOutcome::Committed)
     }
 
@@ -339,7 +411,10 @@ impl VaultTransaction for MemoryTransaction<'_> {
         metadata: RecoveryBundleMetadata,
         artifacts: RecoveryArtifacts<'_>,
     ) -> Result<CommitOutcome, VaultStoreError> {
-        if artifacts.live.is_none() && artifacts.init_pending.is_none() {
+        if artifacts.live.is_none()
+            && artifacts.init_pending.is_none()
+            && artifacts.rebuild_pending.is_none()
+        {
             return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
         }
         if self
@@ -380,6 +455,9 @@ impl MemoryTransaction<'_> {
             init_pending: artifacts
                 .init_pending
                 .map(|bytes| Zeroizing::new(bytes.to_vec())),
+            rebuild_pending: artifacts
+                .rebuild_pending
+                .map(|bytes| Zeroizing::new(bytes.to_vec())),
         });
     }
 
@@ -390,6 +468,16 @@ impl MemoryTransaction<'_> {
         let pending = self
             .state
             .init_pending
+            .take()
+            .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::MissingState))?;
+        self.state.live = Some(pending);
+        Ok(())
+    }
+
+    fn promote_rebuild(&mut self) -> Result<(), VaultStoreError> {
+        let pending = self
+            .state
+            .rebuild_pending
             .take()
             .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::MissingState))?;
         self.state.live = Some(pending);

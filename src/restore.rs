@@ -240,6 +240,11 @@ where
                 drop(opened);
                 drop(key);
             }
+            if let Some(pending) = &bundle.rebuild_pending {
+                let (opened, key) = self.open_source(pending, interaction)?;
+                drop(opened);
+                drop(key);
+            }
             self.restore_locked(
                 transaction,
                 envelope,
@@ -266,6 +271,9 @@ where
 
         if transaction.read_init_pending()?.is_some() {
             return Err(RestoreError::ConflictingInitialization);
+        }
+        if transaction.read_rebuild_pending()?.is_some() {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict).into());
         }
         let current = transaction.read_live()?;
         if let Some(current) = &current
@@ -342,6 +350,7 @@ where
                 RecoveryArtifacts {
                     live: Some(live),
                     init_pending: None,
+                    rebuild_pending: None,
                 },
             ) {
                 Err(error) if error.kind() == VaultStoreErrorKind::Conflict => continue,
@@ -364,6 +373,7 @@ where
                         .as_ref()
                         .is_some_and(|bytes| bytes.as_slice() == live)
                     && bundle.init_pending.is_none()
+                    && bundle.rebuild_pending.is_none()
             }) {
                 return Ok(metadata.id);
             }
@@ -693,6 +703,7 @@ mod tests {
                     RecoveryArtifacts {
                         live: Some(&selected),
                         init_pending: None,
+                        rebuild_pending: None,
                     },
                 )?;
                 Ok(())
@@ -739,6 +750,7 @@ mod tests {
                     RecoveryArtifacts {
                         live: Some(&selected),
                         init_pending: None,
+                        rebuild_pending: None,
                     },
                 )?;
                 Ok(())

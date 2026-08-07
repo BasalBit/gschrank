@@ -20,6 +20,7 @@ use crate::{
         BackupReceipt, ImportOperationError, ProfileInspection, ProfileOperationError,
         ProfileOperations, VaultInspection, VaultReadiness,
     },
+    rebuild::{RebuildOperations, RebuildReceipt},
     recovery::{RecoveryList, RecoveryOperationError, RecoveryOperations, RecoveryOverview},
     reset::{ResetError, ResetOperations, ResetPreparationError, ResetReceipt},
     restore::{RestoreOperations, RestoreReceipt},
@@ -55,6 +56,7 @@ Usage:
   gschrank doctor
   gschrank backup <absolute-destination>
   gschrank restore <absolute-source>
+  gschrank rebuild
   gschrank reset
   gschrank recovery list
   gschrank recovery restore <bundle-id>
@@ -81,6 +83,7 @@ Commands:
   doctor     Check vault and shell readiness without showing decrypted names
   backup     Create a Keychain-bound encrypted vault backup without overwriting
   restore    Authenticate and restore a Keychain-bound encrypted vault backup
+  rebuild    Re-encrypt every profile under a new vault identity and master key
   reset      Preserve current state and create a new independently keyed empty vault
   recovery   List, validate, or restore durable internal recovery bundles
   import     Add a strict stdin-only dotenv document to an existing profile
@@ -108,6 +111,7 @@ enum Command {
     Doctor,
     Backup(PathBuf),
     Restore(PathBuf),
+    Rebuild,
     Reset {
         shell_wrapper: bool,
     },
@@ -326,11 +330,11 @@ struct StatusReport {
 #[cfg(target_os = "macos")]
 impl StatusReport {
     fn exit_code(&self) -> u8 {
-        if matches!(self.vault, Err(ProfileOperationError::NotInitialized))
-            && self
-                .recovery
-                .is_ok_and(|overview| overview.initialization_pending)
-        {
+        if self.recovery.is_ok_and(|overview| {
+            overview.rebuild_pending
+                || (overview.initialization_pending
+                    && matches!(self.vault, Err(ProfileOperationError::NotInitialized)))
+        }) {
             14
         } else if let Err(error) = self.vault {
             error.exit_code()
@@ -338,7 +342,7 @@ impl StatusReport {
             error.exit_code()
         } else if self
             .recovery
-            .is_ok_and(|overview| overview.initialization_pending)
+            .is_ok_and(|overview| overview.initialization_pending || overview.rebuild_pending)
         {
             14
         } else if let Err(error) = self.shell {
@@ -362,11 +366,11 @@ struct DoctorReport {
 #[cfg(target_os = "macos")]
 impl DoctorReport {
     fn exit_code(&self) -> u8 {
-        if matches!(self.vault, Err(ProfileOperationError::NotInitialized))
-            && self
-                .recovery
-                .is_ok_and(|overview| overview.initialization_pending)
-        {
+        if self.recovery.is_ok_and(|overview| {
+            overview.rebuild_pending
+                || (overview.initialization_pending
+                    && matches!(self.vault, Err(ProfileOperationError::NotInitialized)))
+        }) {
             return 14;
         }
         if let Err(error) = self.vault {
@@ -377,7 +381,7 @@ impl DoctorReport {
         }
         if self
             .recovery
-            .is_ok_and(|overview| overview.initialization_pending)
+            .is_ok_and(|overview| overview.initialization_pending || overview.rebuild_pending)
         {
             return 14;
         }
@@ -428,6 +432,7 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
         Ok(Command::Doctor) => run_doctor(),
         Ok(Command::Backup(destination)) => run_backup(destination),
         Ok(Command::Restore(source)) => run_restore(source),
+        Ok(Command::Rebuild) => run_rebuild(),
         Ok(Command::Reset { shell_wrapper }) => run_reset(shell_wrapper),
         Ok(Command::RecoveryList) => run_recovery_list(),
         Ok(Command::RecoveryRestore(bundle_id)) => run_recovery_restore(bundle_id),
@@ -468,6 +473,7 @@ fn parse(arguments: &[OsString]) -> Result<Command, ParseError> {
             Ok(Command::Backup(PathBuf::from(destination)))
         }
         [restore, source] if restore == "restore" => Ok(Command::Restore(PathBuf::from(source))),
+        [rebuild] if rebuild == "rebuild" => Ok(Command::Rebuild),
         [reset] if reset == "reset" => Ok(Command::Reset {
             shell_wrapper: false,
         }),
@@ -1003,6 +1009,37 @@ fn render_restore_success(receipt: RestoreReceipt) -> String {
 }
 
 #[cfg(target_os = "macos")]
+fn run_rebuild() -> ExitCode {
+    let paths = match MacOsPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(13);
+        }
+    };
+    let keys = MacOsKeychainProvider::new();
+    let store = LocalVaultStore::new(paths.data_directory().to_owned());
+    let mut confirmer = TerminalTypedConfirmer;
+    match RebuildOperations::new(&keys, &store).rebuild(interaction_policy(), &mut confirmer) {
+        Ok(receipt) => {
+            print!("{}", render_rebuild_success(receipt));
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
+fn render_rebuild_success(receipt: RebuildReceipt) -> String {
+    format!(
+        "Rebuilt every profile and value under a new vault identity at revision 0.\nPrevious encrypted vault retained as recovery bundle {}.\nExisting shells keep their current environment snapshots; new shells use the rebuilt vault.\n",
+        receipt.recovery_bundle.to_hex()
+    )
+}
+
+#[cfg(target_os = "macos")]
 fn run_reset(shell_wrapper: bool) -> ExitCode {
     let paths = match MacOsPaths::discover() {
         Ok(paths) => paths,
@@ -1170,7 +1207,7 @@ fn report_diagnostic_errors<T>(
 #[cfg(target_os = "macos")]
 fn render_path_failure(command: &str) -> String {
     format!(
-        "{command}: unavailable\nLifecycle: unavailable\nVault: unavailable\nInitialization candidate: unknown\nRecovery bundles: unknown\nShell integration: unavailable\nRemediation: use private, user-owned local paths and retry.\n"
+        "{command}: unavailable\nLifecycle: unavailable\nVault: unavailable\nInitialization candidate: unknown\nRebuild candidate: unknown\nRecovery bundles: unknown\nShell integration: unavailable\nRemediation: use private, user-owned local paths and retry.\n"
     )
 }
 
@@ -1241,11 +1278,18 @@ fn append_recovery_overview(
         } else {
             "absent"
         });
+        output.push_str("\nRebuild candidate: ");
+        output.push_str(if overview.rebuild_pending {
+            "present"
+        } else {
+            "absent"
+        });
         output.push_str("\nRecovery bundles: ");
         output.push_str(&overview.bundle_count.to_string());
         output.push('\n');
     } else {
         output.push_str("Initialization candidate: unknown\n");
+        output.push_str("Rebuild candidate: unknown\n");
         output.push_str("Recovery bundles: unknown\n");
     }
 }
@@ -1421,6 +1465,13 @@ fn lifecycle_label<T>(
 ) -> &'static str {
     match (vault, recovery) {
         (
+            _,
+            Ok(RecoveryOverview {
+                rebuild_pending: true,
+                ..
+            }),
+        ) => "rebuild pending",
+        (
             Err(ProfileOperationError::NotInitialized),
             Ok(RecoveryOverview {
                 initialization_pending: true,
@@ -1444,6 +1495,13 @@ fn lifecycle_label<T>(
 fn status_outcome(report: &StatusReport) -> &'static str {
     match (&report.vault, &report.recovery) {
         (
+            _,
+            Ok(RecoveryOverview {
+                rebuild_pending: true,
+                ..
+            }),
+        ) => "rebuild pending",
+        (
             Err(ProfileOperationError::NotInitialized),
             Ok(RecoveryOverview {
                 initialization_pending: true,
@@ -1461,6 +1519,13 @@ fn status_outcome(report: &StatusReport) -> &'static str {
 #[cfg(target_os = "macos")]
 fn doctor_outcome(report: &DoctorReport) -> &'static str {
     match (&report.vault, &report.recovery) {
+        (
+            _,
+            Ok(RecoveryOverview {
+                rebuild_pending: true,
+                ..
+            }),
+        ) => "rebuild pending",
         (
             Err(ProfileOperationError::NotInitialized),
             Ok(RecoveryOverview {
@@ -1502,6 +1567,12 @@ fn doctor_remediation(report: &DoctorReport) -> &'static str {
             .is_ok_and(|overview| overview.initialization_pending)
     {
         return "preserve the conflicting initialization candidate and resolve it through an explicit recovery lifecycle operation.";
+    }
+    if report
+        .recovery
+        .is_ok_and(|overview| overview.rebuild_pending)
+    {
+        return "run 'gschrank rebuild' to safely resume the reserved rebuild.";
     }
     if let Err(error) = report.recovery
         && report.vault.is_ok()
@@ -2262,6 +2333,12 @@ fn run_restore(_source: PathBuf) -> ExitCode {
 }
 
 #[cfg(not(target_os = "macos"))]
+fn run_rebuild() -> ExitCode {
+    eprintln!("gschrank: this build does not support fresh-vault rebuild on this platform");
+    ExitCode::from(1)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn run_reset(_shell_wrapper: bool) -> ExitCode {
     eprintln!("gschrank: this build does not support recoverable vault reset on this platform");
     ExitCode::from(1)
@@ -2457,6 +2534,12 @@ mod tests {
     }
 
     #[test]
+    fn parses_only_the_exact_rebuild_grammar() {
+        assert!(matches!(parse(&["rebuild".into()]), Ok(Command::Rebuild)));
+        assert!(parse(&["rebuild".into(), "--force".into()]).is_err());
+    }
+
+    #[test]
     fn parses_only_the_exact_backup_grammar() {
         assert!(matches!(
             parse(&["backup".into(), "/tmp/vault.backup".into()]),
@@ -2597,6 +2680,20 @@ mod tests {
 
         let wrapped = render_reset_success(receipt, true);
         assert!(!wrapped.contains("current shell was not changed"));
+    }
+
+    #[test]
+    fn rebuild_success_reports_only_safe_recovery_and_shell_metadata() {
+        let output = render_rebuild_success(RebuildReceipt {
+            vault_id: crate::VaultId::from_bytes([1; 16]),
+            key_id: crate::KeyId::from_bytes([2; 16]),
+            recovery_bundle: RecoveryBundleId::from_bytes([3; 16]),
+        });
+        assert!(output.contains("revision 0"));
+        assert!(output.contains("03030303030303030303030303030303"));
+        assert!(output.contains("Existing shells keep"));
+        assert!(!output.contains("TOKEN"));
+        assert!(!output.contains("CANARY"));
     }
 
     #[test]
@@ -2871,6 +2968,7 @@ mod tests {
         fn clear_recovery() -> RecoveryOverview {
             RecoveryOverview {
                 initialization_pending: false,
+                rebuild_pending: false,
                 bundle_count: 0,
             }
         }
@@ -2952,6 +3050,7 @@ mod tests {
                 vault: Err(ProfileOperationError::NotInitialized),
                 recovery: Ok(RecoveryOverview {
                     initialization_pending: true,
+                    rebuild_pending: false,
                     bundle_count: 2,
                 }),
                 shell: Ok(installed_shell()),
@@ -2963,6 +3062,27 @@ mod tests {
             assert!(output.contains("Initialization candidate: present"));
             assert!(output.contains("Recovery bundles: 2"));
             assert!(output.contains("run 'gschrank init'"));
+            assert_eq!(report.exit_code(), 14);
+        }
+
+        #[test]
+        fn diagnostics_make_an_interrupted_rebuild_actionable_without_names() {
+            let report = DoctorReport {
+                vault: Ok(VaultReadiness { revision: 7 }),
+                recovery: Ok(RecoveryOverview {
+                    initialization_pending: false,
+                    rebuild_pending: true,
+                    bundle_count: 1,
+                }),
+                shell: Ok(installed_shell()),
+                current_shell: Ok(ManagedState::empty()),
+            };
+
+            let output = render_doctor(&report);
+            assert!(output.contains("Doctor: rebuild pending"));
+            assert!(output.contains("Rebuild candidate: present"));
+            assert!(output.contains("run 'gschrank rebuild'"));
+            assert!(!output.contains("TOKEN"));
             assert_eq!(report.exit_code(), 14);
         }
 

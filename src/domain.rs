@@ -219,6 +219,12 @@ impl Vault {
         self.revision
     }
 
+    /// Starts a fresh logical identity while retaining all profiles and
+    /// values. This is deliberately restricted to the rebuild lifecycle.
+    pub(crate) fn begin_fresh_identity(&mut self) {
+        self.revision = 0;
+    }
+
     /// Returns profile names in canonical byte order.
     #[must_use]
     pub fn profile_names(&self) -> impl ExactSizeIterator<Item = &ProfileName> {

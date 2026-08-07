@@ -139,6 +139,10 @@ where
             return self.validate_live(&live, interaction);
         }
 
+        if transaction.read_rebuild_pending()?.is_some() {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict).into());
+        }
+
         if let Some(pending) = transaction.read_init_pending()? {
             return self.resume_pending(transaction, &pending, interaction);
         }

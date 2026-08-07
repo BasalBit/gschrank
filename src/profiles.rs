@@ -427,6 +427,7 @@ where
         interaction: InteractionPolicy,
     ) -> Result<ImportReceipt, ImportOperationError> {
         self.store.exclusive_transaction(|transaction| {
+            Self::ensure_no_rebuild_pending(transaction)?;
             let (mut opened, key) = self.open_current(transaction, interaction)?;
             let preview = opened.vault.plan_import(profile, &imported)?;
             if !replace_existing && !preview.collisions.is_empty() {
@@ -580,6 +581,7 @@ where
         operation: impl FnOnce(&mut Vault) -> Result<R, DomainError>,
     ) -> Result<(MutationReceipt, R), ProfileOperationError> {
         self.store.exclusive_transaction(|transaction| {
+            Self::ensure_no_rebuild_pending(transaction)?;
             let (mut opened, key) = self.open_current(transaction, interaction)?;
             let result = operation(&mut opened.vault)?;
             let expected_revision = opened.vault.revision();
@@ -609,6 +611,13 @@ where
     ) -> Result<(crate::OpenedVault, MasterKey), ProfileOperationError> {
         let (opened, key, _envelope) = self.open_current_with_envelope(read, interaction)?;
         Ok((opened, key))
+    }
+
+    fn ensure_no_rebuild_pending(read: &mut dyn VaultRead) -> Result<(), ProfileOperationError> {
+        if read.read_rebuild_pending()?.is_some() {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict).into());
+        }
+        Ok(())
     }
 
     fn open_current_with_envelope(

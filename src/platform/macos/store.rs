@@ -23,15 +23,18 @@ use super::system;
 const LIVE_FILE: &str = "vault";
 const LOCK_FILE: &str = "vault.lock";
 const INIT_PENDING_FILE: &str = "vault.init.pending";
+const REBUILD_PENDING_FILE: &str = "vault.rebuild.pending";
 const RECOVERY_DIRECTORY: &str = "recovery";
 const RECOVERY_MANIFEST_FILE: &str = "manifest";
 const RECOVERY_LIVE_FILE: &str = "vault";
 const RECOVERY_INIT_FILE: &str = "vault.init.pending";
+const RECOVERY_REBUILD_FILE: &str = "vault.rebuild.pending";
 const RECOVERY_MANIFEST_MAGIC: &[u8; 8] = b"GSCHRCV1";
 const RECOVERY_MANIFEST_VERSION: u16 = 1;
 const RECOVERY_MANIFEST_LENGTH: usize = 40;
 const RECOVERY_FLAG_LIVE: u8 = 0b0000_0001;
 const RECOVERY_FLAG_INIT: u8 = 0b0000_0010;
+const RECOVERY_FLAG_REBUILD: u8 = 0b0000_0100;
 const TEMP_ATTEMPTS: usize = 16;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -167,6 +170,10 @@ impl VaultRead for LocalTransaction<'_> {
         read_artifact(self.directory, INIT_PENDING_FILE)
     }
 
+    fn read_rebuild_pending(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError> {
+        read_artifact(self.directory, REBUILD_PENDING_FILE)
+    }
+
     fn read_recovery_bundles(&mut self) -> Result<Vec<RecoveryBundle>, VaultStoreError> {
         read_recovery_bundles(self.directory)
     }
@@ -176,6 +183,7 @@ impl VaultTransaction for LocalTransaction<'_> {
     fn create_init_pending(&mut self, envelope: &[u8]) -> Result<(), VaultStoreError> {
         if artifact_exists(self.directory, LIVE_FILE)?
             || artifact_exists(self.directory, INIT_PENDING_FILE)?
+            || artifact_exists(self.directory, REBUILD_PENDING_FILE)?
         {
             return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
         }
@@ -218,10 +226,56 @@ impl VaultTransaction for LocalTransaction<'_> {
         }
     }
 
+    fn create_rebuild_pending(&mut self, envelope: &[u8]) -> Result<(), VaultStoreError> {
+        if !artifact_exists(self.directory, LIVE_FILE)?
+            || artifact_exists(self.directory, INIT_PENDING_FILE)?
+            || artifact_exists(self.directory, REBUILD_PENDING_FILE)?
+        {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+        }
+        durably_install(
+            self.directory,
+            REBUILD_PENDING_FILE,
+            envelope,
+            DestinationState::Absent,
+        )
+        .map(|_| ())
+    }
+
+    fn discard_rebuild_pending(&mut self) -> Result<(), VaultStoreError> {
+        if read_artifact(self.directory, REBUILD_PENDING_FILE)?.is_none() {
+            return Ok(());
+        }
+        fs::remove_file(self.directory.join(REBUILD_PENDING_FILE)).map_err(map_file_io)?;
+        sync_directory(self.directory)
+            .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::OutcomeIndeterminate))
+    }
+
+    fn promote_rebuild_pending(&mut self) -> Result<CommitOutcome, VaultStoreError> {
+        if !artifact_exists(self.directory, LIVE_FILE)? {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::MissingState));
+        }
+        let pending = read_artifact(self.directory, REBUILD_PENDING_FILE)?
+            .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::MissingState))?;
+        fs::rename(
+            self.directory.join(REBUILD_PENDING_FILE),
+            self.directory.join(LIVE_FILE),
+        )
+        .map_err(map_file_io)?;
+        if sync_directory(self.directory).is_err() {
+            return Ok(CommitOutcome::Indeterminate);
+        }
+        if verify_artifact(self.directory, LIVE_FILE, &pending).is_err() {
+            return Ok(CommitOutcome::Indeterminate);
+        }
+        Ok(CommitOutcome::Committed)
+    }
+
     fn clear_root_artifacts(&mut self) -> Result<CommitOutcome, VaultStoreError> {
         let live_exists = read_artifact(self.directory, LIVE_FILE)?.is_some();
         let pending_exists = read_artifact(self.directory, INIT_PENDING_FILE)?.is_some();
-        if !live_exists && !pending_exists {
+        let rebuild_exists = read_artifact(self.directory, REBUILD_PENDING_FILE)?.is_some();
+        if !live_exists && !pending_exists && !rebuild_exists {
             return Err(VaultStoreError::new(VaultStoreErrorKind::MissingState));
         }
 
@@ -229,6 +283,7 @@ impl VaultTransaction for LocalTransaction<'_> {
         for (exists, name) in [
             (live_exists, LIVE_FILE),
             (pending_exists, INIT_PENDING_FILE),
+            (rebuild_exists, REBUILD_PENDING_FILE),
         ] {
             if !exists {
                 continue;
@@ -248,8 +303,9 @@ impl VaultTransaction for LocalTransaction<'_> {
         match (
             read_artifact(self.directory, LIVE_FILE),
             read_artifact(self.directory, INIT_PENDING_FILE),
+            read_artifact(self.directory, REBUILD_PENDING_FILE),
         ) {
-            (Ok(None), Ok(None)) => Ok(CommitOutcome::Committed),
+            (Ok(None), Ok(None), Ok(None)) => Ok(CommitOutcome::Committed),
             _ => Ok(CommitOutcome::Indeterminate),
         }
     }
@@ -379,12 +435,19 @@ fn preserve_recovery_bundle(
     metadata: RecoveryBundleMetadata,
     artifacts: RecoveryArtifacts<'_>,
 ) -> Result<CommitOutcome, VaultStoreError> {
-    if artifacts.live.is_none() && artifacts.init_pending.is_none() {
+    if artifacts.live.is_none()
+        && artifacts.init_pending.is_none()
+        && artifacts.rebuild_pending.is_none()
+    {
         return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
     }
-    for envelope in [artifacts.live, artifacts.init_pending]
-        .into_iter()
-        .flatten()
+    for envelope in [
+        artifacts.live,
+        artifacts.init_pending,
+        artifacts.rebuild_pending,
+    ]
+    .into_iter()
+    .flatten()
     {
         if envelope.len() > MAX_ENVELOPE_SIZE {
             return Err(VaultStoreError::new(VaultStoreErrorKind::IoFailure));
@@ -417,6 +480,9 @@ fn preserve_recovery_bundle(
         if let Some(pending) = artifacts.init_pending {
             write_new_synced(&temporary, RECOVERY_INIT_FILE, pending)?;
         }
+        if let Some(pending) = artifacts.rebuild_pending {
+            write_new_synced(&temporary, RECOVERY_REBUILD_FILE, pending)?;
+        }
         let manifest = encode_recovery_manifest(metadata, artifacts);
         write_new_synced(&temporary, RECOVERY_MANIFEST_FILE, &manifest)?;
         sync_directory(&temporary).map_err(map_directory_io)
@@ -443,6 +509,11 @@ fn preserve_recovery_bundle(
             .as_ref()
             .map(|bytes| bytes.as_slice())
             != artifacts.init_pending
+        || committed
+            .rebuild_pending
+            .as_ref()
+            .map(|bytes| bytes.as_slice())
+            != artifacts.rebuild_pending
     {
         return Ok(CommitOutcome::Indeterminate);
     }
@@ -517,6 +588,14 @@ fn read_recovery_bundle(
     } else {
         None
     };
+    let rebuild_pending = if flags & RECOVERY_FLAG_REBUILD != 0 {
+        Some(
+            read_artifact(directory, RECOVERY_REBUILD_FILE)?
+                .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::Conflict))?,
+        )
+    } else {
+        None
+    };
     let mut entries = Vec::new();
     for entry in fs::read_dir(directory).map_err(map_directory_io)? {
         let entry = entry.map_err(map_directory_io)?;
@@ -535,6 +614,9 @@ fn read_recovery_bundle(
     if init_pending.is_some() {
         expected.push(RECOVERY_INIT_FILE);
     }
+    if rebuild_pending.is_some() {
+        expected.push(RECOVERY_REBUILD_FILE);
+    }
     expected.sort_unstable();
     if entries != expected {
         return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
@@ -543,6 +625,7 @@ fn read_recovery_bundle(
         metadata,
         live,
         init_pending,
+        rebuild_pending,
     })
 }
 
@@ -560,7 +643,8 @@ fn encode_recovery_manifest(
         RecoveryReason::Rebuild => 3,
     };
     bytes[11] = (u8::from(artifacts.live.is_some()) * RECOVERY_FLAG_LIVE)
-        | (u8::from(artifacts.init_pending.is_some()) * RECOVERY_FLAG_INIT);
+        | (u8::from(artifacts.init_pending.is_some()) * RECOVERY_FLAG_INIT)
+        | (u8::from(artifacts.rebuild_pending.is_some()) * RECOVERY_FLAG_REBUILD);
     bytes[12..20].copy_from_slice(&metadata.created_at_unix_seconds.to_be_bytes());
     bytes[20..36].copy_from_slice(metadata.id.as_bytes());
     bytes
@@ -581,7 +665,8 @@ fn decode_recovery_manifest(bytes: &[u8]) -> Result<(RecoveryBundleMetadata, u8)
         _ => return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict)),
     };
     let flags = bytes[11];
-    if flags == 0 || flags & !(RECOVERY_FLAG_LIVE | RECOVERY_FLAG_INIT) != 0 {
+    if flags == 0 || flags & !(RECOVERY_FLAG_LIVE | RECOVERY_FLAG_INIT | RECOVERY_FLAG_REBUILD) != 0
+    {
         return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
     }
     let created_at_unix_seconds = u64::from_be_bytes(
@@ -850,6 +935,43 @@ mod tests {
     }
 
     #[test]
+    fn creates_and_atomically_promotes_a_reserved_rebuild_candidate() {
+        let test = TestDirectory::new();
+        let store = LocalVaultStore::new(test.data());
+        store
+            .initialization_transaction::<_, VaultStoreError, _>(|transaction| {
+                transaction.create_init_pending(b"old-live")?;
+                transaction.promote_init_pending()?;
+                transaction.create_rebuild_pending(b"rebuilt-live")?;
+                assert_eq!(
+                    transaction.read_rebuild_pending()?.unwrap().as_slice(),
+                    b"rebuilt-live"
+                );
+                assert_eq!(
+                    transaction.promote_rebuild_pending()?,
+                    CommitOutcome::Committed
+                );
+                assert_eq!(
+                    transaction.read_live()?.unwrap().as_slice(),
+                    b"rebuilt-live"
+                );
+                assert!(transaction.read_rebuild_pending()?.is_none());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            fs::metadata(test.data().join(LIVE_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(!test.data().join(REBUILD_PENDING_FILE).exists());
+    }
+
+    #[test]
     fn preserves_exact_recovery_bundles_with_restrictive_durable_structure() {
         let test = TestDirectory::new();
         let store = LocalVaultStore::new(test.data());
@@ -860,6 +982,7 @@ mod tests {
         };
         let live = b"opaque-live-envelope";
         let pending = b"opaque-init-envelope";
+        let rebuild = b"opaque-rebuild-envelope";
 
         store
             .initialization_transaction::<_, VaultStoreError, _>(|transaction| {
@@ -869,6 +992,7 @@ mod tests {
                         RecoveryArtifacts {
                             live: Some(live),
                             init_pending: Some(pending),
+                            rebuild_pending: Some(rebuild),
                         },
                     )?,
                     CommitOutcome::Committed
@@ -887,6 +1011,10 @@ mod tests {
             bundles[0].init_pending.as_ref().unwrap().as_slice(),
             pending
         );
+        assert_eq!(
+            bundles[0].rebuild_pending.as_ref().unwrap().as_slice(),
+            rebuild
+        );
 
         let recovery = test.data().join(RECOVERY_DIRECTORY);
         let bundle = recovery.join(metadata.id.to_hex());
@@ -902,6 +1030,7 @@ mod tests {
             RECOVERY_MANIFEST_FILE,
             RECOVERY_LIVE_FILE,
             RECOVERY_INIT_FILE,
+            RECOVERY_REBUILD_FILE,
         ] {
             assert_eq!(
                 fs::metadata(bundle.join(name))
@@ -932,6 +1061,12 @@ mod tests {
             fs::Permissions::from_mode(0o600),
         )
         .unwrap();
+        fs::write(test.data().join(REBUILD_PENDING_FILE), b"old-rebuild").unwrap();
+        fs::set_permissions(
+            test.data().join(REBUILD_PENDING_FILE),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         let metadata = RecoveryBundleMetadata {
             id: RecoveryBundleId::from_bytes([0x6b; 16]),
             created_at_unix_seconds: 1_765_000_002,
@@ -942,12 +1077,14 @@ mod tests {
             .exclusive_transaction::<_, VaultStoreError, _>(|transaction| {
                 let live = transaction.read_live()?.unwrap();
                 let pending = transaction.read_init_pending()?.unwrap();
+                let rebuild = transaction.read_rebuild_pending()?.unwrap();
                 assert_eq!(
                     transaction.preserve_recovery(
                         metadata,
                         RecoveryArtifacts {
                             live: Some(&live),
                             init_pending: Some(&pending),
+                            rebuild_pending: Some(&rebuild),
                         },
                     )?,
                     CommitOutcome::Committed
@@ -958,6 +1095,7 @@ mod tests {
                 );
                 assert!(transaction.read_live()?.is_none());
                 assert!(transaction.read_init_pending()?.is_none());
+                assert!(transaction.read_rebuild_pending()?.is_none());
                 Ok(())
             })
             .unwrap();
@@ -971,6 +1109,10 @@ mod tests {
         assert_eq!(
             bundles[0].init_pending.as_ref().unwrap().as_slice(),
             b"old-pending"
+        );
+        assert_eq!(
+            bundles[0].rebuild_pending.as_ref().unwrap().as_slice(),
+            b"old-rebuild"
         );
     }
 
@@ -989,12 +1131,16 @@ mod tests {
             let artifacts = RecoveryArtifacts {
                 live: Some(b"live"),
                 init_pending: Some(b"pending"),
+                rebuild_pending: Some(b"rebuild"),
             };
             let encoded = encode_recovery_manifest(metadata, artifacts);
             let (decoded, flags) = decode_recovery_manifest(&encoded).unwrap();
             assert_eq!(decoded.reason, expected_reason);
             assert_eq!(decoded, metadata);
-            assert_eq!(flags, RECOVERY_FLAG_LIVE | RECOVERY_FLAG_INIT);
+            assert_eq!(
+                flags,
+                RECOVERY_FLAG_LIVE | RECOVERY_FLAG_INIT | RECOVERY_FLAG_REBUILD
+            );
         }
 
         let metadata = RecoveryBundleMetadata {
@@ -1007,6 +1153,7 @@ mod tests {
             RecoveryArtifacts {
                 live: Some(b"live"),
                 init_pending: None,
+                rebuild_pending: None,
             },
         );
         noncanonical[39] = 1;
@@ -1055,6 +1202,7 @@ mod tests {
                     RecoveryArtifacts {
                         live: Some(&live),
                         init_pending: None,
+                        rebuild_pending: None,
                     },
                 )?;
                 Ok(())

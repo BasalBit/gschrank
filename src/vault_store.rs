@@ -165,6 +165,7 @@ pub(crate) struct RecoveryBundle {
     pub(crate) metadata: RecoveryBundleMetadata,
     pub(crate) live: Option<Zeroizing<Vec<u8>>>,
     pub(crate) init_pending: Option<Zeroizing<Vec<u8>>>,
+    pub(crate) rebuild_pending: Option<Zeroizing<Vec<u8>>>,
 }
 
 /// Borrowed encrypted artifacts to preserve as one recovery bundle.
@@ -173,12 +174,14 @@ pub(crate) struct RecoveryBundle {
 pub(crate) struct RecoveryArtifacts<'artifacts> {
     pub(crate) live: Option<&'artifacts [u8]>,
     pub(crate) init_pending: Option<&'artifacts [u8]>,
+    pub(crate) rebuild_pending: Option<&'artifacts [u8]>,
 }
 
 /// Read access while the store retains its stable shared or exclusive lock.
 pub(crate) trait VaultRead {
     fn read_live(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError>;
     fn read_init_pending(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError>;
+    fn read_rebuild_pending(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError>;
     fn read_recovery_bundles(&mut self) -> Result<Vec<RecoveryBundle>, VaultStoreError>;
 }
 
@@ -187,8 +190,11 @@ pub(crate) trait VaultTransaction: VaultRead {
     fn create_init_pending(&mut self, envelope: &[u8]) -> Result<(), VaultStoreError>;
     fn discard_init_pending(&mut self) -> Result<(), VaultStoreError>;
     fn promote_init_pending(&mut self) -> Result<CommitOutcome, VaultStoreError>;
-    /// Remove the live and reserved initialization artifacts after an exact
-    /// recovery copy has been committed. Recovery bundles are never touched.
+    fn create_rebuild_pending(&mut self, envelope: &[u8]) -> Result<(), VaultStoreError>;
+    fn discard_rebuild_pending(&mut self) -> Result<(), VaultStoreError>;
+    fn promote_rebuild_pending(&mut self) -> Result<CommitOutcome, VaultStoreError>;
+    /// Remove the live and all reserved root artifacts after an exact recovery
+    /// copy has been committed. Recovery bundles are never touched.
     fn clear_root_artifacts(&mut self) -> Result<CommitOutcome, VaultStoreError>;
     fn install_live(&mut self, envelope: &[u8]) -> Result<CommitOutcome, VaultStoreError>;
     fn replace_live(&mut self, envelope: &[u8]) -> Result<CommitOutcome, VaultStoreError>;

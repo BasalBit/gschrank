@@ -17,7 +17,7 @@ const MAX_RECOVERY_ID_ATTEMPTS: usize = 8;
 const RESET_CONFIRMATION: TypedConfirmationRequest = TypedConfirmationRequest {
     expected: "RESET",
     action: "replace the current state with a new empty vault",
-    warning: "The current encrypted vault and any pending initialization will be retained as an internal recovery bundle. Existing Keychain items and external backups will not be deleted.",
+    warning: "The current encrypted vault and any pending lifecycle state will be retained as an internal recovery bundle. Existing Keychain items and external backups will not be deleted.",
 };
 
 /// A safe failure supplied by the caller while preparing dependent state.
@@ -159,7 +159,8 @@ where
         self.store.exclusive_transaction(|transaction| {
             let live = transaction.read_live()?;
             let init_pending = transaction.read_init_pending()?;
-            if live.is_none() && init_pending.is_none() {
+            let rebuild_pending = transaction.read_rebuild_pending()?;
+            if live.is_none() && init_pending.is_none() && rebuild_pending.is_none() {
                 return Err(ResetError::NotInitialized);
             }
 
@@ -170,6 +171,7 @@ where
                 transaction,
                 live.as_ref().map(|bytes| bytes.as_slice()),
                 init_pending.as_ref().map(|bytes| bytes.as_slice()),
+                rebuild_pending.as_ref().map(|bytes| bytes.as_slice()),
             )?;
             Self::clear_preserved_root(transaction)?;
             let InitOutcome::Created { vault_id, key_id } =
@@ -190,6 +192,7 @@ where
         transaction: &mut dyn VaultTransaction,
         live: Option<&[u8]>,
         init_pending: Option<&[u8]>,
+        rebuild_pending: Option<&[u8]>,
     ) -> Result<RecoveryBundleId, ResetError> {
         let created_at_unix_seconds = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -201,9 +204,14 @@ where
                 created_at_unix_seconds,
                 reason: RecoveryReason::Reset,
             };
-            let outcome = match transaction
-                .preserve_recovery(metadata, RecoveryArtifacts { live, init_pending })
-            {
+            let outcome = match transaction.preserve_recovery(
+                metadata,
+                RecoveryArtifacts {
+                    live,
+                    init_pending,
+                    rebuild_pending,
+                },
+            ) {
                 Err(error) if error.kind() == VaultStoreErrorKind::Conflict => continue,
                 result => result?,
             };
@@ -229,6 +237,13 @@ where
                         bundle.init_pending.as_ref().map(|bytes| bytes.as_slice()),
                         init_pending,
                     )
+                    && optional_bytes_equal(
+                        bundle
+                            .rebuild_pending
+                            .as_ref()
+                            .map(|bytes| bytes.as_slice()),
+                        rebuild_pending,
+                    )
             }) {
                 return Ok(metadata.id);
             }
@@ -239,8 +254,9 @@ where
 
     fn clear_preserved_root(transaction: &mut dyn VaultTransaction) -> Result<(), ResetError> {
         let outcome = transaction.clear_root_artifacts()?;
-        let root_is_absent =
-            transaction.read_live()?.is_none() && transaction.read_init_pending()?.is_none();
+        let root_is_absent = transaction.read_live()?.is_none()
+            && transaction.read_init_pending()?.is_none()
+            && transaction.read_rebuild_pending()?.is_none();
         match (outcome, root_is_absent) {
             (CommitOutcome::Committed | CommitOutcome::Indeterminate, true) => Ok(()),
             (CommitOutcome::NotCommitted, _) => Err(ResetError::RootClearNotCommitted),
@@ -369,8 +385,10 @@ mod tests {
         let (keys, store, old_key_id, _) = initialized_with_secret();
         let live = b"CANARY-unreadable-live".to_vec();
         let pending = b"CANARY-unreadable-pending".to_vec();
+        let rebuild = b"CANARY-unreadable-rebuild".to_vec();
         store.set_live(live.clone());
         store.set_pending(pending.clone());
+        store.set_rebuild_pending(rebuild.clone());
         keys.fail_next_load(crate::key_provider::KeyProviderErrorKind::BackendFailure);
         let mut confirmer = ScriptedConfirmer::accepting();
 
@@ -393,6 +411,13 @@ mod tests {
                 .as_ref()
                 .map(|bytes| bytes.as_slice()),
             Some(pending.as_slice())
+        );
+        assert_eq!(
+            bundles[0]
+                .rebuild_pending
+                .as_ref()
+                .map(|bytes| bytes.as_slice()),
+            Some(rebuild.as_slice())
         );
     }
 

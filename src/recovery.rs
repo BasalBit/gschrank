@@ -73,6 +73,7 @@ impl RecoveryList {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryOverview {
     pub(crate) initialization_pending: bool,
+    pub(crate) rebuild_pending: bool,
     pub(crate) bundle_count: usize,
 }
 
@@ -145,6 +146,7 @@ where
         self.store.shared_read(|read| {
             Ok(RecoveryOverview {
                 initialization_pending: read.read_init_pending()?.is_some(),
+                rebuild_pending: read.read_rebuild_pending()?.is_some(),
                 bundle_count: read.read_recovery_bundles()?.len(),
             })
         })
@@ -170,14 +172,22 @@ where
         bundle: &RecoveryBundle,
         interaction: InteractionPolicy,
     ) -> RecoveryInspection {
-        let primary = bundle.live.as_deref().or(bundle.init_pending.as_deref());
+        let primary = bundle
+            .live
+            .as_deref()
+            .or(bundle.init_pending.as_deref())
+            .or(bundle.rebuild_pending.as_deref());
         let primary_metadata = primary.and_then(|envelope| inspect_envelope(envelope).ok());
-        let authentication = [bundle.live.as_deref(), bundle.init_pending.as_deref()]
-            .into_iter()
-            .flatten()
-            .map(|envelope| self.authenticate(envelope, interaction))
-            .max_by_key(|status| status.exit_code())
-            .unwrap_or(RecoveryAuthentication::Unreadable);
+        let authentication = [
+            bundle.live.as_deref(),
+            bundle.init_pending.as_deref(),
+            bundle.rebuild_pending.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|envelope| self.authenticate(envelope, interaction))
+        .max_by_key(|status| status.exit_code())
+        .unwrap_or(RecoveryAuthentication::Unreadable);
 
         RecoveryInspection {
             id: bundle.metadata.id,
@@ -257,6 +267,7 @@ mod tests {
                         RecoveryArtifacts {
                             live: Some(&live),
                             init_pending: None,
+                            rebuild_pending: None,
                         },
                     )?,
                     CommitOutcome::Committed
@@ -327,11 +338,13 @@ mod tests {
     fn overview_reports_reserved_initialization_and_bundle_state() {
         let (keys, store) = initialized_recovery();
         store.set_pending(b"opaque-conflicting-candidate".to_vec());
+        store.set_rebuild_pending(b"opaque-rebuild-candidate".to_vec());
 
         assert_eq!(
             RecoveryOperations::new(&keys, &store).overview().unwrap(),
             RecoveryOverview {
                 initialization_pending: true,
+                rebuild_pending: true,
                 bundle_count: 1,
             }
         );
@@ -355,6 +368,7 @@ mod tests {
                     RecoveryArtifacts {
                         live: Some(b"not-an-envelope"),
                         init_pending: None,
+                        rebuild_pending: None,
                     },
                 )?;
                 Ok(())
@@ -411,6 +425,7 @@ mod tests {
                         RecoveryArtifacts {
                             live: Some(&live),
                             init_pending: None,
+                            rebuild_pending: None,
                         },
                     )
                 })
