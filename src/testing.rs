@@ -1,0 +1,260 @@
+#![forbid(unsafe_code)]
+
+use std::{
+    collections::BTreeMap,
+    sync::{Mutex, MutexGuard},
+};
+
+use zeroize::Zeroizing;
+
+use crate::{
+    KeyId, MasterKey,
+    key_provider::{InteractionPolicy, KeyProvider, KeyProviderError, KeyProviderErrorKind},
+    vault_store::{
+        CommitOutcome, VaultRead, VaultStore, VaultStoreError, VaultStoreErrorKind,
+        VaultTransaction,
+    },
+};
+
+pub(crate) struct MemoryKeyProvider {
+    state: Mutex<MemoryKeyState>,
+}
+
+#[derive(Default)]
+struct MemoryKeyState {
+    keys: BTreeMap<KeyId, Zeroizing<[u8; 32]>>,
+    next_load_error: Option<KeyProviderErrorKind>,
+    next_store_error: Option<KeyProviderErrorKind>,
+    always_store_error: Option<KeyProviderErrorKind>,
+    load_calls: usize,
+    store_calls: usize,
+}
+
+impl MemoryKeyProvider {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(MemoryKeyState::default()),
+        }
+    }
+
+    pub(crate) fn fail_next_load(&self, kind: KeyProviderErrorKind) {
+        self.state().next_load_error = Some(kind);
+    }
+
+    pub(crate) fn fail_next_store(&self, kind: KeyProviderErrorKind) {
+        self.state().next_store_error = Some(kind);
+    }
+
+    pub(crate) fn always_fail_store(&self, kind: KeyProviderErrorKind) {
+        self.state().always_store_error = Some(kind);
+    }
+
+    pub(crate) fn insert(&self, key_id: KeyId, key: &MasterKey) {
+        self.state()
+            .keys
+            .insert(key_id, Zeroizing::new(*key.expose()));
+    }
+
+    pub(crate) fn contains(&self, key_id: &KeyId) -> bool {
+        self.state().keys.contains_key(key_id)
+    }
+
+    pub(crate) fn key_count(&self) -> usize {
+        self.state().keys.len()
+    }
+
+    pub(crate) fn store_calls(&self) -> usize {
+        self.state().store_calls
+    }
+
+    fn state(&self) -> MutexGuard<'_, MemoryKeyState> {
+        self.state.lock().expect("memory key provider lock")
+    }
+}
+
+impl KeyProvider for MemoryKeyProvider {
+    fn load(
+        &self,
+        key_id: &KeyId,
+        _interaction: InteractionPolicy,
+    ) -> Result<MasterKey, KeyProviderError> {
+        let mut state = self.state();
+        state.load_calls += 1;
+        if let Some(kind) = state.next_load_error.take() {
+            return Err(KeyProviderError::new(kind));
+        }
+        let key = state
+            .keys
+            .get(key_id)
+            .ok_or_else(|| KeyProviderError::new(KeyProviderErrorKind::NotFound))?;
+        Ok(MasterKey::from_bytes(**key))
+    }
+
+    fn store_new(
+        &self,
+        key_id: &KeyId,
+        key: &MasterKey,
+        _interaction: InteractionPolicy,
+    ) -> Result<(), KeyProviderError> {
+        let mut state = self.state();
+        state.store_calls += 1;
+        if let Some(kind) = state.next_store_error.take() {
+            return Err(KeyProviderError::new(kind));
+        }
+        if let Some(kind) = state.always_store_error {
+            return Err(KeyProviderError::new(kind));
+        }
+        if state.keys.contains_key(key_id) {
+            return Err(KeyProviderError::new(KeyProviderErrorKind::AlreadyExists));
+        }
+        state.keys.insert(*key_id, Zeroizing::new(*key.expose()));
+        Ok(())
+    }
+
+    fn delete(
+        &self,
+        key_id: &KeyId,
+        _interaction: InteractionPolicy,
+    ) -> Result<(), KeyProviderError> {
+        if self.state().keys.remove(key_id).is_some() {
+            Ok(())
+        } else {
+            Err(KeyProviderError::new(KeyProviderErrorKind::NotFound))
+        }
+    }
+}
+
+pub(crate) struct MemoryVaultStore {
+    state: Mutex<MemoryVaultState>,
+}
+
+#[derive(Default)]
+struct MemoryVaultState {
+    live: Option<Zeroizing<Vec<u8>>>,
+    init_pending: Option<Zeroizing<Vec<u8>>>,
+    next_promotion: Option<PromotionFault>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum PromotionFault {
+    NotCommitted,
+    IndeterminateBeforeCommit,
+    IndeterminateAfterCommit,
+}
+
+impl MemoryVaultStore {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(MemoryVaultState::default()),
+        }
+    }
+
+    pub(crate) fn set_live(&self, envelope: Vec<u8>) {
+        self.state().live = Some(Zeroizing::new(envelope));
+    }
+
+    pub(crate) fn set_pending(&self, envelope: Vec<u8>) {
+        self.state().init_pending = Some(Zeroizing::new(envelope));
+    }
+
+    pub(crate) fn fail_next_promotion(&self, fault: PromotionFault) {
+        self.state().next_promotion = Some(fault);
+    }
+
+    pub(crate) fn live(&self) -> Option<Vec<u8>> {
+        self.state().live.as_ref().map(|bytes| bytes.to_vec())
+    }
+
+    pub(crate) fn pending(&self) -> Option<Vec<u8>> {
+        self.state()
+            .init_pending
+            .as_ref()
+            .map(|bytes| bytes.to_vec())
+    }
+
+    fn state(&self) -> MutexGuard<'_, MemoryVaultState> {
+        self.state.lock().expect("memory vault store lock")
+    }
+}
+
+struct MemoryTransaction<'state> {
+    state: &'state mut MemoryVaultState,
+}
+
+impl VaultRead for MemoryTransaction<'_> {
+    fn read_live(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError> {
+        Ok(self.state.live.clone())
+    }
+}
+
+impl VaultTransaction for MemoryTransaction<'_> {
+    fn read_init_pending(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError> {
+        Ok(self.state.init_pending.clone())
+    }
+
+    fn create_init_pending(&mut self, envelope: &[u8]) -> Result<(), VaultStoreError> {
+        if self.state.live.is_some() || self.state.init_pending.is_some() {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+        }
+        self.state.init_pending = Some(Zeroizing::new(envelope.to_vec()));
+        Ok(())
+    }
+
+    fn discard_init_pending(&mut self) -> Result<(), VaultStoreError> {
+        self.state.init_pending = None;
+        Ok(())
+    }
+
+    fn promote_init_pending(&mut self) -> Result<CommitOutcome, VaultStoreError> {
+        match self.state.next_promotion.take() {
+            Some(PromotionFault::NotCommitted) => return Ok(CommitOutcome::NotCommitted),
+            Some(PromotionFault::IndeterminateBeforeCommit) => {
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            Some(PromotionFault::IndeterminateAfterCommit) => {
+                self.promote()?;
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            None => {}
+        }
+        self.promote()?;
+        Ok(CommitOutcome::Committed)
+    }
+}
+
+impl MemoryTransaction<'_> {
+    fn promote(&mut self) -> Result<(), VaultStoreError> {
+        if self.state.live.is_some() {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+        }
+        let pending = self
+            .state
+            .init_pending
+            .take()
+            .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::MissingState))?;
+        self.state.live = Some(pending);
+        Ok(())
+    }
+}
+
+impl VaultStore for MemoryVaultStore {
+    fn shared_read<T, E, F>(&self, operation: F) -> Result<T, E>
+    where
+        E: From<VaultStoreError>,
+        F: FnOnce(&mut dyn VaultRead) -> Result<T, E>,
+    {
+        let mut state = self.state();
+        let mut transaction = MemoryTransaction { state: &mut state };
+        operation(&mut transaction)
+    }
+
+    fn exclusive_transaction<T, E, F>(&self, operation: F) -> Result<T, E>
+    where
+        E: From<VaultStoreError>,
+        F: FnOnce(&mut dyn VaultTransaction) -> Result<T, E>,
+    {
+        let mut state = self.state();
+        let mut transaction = MemoryTransaction { state: &mut state };
+        operation(&mut transaction)
+    }
+}

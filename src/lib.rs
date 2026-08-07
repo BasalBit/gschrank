@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 //! Portable security core for Gschrank.
 //!
@@ -7,10 +7,21 @@
 //! shell adapters will compose these modules without changing their formats or
 //! policy.
 
+mod cli;
 mod codec;
 mod domain;
 mod envelope;
+mod init;
+mod key_provider;
+mod vault_store;
 
+#[cfg(target_os = "macos")]
+mod platform;
+
+#[cfg(test)]
+mod testing;
+
+pub use cli::run_cli;
 pub use codec::PayloadError;
 pub use domain::{DomainError, EnvironmentName, Mutation, ProfileName, SecretValue, Vault};
 pub use envelope::{

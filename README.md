@@ -5,11 +5,12 @@ vault and loading them safely into a shell. macOS and Zsh are the first
 supported platform and shell; the portable core is designed for a later Linux
 and Bash adapter.
 
-The project is currently under implementation. The first milestone implements
+The project is currently under implementation. The portable core implements
 the validated profile model, deterministic vault payload codec, and the
-authenticated XChaCha20-Poly1305 envelope. Keychain persistence, local atomic
-storage, and shell integration are the next milestone, so this build does not
-yet store or load real credentials.
+authenticated XChaCha20-Poly1305 envelope. On macOS, `gschrank init` now creates
+an empty encrypted vault through atomic APFS persistence and stores its random
+master key in the login Keychain. Profile editing and shell integration are not
+implemented yet, so the current CLI cannot store environment values.
 
 The canonical executable is `gschrank`. Configured interactive Zsh shells will
 also be able to expose the optional `gsch` function once shell integration is

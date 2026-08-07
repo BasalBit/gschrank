@@ -20,7 +20,7 @@ const NONCE_LENGTH: usize = 24;
 const AAD_DOMAIN: &[u8] = b"gschrank:vault-envelope:v1\0";
 
 /// A public, opaque 128-bit vault identifier.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct VaultId([u8; 16]);
 
 impl VaultId {
@@ -56,7 +56,7 @@ impl VaultId {
 }
 
 /// A public, opaque 128-bit secure-store lookup identifier.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct KeyId([u8; 16]);
 
 impl KeyId {

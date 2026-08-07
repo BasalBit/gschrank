@@ -12,12 +12,18 @@ chacha20poly1305 = { version = "0.11", default-features = false, features = ["al
 getrandom = "0.4"
 zeroize = { version = "1.9", features = ["alloc"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+libc = "0.2"
+security-framework = "3.7"
+security-framework-sys = "2.15"
+
 [profile.release]
 panic = "unwind"
 strip = "symbols"
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
