@@ -17,4 +17,4 @@ pub(crate) use paths::{MacOsPathError, MacOsPaths};
 pub(crate) use preferences::{PreferenceError, ShellPreferenceStore, ShellPreferences};
 pub(crate) use store::LocalVaultStore;
 pub(crate) use terminal::{HiddenInputError, read_hidden_stdin};
-pub(crate) use zsh_config::{ZshConfigEditor, ZshConfigError};
+pub(crate) use zsh_config::{ShortcutDiagnostic, ZshConfigEditor, ZshConfigError, ZshDiagnostic};

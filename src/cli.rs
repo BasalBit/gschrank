@@ -15,11 +15,14 @@ use crate::{
     import_command::{ImportCommandError, ImportOptions, ImportOutcome, execute_import},
     init::{InitOutcome, Initializer},
     key_provider::InteractionPolicy,
-    profiles::{ImportOperationError, ProfileInspection, ProfileOperationError, ProfileOperations},
+    profiles::{
+        ImportOperationError, ProfileInspection, ProfileOperationError, ProfileOperations,
+        VaultInspection, VaultReadiness,
+    },
     secret_input::{SecretInputMode, read_secret},
     set_command::execute_set,
     shell::{ShellEmitter, ZshEmitter},
-    shell_config::{ShellConfigEdit, StartupConfiguration},
+    shell_config::{ShellConfigEdit, ShellIntegrationState, StartupConfiguration},
     shell_transition::{
         ACTIVE_PROFILE_NAME, ENV_PROTOCOL_NAME, MANAGED_KEYS_NAME, ManagedState, ManagedStateError,
         OperationContext, ShellTransition,
@@ -29,7 +32,8 @@ use crate::{
 #[cfg(target_os = "macos")]
 use crate::platform::macos::{
     LocalVaultStore, MacOsKeychainProvider, MacOsPathError, MacOsPaths, PreferenceError,
-    ShellPreferenceStore, ShellPreferences, ZshConfigEditor, ZshConfigError,
+    ShellPreferenceStore, ShellPreferences, ShortcutDiagnostic, ZshConfigEditor, ZshConfigError,
+    ZshDiagnostic,
 };
 
 const HELP: &str = concat!(
@@ -42,6 +46,8 @@ Encrypted environment profiles for your shell.
 Usage:
   gschrank config [--rc-file <absolute-path>]
   gschrank init
+  gschrank status
+  gschrank doctor
   gschrank import dotenv <profile> [--dry-run] [--replace-existing]
   gschrank profile create <profile>
   gschrank profile rename <old> <new>
@@ -61,6 +67,8 @@ Usage:
 Commands:
   config     Guided vault, profile, secret, and Zsh startup setup
   init       Create an empty encrypted vault, or validate the existing vault
+  status     Show authenticated names-only vault and current-shell state
+  doctor     Check vault and shell readiness without showing decrypted names
   import     Add a strict stdin-only dotenv document to an existing profile
   profile    Create, rename, delete, list, or inspect profiles
   set        Create or update a variable using hidden or explicit stdin input
@@ -82,6 +90,8 @@ enum Command {
         rc_file: Option<PathBuf>,
     },
     Init,
+    Status,
+    Doctor,
     Import {
         profile: ProfileName,
         options: ImportOptions,
@@ -284,6 +294,56 @@ struct StartupSuccess {
     shortcut_conflict: bool,
 }
 
+#[cfg(target_os = "macos")]
+struct StatusReport {
+    vault: Result<VaultInspection, ProfileOperationError>,
+    shell: Result<ZshDiagnostic, ShellConfigurationError>,
+    current_shell: Result<ManagedState, ManagedStateError>,
+}
+
+#[cfg(target_os = "macos")]
+impl StatusReport {
+    fn exit_code(&self) -> u8 {
+        if let Err(error) = self.vault {
+            error.exit_code()
+        } else if let Err(error) = self.shell {
+            error.exit_code()
+        } else if self.current_shell.is_err() {
+            14
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct DoctorReport {
+    vault: Result<VaultReadiness, ProfileOperationError>,
+    shell: Result<ZshDiagnostic, ShellConfigurationError>,
+    current_shell: Result<ManagedState, ManagedStateError>,
+}
+
+#[cfg(target_os = "macos")]
+impl DoctorReport {
+    fn exit_code(&self) -> u8 {
+        if let Err(error) = self.vault {
+            return error.exit_code();
+        }
+        let shell = match &self.shell {
+            Ok(shell) => shell,
+            Err(error) => return error.exit_code(),
+        };
+        if self.current_shell.is_err()
+            || shell.integration == ShellIntegrationState::Absent
+            || shell.canonical_conflict
+        {
+            14
+        } else {
+            0
+        }
+    }
+}
+
 enum ParseError {
     InvalidGrammar,
     InvalidName(DomainError),
@@ -312,6 +372,8 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
         }
         Ok(Command::Config { rc_file }) => run_config(rc_file),
         Ok(Command::Init) => run_init(),
+        Ok(Command::Status) => run_status(),
+        Ok(Command::Doctor) => run_doctor(),
         Ok(Command::Import { profile, options }) => run_import(&profile, options),
         Ok(Command::Profile(command)) => run_profile(command),
         Ok(Command::Set {
@@ -343,6 +405,8 @@ fn parse(arguments: &[OsString]) -> Result<Command, ParseError> {
             })
         }
         [argument] if argument == "init" => Ok(Command::Init),
+        [argument] if argument == "status" => Ok(Command::Status),
+        [argument] if argument == "doctor" => Ok(Command::Doctor),
         [import, dotenv, arguments @ ..] if import == "import" && dotenv == "dotenv" => {
             parse_import(arguments)
         }
@@ -687,6 +751,383 @@ fn render_profile_success(success: ProfileSuccess) -> String {
         }
     }
     output
+}
+
+#[cfg(target_os = "macos")]
+fn run_status() -> ExitCode {
+    let paths = match MacOsPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            print!("{}", render_path_failure("Status"));
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(13);
+        }
+    };
+    let keys = MacOsKeychainProvider::new();
+    let store = LocalVaultStore::new(paths.data_directory().to_owned());
+    let vault = ProfileOperations::new(&keys, &store).inspect_all(interaction_policy());
+    let shell = diagnose_zsh(&paths);
+    let current_shell = inherited_managed_state();
+    let report = StatusReport {
+        vault,
+        shell,
+        current_shell,
+    };
+    print!("{}", render_status(&report));
+    report_diagnostic_errors(&report.vault, &report.shell, &report.current_shell);
+    ExitCode::from(report.exit_code())
+}
+
+#[cfg(target_os = "macos")]
+fn run_doctor() -> ExitCode {
+    let paths = match MacOsPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            print!("{}", render_path_failure("Doctor"));
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(13);
+        }
+    };
+    let keys = MacOsKeychainProvider::new();
+    let store = LocalVaultStore::new(paths.data_directory().to_owned());
+    let vault = ProfileOperations::new(&keys, &store).readiness(interaction_policy());
+    let shell = diagnose_zsh(&paths);
+    let current_shell = inherited_managed_state();
+    let report = DoctorReport {
+        vault,
+        shell,
+        current_shell,
+    };
+    print!("{}", render_doctor(&report));
+    report_diagnostic_errors(&report.vault, &report.shell, &report.current_shell);
+    ExitCode::from(report.exit_code())
+}
+
+#[cfg(target_os = "macos")]
+fn diagnose_zsh(paths: &MacOsPaths) -> Result<ZshDiagnostic, ShellConfigurationError> {
+    let resolved = resolve_zsh_config(paths, None)?;
+    resolved
+        .editor
+        .diagnose(resolved.shortcut_default())
+        .map_err(Into::into)
+}
+
+#[cfg(target_os = "macos")]
+fn report_diagnostic_errors<T>(
+    vault: &Result<T, ProfileOperationError>,
+    shell: &Result<ZshDiagnostic, ShellConfigurationError>,
+    current_shell: &Result<ManagedState, ManagedStateError>,
+) {
+    if let Err(error) = vault {
+        eprintln!("gschrank: {error}");
+    }
+    if let Err(error) = shell {
+        eprintln!("gschrank: {error}");
+    }
+    if let Err(error) = current_shell {
+        eprintln!("gschrank: {error}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn render_path_failure(command: &str) -> String {
+    format!(
+        "{command}: unavailable\nLifecycle: unavailable\nVault: unavailable\nShell integration: unavailable\nRemediation: use private, user-owned local paths and retry.\n"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn render_status(report: &StatusReport) -> String {
+    let mut output = String::new();
+    output.push_str("Status: ");
+    output.push_str(status_outcome(report));
+    output.push('\n');
+    output.push_str("Lifecycle: ");
+    output.push_str(match report.vault {
+        Ok(_) => "ready",
+        Err(error) => vault_lifecycle(error),
+    });
+    output.push('\n');
+    match &report.vault {
+        Ok(vault) => {
+            output.push_str("Vault: ready (revision ");
+            output.push_str(&vault.revision.to_string());
+            output.push_str(")\n");
+        }
+        Err(_) => output.push_str("Vault: unavailable\n"),
+    }
+    append_shell_status(&mut output, report.shell.as_ref().ok());
+    append_current_shell_status(&mut output, &report.current_shell, true);
+    if let Ok(vault) = &report.vault {
+        output.push_str("Profiles:\n");
+        if vault.profiles.is_empty() {
+            output.push_str("  (none)\n");
+        }
+        for profile in &vault.profiles {
+            output.push_str("  ");
+            output.push_str(profile.profile.as_str());
+            output.push('\n');
+            for variable in &profile.variables {
+                output.push_str("    ");
+                output.push_str(variable.as_str());
+                output.push('\n');
+            }
+        }
+    }
+    output
+}
+
+#[cfg(target_os = "macos")]
+fn render_doctor(report: &DoctorReport) -> String {
+    let mut output = String::new();
+    output.push_str("Doctor: ");
+    output.push_str(doctor_outcome(report));
+    output.push('\n');
+    append_vault_doctor(&mut output, &report.vault);
+    append_shell_status(&mut output, report.shell.as_ref().ok());
+    append_current_shell_status(&mut output, &report.current_shell, false);
+    output.push_str("Remediation: ");
+    output.push_str(doctor_remediation(report));
+    output.push('\n');
+    output
+}
+
+#[cfg(target_os = "macos")]
+fn append_vault_doctor(
+    output: &mut String,
+    readiness: &Result<VaultReadiness, ProfileOperationError>,
+) {
+    match readiness {
+        Ok(readiness) => {
+            output.push_str("Vault storage: readable and private\n");
+            output.push_str("Envelope: supported and authenticated\n");
+            output.push_str("Keychain item: present\n");
+            output.push_str("Revision: ");
+            output.push_str(&readiness.revision.to_string());
+            output.push('\n');
+        }
+        Err(ProfileOperationError::NotInitialized) => {
+            output.push_str("Vault storage: not initialized\n");
+            output.push_str("Envelope: not checked\n");
+            output.push_str("Keychain item: not checked\n");
+        }
+        Err(ProfileOperationError::VaultKeyMissing) => {
+            output.push_str("Vault storage: readable\n");
+            output.push_str("Envelope: supported header\n");
+            output.push_str("Keychain item: missing\n");
+        }
+        Err(ProfileOperationError::InvalidKeyMaterial) => {
+            output.push_str("Vault storage: readable\n");
+            output.push_str("Envelope: supported header\n");
+            output.push_str("Keychain item: invalid\n");
+        }
+        Err(ProfileOperationError::SecureStore(_)) => {
+            output.push_str("Vault storage: readable\n");
+            output.push_str("Envelope: supported header\n");
+            output.push_str("Keychain item: unavailable\n");
+        }
+        Err(ProfileOperationError::Vault(_)) => {
+            output.push_str("Vault storage: readable\n");
+            output.push_str("Envelope: invalid or unauthenticated\n");
+            output.push_str("Keychain item: unavailable\n");
+        }
+        Err(ProfileOperationError::Store(_)) => {
+            output.push_str("Vault storage: unavailable\n");
+            output.push_str("Envelope: not checked\n");
+            output.push_str("Keychain item: not checked\n");
+        }
+        Err(
+            ProfileOperationError::Domain(_)
+            | ProfileOperationError::CommitNotCompleted
+            | ProfileOperationError::CommitOutcomeIndeterminate,
+        ) => {
+            output.push_str("Vault storage: unavailable\n");
+            output.push_str("Envelope: unavailable\n");
+            output.push_str("Keychain item: unavailable\n");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn append_shell_status(output: &mut String, shell: Option<&ZshDiagnostic>) {
+    let Some(shell) = shell else {
+        output.push_str("Shell integration: unavailable\n");
+        output.push_str("Startup profile: unknown\n");
+        output.push_str("Canonical shell name: unknown\n");
+        output.push_str("Shortcut: unknown\n");
+        return;
+    };
+    match &shell.integration {
+        ShellIntegrationState::Absent => {
+            output.push_str("Shell integration: absent\n");
+            output.push_str("Startup profile: not configured\n");
+        }
+        ShellIntegrationState::Installed(configuration) => {
+            output.push_str("Shell integration: installed\n");
+            output.push_str("Startup profile: ");
+            if let Some(profile) = configuration.profile() {
+                output.push_str(profile.as_str());
+            } else {
+                output.push_str("off");
+            }
+            output.push('\n');
+        }
+    }
+    output.push_str("Canonical shell name: ");
+    output.push_str(if shell.canonical_conflict {
+        "conflicting"
+    } else {
+        "available"
+    });
+    output.push('\n');
+    output.push_str("Shortcut: ");
+    output.push_str(shortcut_label(shell.shortcut));
+    output.push('\n');
+}
+
+#[cfg(target_os = "macos")]
+fn append_current_shell_status(
+    output: &mut String,
+    current: &Result<ManagedState, ManagedStateError>,
+    include_names: bool,
+) {
+    if let Ok(state) = current {
+        output.push_str("Current shell: ");
+        if let Some(profile) = state.active_profile() {
+            if include_names {
+                output.push_str("active profile ");
+                output.push_str(profile.as_str());
+            } else {
+                output.push_str("valid active metadata");
+            }
+        } else {
+            output.push_str("inactive");
+        }
+        output.push('\n');
+        if include_names {
+            output.push_str("Managed variables:\n");
+            if state.managed_names().is_empty() {
+                output.push_str("  (none)\n");
+            } else {
+                for name in state.managed_names() {
+                    output.push_str("  ");
+                    output.push_str(name.as_str());
+                    output.push('\n');
+                }
+            }
+        } else {
+            output.push_str("Managed-variable metadata: valid (count ");
+            output.push_str(&state.managed_names().len().to_string());
+            output.push_str(")\n");
+        }
+    } else {
+        output.push_str("Current shell: invalid managed metadata\n");
+        if include_names {
+            output.push_str("Managed variables: unavailable\n");
+        } else {
+            output.push_str("Managed-variable metadata: invalid\n");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+const fn shortcut_label(shortcut: ShortcutDiagnostic) -> &'static str {
+    match shortcut {
+        ShortcutDiagnostic::Enabled => "enabled",
+        ShortcutDiagnostic::Available => "available",
+        ShortcutDiagnostic::Conflicting => "conflicting",
+        ShortcutDiagnostic::Shadowed => "shadowed",
+        ShortcutDiagnostic::Disabled => "disabled",
+    }
+}
+
+#[cfg(target_os = "macos")]
+const fn vault_lifecycle(error: ProfileOperationError) -> &'static str {
+    match error {
+        ProfileOperationError::NotInitialized => "not initialized",
+        ProfileOperationError::VaultKeyMissing
+        | ProfileOperationError::InvalidKeyMaterial
+        | ProfileOperationError::Vault(_) => "frozen",
+        ProfileOperationError::SecureStore(_)
+        | ProfileOperationError::Domain(_)
+        | ProfileOperationError::Store(_)
+        | ProfileOperationError::CommitNotCompleted
+        | ProfileOperationError::CommitOutcomeIndeterminate => "unavailable",
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn status_outcome(report: &StatusReport) -> &'static str {
+    match report.vault {
+        Err(error) => vault_lifecycle(error),
+        Ok(_) if report.exit_code() == 0 => "ready",
+        Ok(_) => "action required",
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn doctor_outcome(report: &DoctorReport) -> &'static str {
+    match report.vault {
+        Err(ProfileOperationError::NotInitialized) => "not initialized",
+        Err(
+            ProfileOperationError::VaultKeyMissing
+            | ProfileOperationError::InvalidKeyMaterial
+            | ProfileOperationError::Vault(_),
+        ) => "frozen",
+        Err(_) => "unhealthy",
+        Ok(_) if report.exit_code() == 0 => "healthy",
+        Ok(_) => "action required",
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn doctor_remediation(report: &DoctorReport) -> &'static str {
+    match report.vault {
+        Err(ProfileOperationError::NotInitialized) => {
+            "run 'gschrank config' for guided setup or 'gschrank init' for an empty vault."
+        }
+        Err(ProfileOperationError::SecureStore(_)) => {
+            "unlock or permit macOS Keychain access, then retry."
+        }
+        Err(ProfileOperationError::VaultKeyMissing | ProfileOperationError::InvalidKeyMaterial) => {
+            "do not overwrite the vault; use an explicit recovery or fresh-vault workflow."
+        }
+        Err(ProfileOperationError::Vault(_)) => {
+            "do not reset automatically; preserve the vault and use an explicit recovery workflow."
+        }
+        Err(ProfileOperationError::Store(error)) => match error.kind() {
+            crate::vault_store::VaultStoreErrorKind::UnsafePath
+            | crate::vault_store::VaultStoreErrorKind::PermissionDenied
+            | crate::vault_store::VaultStoreErrorKind::UnsupportedStorage => {
+                "restore private, user-owned local vault storage and retry."
+            }
+            crate::vault_store::VaultStoreErrorKind::Conflict
+            | crate::vault_store::VaultStoreErrorKind::MissingState
+            | crate::vault_store::VaultStoreErrorKind::LockFailure
+            | crate::vault_store::VaultStoreErrorKind::IoFailure
+            | crate::vault_store::VaultStoreErrorKind::OutcomeIndeterminate => {
+                "leave the vault unchanged, resolve the local storage failure, and retry."
+            }
+        },
+        Err(
+            ProfileOperationError::Domain(_)
+            | ProfileOperationError::CommitNotCompleted
+            | ProfileOperationError::CommitOutcomeIndeterminate,
+        ) => "leave the vault unchanged and inspect its state before retrying.",
+        Ok(_) => match &report.shell {
+            Err(_) => "repair the reported Zsh configuration or preference failure and retry.",
+            Ok(shell) if shell.integration == ShellIntegrationState::Absent => {
+                "run 'gschrank config' to install the managed Zsh integration."
+            }
+            Ok(shell) if shell.canonical_conflict => {
+                "remove or rename the unmanaged 'gschrank' shell definition, then rerun configuration."
+            }
+            Ok(_) if report.current_shell.is_err() => {
+                "open a fresh Zsh session to discard invalid inherited Gschrank metadata."
+            }
+            Ok(_) => "none.",
+        },
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1331,7 +1772,6 @@ impl std::fmt::Display for SnapshotLoadError {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[cfg(not(target_os = "macos"))]
 fn run_emit_zsh(_context: OperationContext, _operation: EmitOperation) -> ExitCode {
     eprintln!("gschrank: this build does not support encrypted profiles on this platform");
@@ -1353,6 +1793,18 @@ fn run_import(_profile: &ProfileName, _options: ImportOptions) -> ExitCode {
 #[cfg(not(target_os = "macos"))]
 fn run_init() -> ExitCode {
     eprintln!("gschrank: this build does not support secure vault initialization on this platform");
+    ExitCode::from(1)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_status() -> ExitCode {
+    eprintln!("gschrank: this build does not support encrypted diagnostics on this platform");
+    ExitCode::from(1)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_doctor() -> ExitCode {
+    eprintln!("gschrank: this build does not support encrypted diagnostics on this platform");
     ExitCode::from(1)
 }
 
@@ -1392,6 +1844,8 @@ mod tests {
     fn parses_only_the_available_exact_grammar() {
         assert!(matches!(parse(&[]), Ok(Command::Help)));
         assert!(matches!(parse(&["init".into()]), Ok(Command::Init)));
+        assert!(matches!(parse(&["status".into()]), Ok(Command::Status)));
+        assert!(matches!(parse(&["doctor".into()]), Ok(Command::Doctor)));
         assert!(matches!(parse(&["--version".into()]), Ok(Command::Version)));
         assert!(matches!(
             parse(&["profile".into(), "list".into()]),
@@ -1464,6 +1918,8 @@ mod tests {
             })
         ));
         assert!(parse(&["init".into(), "extra".into()]).is_err());
+        assert!(parse(&["status".into(), "extra".into()]).is_err());
+        assert!(parse(&["doctor".into(), "extra".into()]).is_err());
         assert!(parse(&["profile".into()]).is_err());
         assert!(parse(&["profile".into(), "create".into(), "NOT VALID".into()]).is_err());
         assert!(
@@ -1813,6 +2269,132 @@ mod tests {
                 shortcut_conflict: false,
             };
             assert!(!render_startup_success(&unchanged).contains("open a new shell"));
+        }
+
+        fn installed_shell() -> ZshDiagnostic {
+            ZshDiagnostic {
+                integration: ShellIntegrationState::Installed(StartupConfiguration::new(
+                    None, false,
+                )),
+                shortcut: ShortcutDiagnostic::Disabled,
+                canonical_conflict: false,
+            }
+        }
+
+        #[test]
+        fn status_renders_authenticated_names_but_never_secret_values() {
+            let report = StatusReport {
+                vault: Ok(VaultInspection {
+                    revision: 7,
+                    profiles: vec![ProfileInspection {
+                        profile: ProfileName::new("dev").unwrap(),
+                        variables: vec![EnvironmentName::new("API_TOKEN").unwrap()],
+                    }],
+                }),
+                shell: Ok(installed_shell()),
+                current_shell: ManagedState::from_metadata(
+                    Some("1"),
+                    Some("dev"),
+                    Some("API_TOKEN"),
+                ),
+            };
+
+            let output = render_status(&report);
+            assert!(output.contains("Status: ready"));
+            assert!(output.contains("revision 7"));
+            assert!(output.contains("dev"));
+            assert!(output.contains("API_TOKEN"));
+            assert!(!output.contains("CANARY-super-secret"));
+            assert_eq!(report.exit_code(), 0);
+        }
+
+        #[test]
+        fn failed_status_never_renders_cached_vault_names() {
+            let report = StatusReport {
+                vault: Err(ProfileOperationError::VaultKeyMissing),
+                shell: Ok(installed_shell()),
+                current_shell: Ok(ManagedState::empty()),
+            };
+            let output = render_status(&report);
+            assert!(output.contains("Status: frozen"));
+            assert!(!output.contains("Profiles:"));
+            assert!(!output.contains("dev"));
+            assert!(!output.contains("API_TOKEN"));
+            assert_eq!(report.exit_code(), 12);
+        }
+
+        #[test]
+        fn doctor_is_name_free_and_maps_lifecycle_failures_to_stable_exits() {
+            let healthy = DoctorReport {
+                vault: Ok(VaultReadiness { revision: 9 }),
+                shell: Ok(installed_shell()),
+                current_shell: ManagedState::from_metadata(
+                    Some("1"),
+                    Some("private-profile"),
+                    Some("PRIVATE_TOKEN"),
+                ),
+            };
+            let output = render_doctor(&healthy);
+            assert!(output.contains("Doctor: healthy"));
+            assert!(output.contains("Revision: 9"));
+            assert!(output.contains("valid active metadata"));
+            assert!(output.contains("count 1"));
+            assert!(!output.contains("private-profile"));
+            assert!(!output.contains("PRIVATE_TOKEN"));
+            assert!(!output.contains("CANARY-super-secret"));
+            assert_eq!(healthy.exit_code(), 0);
+
+            let not_initialized = DoctorReport {
+                vault: Err(ProfileOperationError::NotInitialized),
+                shell: Ok(installed_shell()),
+                current_shell: Ok(ManagedState::empty()),
+            };
+            assert!(render_doctor(&not_initialized).contains("Doctor: not initialized"));
+            assert_eq!(not_initialized.exit_code(), 10);
+
+            let frozen = DoctorReport {
+                vault: Err(ProfileOperationError::VaultKeyMissing),
+                shell: Ok(installed_shell()),
+                current_shell: Ok(ManagedState::empty()),
+            };
+            let output = render_doctor(&frozen);
+            assert!(output.contains("Doctor: frozen"));
+            assert!(output.contains("Keychain item: missing"));
+            assert_eq!(frozen.exit_code(), 12);
+        }
+
+        #[test]
+        fn doctor_requires_installed_canonical_shell_integration_and_valid_metadata() {
+            let absent = DoctorReport {
+                vault: Ok(VaultReadiness { revision: 0 }),
+                shell: Ok(ZshDiagnostic {
+                    integration: ShellIntegrationState::Absent,
+                    shortcut: ShortcutDiagnostic::Disabled,
+                    canonical_conflict: false,
+                }),
+                current_shell: Ok(ManagedState::empty()),
+            };
+            assert_eq!(absent.exit_code(), 14);
+            assert!(render_doctor(&absent).contains("run 'gschrank config'"));
+
+            let conflict = DoctorReport {
+                vault: Ok(VaultReadiness { revision: 0 }),
+                shell: Ok(ZshDiagnostic {
+                    canonical_conflict: true,
+                    ..installed_shell()
+                }),
+                current_shell: Ok(ManagedState::empty()),
+            };
+            assert_eq!(conflict.exit_code(), 14);
+            assert!(render_doctor(&conflict).contains("unmanaged 'gschrank'"));
+
+            let invalid_metadata = DoctorReport {
+                vault: Ok(VaultReadiness { revision: 0 }),
+                shell: Ok(installed_shell()),
+                current_shell: Err(ManagedStateError::Incomplete),
+            };
+            assert_eq!(invalid_metadata.exit_code(), 14);
+            assert!(render_doctor(&invalid_metadata).contains("fresh Zsh session"));
         }
 
         #[test]

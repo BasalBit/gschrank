@@ -22,6 +22,19 @@ pub(crate) struct ProfileInspection {
     pub(crate) variables: Vec<crate::EnvironmentName>,
 }
 
+/// One authenticated names-only vault inspection for `status`.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct VaultInspection {
+    pub(crate) revision: u64,
+    pub(crate) profiles: Vec<ProfileInspection>,
+}
+
+/// Value- and name-free authenticated readiness metadata for `doctor`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VaultReadiness {
+    pub(crate) revision: u64,
+}
+
 /// Safe metadata confirming an authenticated vault mutation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MutationReceipt {
@@ -399,6 +412,42 @@ where
         })
     }
 
+    pub(crate) fn inspect_all(
+        &self,
+        interaction: InteractionPolicy,
+    ) -> Result<VaultInspection, ProfileOperationError> {
+        self.store.shared_read(|read| {
+            let (opened, _key) = self.open_current(read, interaction)?;
+            let profiles = opened
+                .vault
+                .profile_names()
+                .map(|profile| {
+                    let variables = opened.vault.variable_names(profile)?.cloned().collect();
+                    Ok(ProfileInspection {
+                        profile: profile.clone(),
+                        variables,
+                    })
+                })
+                .collect::<Result<_, DomainError>>()?;
+            Ok(VaultInspection {
+                revision: opened.vault.revision(),
+                profiles,
+            })
+        })
+    }
+
+    pub(crate) fn readiness(
+        &self,
+        interaction: InteractionPolicy,
+    ) -> Result<VaultReadiness, ProfileOperationError> {
+        self.store.shared_read(|read| {
+            let (opened, _key) = self.open_current(read, interaction)?;
+            Ok(VaultReadiness {
+                revision: opened.vault.revision(),
+            })
+        })
+    }
+
     pub(crate) fn snapshot(
         &self,
         profile: &ProfileName,
@@ -663,6 +712,58 @@ mod tests {
             "snapshot secret bytes mismatch"
         );
         assert_eq!(store.live().unwrap(), before);
+    }
+
+    #[test]
+    fn diagnostic_reads_expose_only_their_intended_metadata() {
+        let (keys, store) = initialized();
+        let operations = ProfileOperations::new(&keys, &store);
+        let dev = profile("dev");
+        operations.create(dev.clone(), INTERACTION).unwrap();
+        operations
+            .set(
+                &dev,
+                EnvironmentName::new("API_TOKEN").unwrap(),
+                SecretValue::from_string("CANARY-diagnostic-secret".to_owned()).unwrap(),
+                INTERACTION,
+            )
+            .unwrap();
+        let before = store.live().unwrap();
+
+        let inspection = operations.inspect_all(INTERACTION).unwrap();
+        assert_eq!(inspection.revision, 2);
+        assert_eq!(inspection.profiles.len(), 1);
+        assert_eq!(inspection.profiles[0].profile, dev);
+        assert_eq!(
+            inspection.profiles[0].variables,
+            vec![EnvironmentName::new("API_TOKEN").unwrap()]
+        );
+        assert!(!format!("{inspection:?}").contains("CANARY-diagnostic-secret"));
+
+        let readiness = operations.readiness(INTERACTION).unwrap();
+        assert_eq!(readiness, VaultReadiness { revision: 2 });
+        let rendered = format!("{readiness:?}");
+        assert!(!rendered.contains("dev"));
+        assert!(!rendered.contains("API_TOKEN"));
+        assert!(!rendered.contains("CANARY-diagnostic-secret"));
+        assert_eq!(store.live().unwrap(), before);
+    }
+
+    #[test]
+    fn diagnostic_readiness_preserves_frozen_failure_categories() {
+        let (keys, store) = initialized();
+        let operations = ProfileOperations::new(&keys, &store);
+        keys.fail_next_load(KeyProviderErrorKind::NotFound);
+        assert_eq!(
+            operations.readiness(INTERACTION).unwrap_err(),
+            ProfileOperationError::VaultKeyMissing
+        );
+
+        store.set_live(b"not-an-envelope".to_vec());
+        assert!(matches!(
+            operations.readiness(INTERACTION),
+            Err(ProfileOperationError::Vault(_))
+        ));
     }
 
     #[test]

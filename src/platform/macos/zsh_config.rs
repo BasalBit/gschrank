@@ -63,6 +63,39 @@ impl ZshConfigEditor {
         }
     }
 
+    pub(crate) fn diagnose(
+        &self,
+        preferred_shortcut: bool,
+    ) -> Result<ZshDiagnostic, ZshConfigError> {
+        let snapshot = self.read_snapshot()?;
+        let parsed = parse_managed_block(snapshot.bytes())?;
+        let managed = parsed.as_ref().map(|parsed| parsed.range.clone());
+        let regions = unmanaged_regions(snapshot.bytes(), managed.as_ref());
+        let canonical_conflict = regions
+            .iter()
+            .any(|region| declares_shell_name(region, b"gschrank"));
+        let shortcut_conflict = regions
+            .iter()
+            .any(|region| declares_shell_name(region, b"gsch"))
+            || executable_on_path(OsStr::new("gsch"));
+        let integration = parsed.map_or(ShellIntegrationState::Absent, |parsed| {
+            ShellIntegrationState::Installed(parsed.configuration)
+        });
+        let shortcut = match integration.configuration() {
+            Some(configuration) if !configuration.shortcut() => ShortcutDiagnostic::Disabled,
+            Some(_) if shortcut_conflict => ShortcutDiagnostic::Shadowed,
+            Some(_) => ShortcutDiagnostic::Enabled,
+            None if !preferred_shortcut => ShortcutDiagnostic::Disabled,
+            None if shortcut_conflict => ShortcutDiagnostic::Conflicting,
+            None => ShortcutDiagnostic::Available,
+        };
+        Ok(ZshDiagnostic {
+            integration,
+            shortcut,
+            canonical_conflict,
+        })
+    }
+
     pub(crate) fn configure(
         &self,
         block: &ZshManagedBlock,
@@ -213,6 +246,24 @@ impl ZshConfigEditor {
         }
         Ok(())
     }
+}
+
+/// Safe ownership state for the optional short shell name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ShortcutDiagnostic {
+    Enabled,
+    Available,
+    Conflicting,
+    Shadowed,
+    Disabled,
+}
+
+/// Read-only diagnostics for one selected Zsh startup file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ZshDiagnostic {
+    pub(crate) integration: ShellIntegrationState,
+    pub(crate) shortcut: ShortcutDiagnostic,
+    pub(crate) canonical_conflict: bool,
 }
 
 struct ParsedManagedBlock {
@@ -865,6 +916,48 @@ mod tests {
                 .unwrap()
                 .starts_with(shortcut_bytes)
         );
+    }
+
+    #[test]
+    fn diagnoses_integration_and_name_ownership_without_writing() {
+        let absent = TestDirectory::new();
+        assert_eq!(
+            absent.editor().diagnose(false).unwrap(),
+            ZshDiagnostic {
+                integration: ShellIntegrationState::Absent,
+                shortcut: ShortcutDiagnostic::Disabled,
+                canonical_conflict: false,
+            }
+        );
+        assert!(!absent.rc_file().exists());
+
+        let canonical = TestDirectory::new();
+        fs::write(
+            canonical.rc_file(),
+            b"function gschrank { print unrelated }\n",
+        )
+        .unwrap();
+        let diagnostic = canonical.editor().diagnose(false).unwrap();
+        assert!(diagnostic.canonical_conflict);
+        assert_eq!(diagnostic.shortcut, ShortcutDiagnostic::Disabled);
+
+        let conflicting = TestDirectory::new();
+        fs::write(conflicting.rc_file(), b"alias gsch='another command'\n").unwrap();
+        assert_eq!(
+            conflicting.editor().diagnose(true).unwrap().shortcut,
+            ShortcutDiagnostic::Conflicting
+        );
+
+        let shadowed = TestDirectory::new();
+        let mut source = b"alias gsch='another command'\n".to_vec();
+        source.extend_from_slice(block(Some("work"), true).source());
+        fs::write(shadowed.rc_file(), source).unwrap();
+        let diagnostic = shadowed.editor().diagnose(true).unwrap();
+        assert!(matches!(
+            diagnostic.integration,
+            ShellIntegrationState::Installed(_)
+        ));
+        assert_eq!(diagnostic.shortcut, ShortcutDiagnostic::Shadowed);
     }
 
     #[test]
