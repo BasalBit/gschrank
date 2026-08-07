@@ -136,6 +136,7 @@ struct MemoryVaultState {
     next_promotion: Option<PromotionFault>,
     next_replacement: Option<ReplacementFault>,
     next_recovery_preservation: Option<RecoveryPreservationFault>,
+    next_root_clear: Option<RootClearFault>,
 }
 
 #[derive(Clone, Copy)]
@@ -154,6 +155,13 @@ pub(crate) enum ReplacementFault {
 
 #[derive(Clone, Copy)]
 pub(crate) enum RecoveryPreservationFault {
+    NotCommitted,
+    IndeterminateBeforeCommit,
+    IndeterminateAfterCommit,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RootClearFault {
     NotCommitted,
     IndeterminateBeforeCommit,
     IndeterminateAfterCommit,
@@ -188,6 +196,10 @@ impl MemoryVaultStore {
 
     pub(crate) fn fail_next_recovery_preservation(&self, fault: RecoveryPreservationFault) {
         self.state().next_recovery_preservation = Some(fault);
+    }
+
+    pub(crate) fn fail_next_root_clear(&self, fault: RootClearFault) {
+        self.state().next_root_clear = Some(fault);
     }
 
     pub(crate) fn live(&self) -> Option<Vec<u8>> {
@@ -260,6 +272,27 @@ impl VaultTransaction for MemoryTransaction<'_> {
             None => {}
         }
         self.promote()?;
+        Ok(CommitOutcome::Committed)
+    }
+
+    fn clear_root_artifacts(&mut self) -> Result<CommitOutcome, VaultStoreError> {
+        if self.state.live.is_none() && self.state.init_pending.is_none() {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::MissingState));
+        }
+        match self.state.next_root_clear.take() {
+            Some(RootClearFault::NotCommitted) => return Ok(CommitOutcome::NotCommitted),
+            Some(RootClearFault::IndeterminateBeforeCommit) => {
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            Some(RootClearFault::IndeterminateAfterCommit) => {
+                self.state.live = None;
+                self.state.init_pending = None;
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            None => {}
+        }
+        self.state.live = None;
+        self.state.init_pending = None;
         Ok(CommitOutcome::Committed)
     }
 

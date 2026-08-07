@@ -181,7 +181,7 @@ where
         };
 
         let opened = open_envelope(pending, &key)?;
-        Self::promote_and_verify(transaction, &key, opened.vault_id, opened.key_id)
+        promote_and_verify(transaction, &key, opened.vault_id, opened.key_id)
     }
 
     fn create_fresh(
@@ -189,71 +189,85 @@ where
         transaction: &mut dyn VaultTransaction,
         interaction: InteractionPolicy,
     ) -> Result<InitOutcome, InitError> {
-        for _ in 0..MAX_ID_COLLISION_RETRIES {
-            let vault_id = VaultId::generate()?;
-            let key_id = KeyId::generate()?;
-            let key = MasterKey::generate()?;
-            let envelope = seal_vault(&Vault::empty(), vault_id, key_id, &key)?;
-            transaction.create_init_pending(&envelope)?;
+        initialize_empty_locked(self.keys, transaction, interaction)
+    }
+}
 
-            match self.keys.store_new(&key_id, &key, interaction) {
-                Ok(()) => {
-                    return Self::promote_and_verify(transaction, &key, vault_id, key_id);
-                }
-                Err(error) if error.kind() == KeyProviderErrorKind::AlreadyExists => {
+/// Create a new empty vault while the caller retains the exclusive store lock.
+///
+/// Lifecycle operations use this only after they have established that both
+/// root artifacts are absent. The ordinary initializer performs that same
+/// check before delegating here.
+pub(crate) fn initialize_empty_locked<K>(
+    keys: &K,
+    transaction: &mut dyn VaultTransaction,
+    interaction: InteractionPolicy,
+) -> Result<InitOutcome, InitError>
+where
+    K: KeyProvider,
+{
+    for _ in 0..MAX_ID_COLLISION_RETRIES {
+        let vault_id = VaultId::generate()?;
+        let key_id = KeyId::generate()?;
+        let key = MasterKey::generate()?;
+        let envelope = seal_vault(&Vault::empty(), vault_id, key_id, &key)?;
+        transaction.create_init_pending(&envelope)?;
+
+        match keys.store_new(&key_id, &key, interaction) {
+            Ok(()) => return promote_and_verify(transaction, &key, vault_id, key_id),
+            Err(error) if error.kind() == KeyProviderErrorKind::AlreadyExists => {
+                transaction.discard_init_pending()?;
+            }
+            Err(error) => {
+                if error.definitely_did_not_store() {
                     transaction.discard_init_pending()?;
                 }
-                Err(error) => {
-                    if error.definitely_did_not_store() {
-                        transaction.discard_init_pending()?;
-                    }
-                    return Err(InitError::from_key_provider(error));
-                }
+                return Err(InitError::from_key_provider(error));
             }
         }
-
-        Err(InitError::SecureStore(KeyProviderError::new(
-            KeyProviderErrorKind::AlreadyExists,
-        )))
     }
 
-    fn promote_and_verify(
-        transaction: &mut dyn VaultTransaction,
-        key: &MasterKey,
-        expected_vault_id: VaultId,
-        expected_key_id: KeyId,
-    ) -> Result<InitOutcome, InitError> {
-        match transaction.promote_init_pending()? {
-            CommitOutcome::Committed => {}
-            CommitOutcome::NotCommitted => return Err(InitError::CommitNotCompleted),
-            CommitOutcome::Indeterminate => {
-                let Some(live) = transaction.read_live()? else {
-                    return Err(InitError::CommitOutcomeIndeterminate);
-                };
-                let opened =
-                    open_envelope(&live, key).map_err(|_| InitError::CommitOutcomeIndeterminate)?;
-                if opened.vault_id != expected_vault_id || opened.key_id != expected_key_id {
-                    return Err(InitError::CommitOutcomeIndeterminate);
-                }
-                return Ok(InitOutcome::Created {
-                    vault_id: opened.vault_id,
-                    key_id: opened.key_id,
-                });
+    Err(InitError::SecureStore(KeyProviderError::new(
+        KeyProviderErrorKind::AlreadyExists,
+    )))
+}
+
+fn promote_and_verify(
+    transaction: &mut dyn VaultTransaction,
+    key: &MasterKey,
+    expected_vault_id: VaultId,
+    expected_key_id: KeyId,
+) -> Result<InitOutcome, InitError> {
+    match transaction.promote_init_pending()? {
+        CommitOutcome::Committed => {}
+        CommitOutcome::NotCommitted => return Err(InitError::CommitNotCompleted),
+        CommitOutcome::Indeterminate => {
+            let Some(live) = transaction.read_live()? else {
+                return Err(InitError::CommitOutcomeIndeterminate);
+            };
+            let opened =
+                open_envelope(&live, key).map_err(|_| InitError::CommitOutcomeIndeterminate)?;
+            if opened.vault_id != expected_vault_id || opened.key_id != expected_key_id {
+                return Err(InitError::CommitOutcomeIndeterminate);
             }
+            return Ok(InitOutcome::Created {
+                vault_id: opened.vault_id,
+                key_id: opened.key_id,
+            });
         }
-
-        let live = transaction
-            .read_live()?
-            .ok_or(InitError::CommitOutcomeIndeterminate)?;
-        let opened = open_envelope(&live, key)?;
-        if opened.vault_id != expected_vault_id || opened.key_id != expected_key_id {
-            return Err(InitError::Vault(EnvelopeError::AuthenticationFailed));
-        }
-        Ok(InitOutcome::Created {
-            vault_id: opened.vault_id,
-            key_id: opened.key_id,
-        })
     }
+
+    let live = transaction
+        .read_live()?
+        .ok_or(InitError::CommitOutcomeIndeterminate)?;
+    let opened = open_envelope(&live, key)?;
+    if opened.vault_id != expected_vault_id || opened.key_id != expected_key_id {
+        return Err(InitError::Vault(EnvelopeError::AuthenticationFailed));
+    }
+    Ok(InitOutcome::Created {
+        vault_id: opened.vault_id,
+        key_id: opened.key_id,
+    })
 }
 
 #[cfg(test)]

@@ -21,6 +21,7 @@ use crate::{
         ProfileOperations, VaultInspection, VaultReadiness,
     },
     recovery::{RecoveryList, RecoveryOperationError, RecoveryOperations, RecoveryOverview},
+    reset::{ResetError, ResetOperations, ResetPreparationError, ResetReceipt},
     restore::{RestoreOperations, RestoreReceipt},
     secret_input::{SecretInputMode, read_secret},
     set_command::execute_set,
@@ -54,6 +55,7 @@ Usage:
   gschrank doctor
   gschrank backup <absolute-destination>
   gschrank restore <absolute-source>
+  gschrank reset
   gschrank recovery list
   gschrank recovery restore <bundle-id>
   gschrank import dotenv <profile> [--dry-run] [--replace-existing]
@@ -79,6 +81,7 @@ Commands:
   doctor     Check vault and shell readiness without showing decrypted names
   backup     Create a Keychain-bound encrypted vault backup without overwriting
   restore    Authenticate and restore a Keychain-bound encrypted vault backup
+  reset      Preserve current state and create a new independently keyed empty vault
   recovery   List, validate, or restore durable internal recovery bundles
   import     Add a strict stdin-only dotenv document to an existing profile
   profile    Create, rename, delete, list, or inspect profiles
@@ -105,6 +108,9 @@ enum Command {
     Doctor,
     Backup(PathBuf),
     Restore(PathBuf),
+    Reset {
+        shell_wrapper: bool,
+    },
     RecoveryList,
     RecoveryRestore(RecoveryBundleId),
     Import {
@@ -422,6 +428,7 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
         Ok(Command::Doctor) => run_doctor(),
         Ok(Command::Backup(destination)) => run_backup(destination),
         Ok(Command::Restore(source)) => run_restore(source),
+        Ok(Command::Reset { shell_wrapper }) => run_reset(shell_wrapper),
         Ok(Command::RecoveryList) => run_recovery_list(),
         Ok(Command::RecoveryRestore(bundle_id)) => run_recovery_restore(bundle_id),
         Ok(Command::Import { profile, options }) => run_import(&profile, options),
@@ -461,6 +468,9 @@ fn parse(arguments: &[OsString]) -> Result<Command, ParseError> {
             Ok(Command::Backup(PathBuf::from(destination)))
         }
         [restore, source] if restore == "restore" => Ok(Command::Restore(PathBuf::from(source))),
+        [reset] if reset == "reset" => Ok(Command::Reset {
+            shell_wrapper: false,
+        }),
         [recovery, list] if recovery == "recovery" && list == "list" => Ok(Command::RecoveryList),
         [recovery, restore, bundle_id] if recovery == "recovery" && restore == "restore" => {
             let bundle_id = bundle_id.to_str().ok_or(ParseError::InvalidGrammar)?;
@@ -551,6 +561,9 @@ fn parse_import(arguments: &[OsString]) -> Result<Command, ParseError> {
 
 fn parse_private(arguments: &[OsString]) -> Result<Command, ParseError> {
     match arguments {
+        [reset] if reset == "__reset-from-zsh" => Ok(Command::Reset {
+            shell_wrapper: true,
+        }),
         [shell_init, shell, protocol]
             if shell_init == "__shell-init" && shell == "zsh" && protocol == "1" =>
         {
@@ -985,6 +998,78 @@ fn render_restore_success(receipt: RestoreReceipt) -> String {
         output.push_str("Previous live ciphertext retained as recovery bundle ");
         output.push_str(&bundle_id.to_hex());
         output.push_str(".\n");
+    }
+    output
+}
+
+#[cfg(target_os = "macos")]
+fn run_reset(shell_wrapper: bool) -> ExitCode {
+    let paths = match MacOsPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(13);
+        }
+    };
+    let keys = MacOsKeychainProvider::new();
+    let store = LocalVaultStore::new(paths.data_directory().to_owned());
+    let operations = ResetOperations::new(&keys, &store);
+    let mut confirmer = TerminalTypedConfirmer;
+    let mut preparation_failure = None;
+    let result = operations.reset(interaction_policy(), &mut confirmer, || {
+        let prepared = resolve_zsh_config(&paths, None)
+            .and_then(|resolved| disable_startup_for_reset(&resolved));
+        prepared.map_err(|error| {
+            let exit_code = error.exit_code();
+            preparation_failure = Some(error);
+            ResetPreparationError::new(exit_code)
+        })
+    });
+
+    match result {
+        Ok(receipt) => {
+            print!("{}", render_reset_success(receipt, shell_wrapper));
+            ExitCode::SUCCESS
+        }
+        Err(ResetError::PreparationFailed(error)) => {
+            if let Some(source) = preparation_failure {
+                eprintln!(
+                    "gschrank: {source}; automatic startup loading was not changed and vault reset did not begin"
+                );
+            } else {
+                eprintln!("gschrank: {}", ResetError::PreparationFailed(error));
+            }
+            ExitCode::from(error.exit_code())
+        }
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn disable_startup_for_reset(resolved: &ResolvedZshConfig) -> Result<(), ShellConfigurationError> {
+    let state = resolved.editor.inspect()?;
+    let Some(current) = state.configuration() else {
+        return Ok(());
+    };
+    if current.profile().is_none() {
+        return Ok(());
+    }
+    let success = configure_startup(&resolved.editor, current.with_profile(None))?;
+    resolved.remember(success.configuration.shortcut())
+}
+
+fn render_reset_success(receipt: ResetReceipt, shell_wrapper: bool) -> String {
+    let mut output = String::from("Initialized a new independently keyed empty vault.\n");
+    output.push_str("Previous encrypted state retained as recovery bundle ");
+    output.push_str(&receipt.recovery_bundle.to_hex());
+    output.push_str(".\nAutomatic profile loading is off for new Zsh shells.\n");
+    if !shell_wrapper {
+        output.push_str(
+            "The current shell was not changed; run 'gschrank unload' through the managed Zsh function or close this shell.\n",
+        );
     }
     output
 }
@@ -2177,6 +2262,12 @@ fn run_restore(_source: PathBuf) -> ExitCode {
 }
 
 #[cfg(not(target_os = "macos"))]
+fn run_reset(_shell_wrapper: bool) -> ExitCode {
+    eprintln!("gschrank: this build does not support recoverable vault reset on this platform");
+    ExitCode::from(1)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn run_recovery_restore(_bundle_id: RecoveryBundleId) -> ExitCode {
     eprintln!("gschrank: this build does not support vault recovery on this platform");
     ExitCode::from(1)
@@ -2347,6 +2438,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_only_the_exact_public_and_private_reset_grammar() {
+        assert!(matches!(
+            parse(&["reset".into()]),
+            Ok(Command::Reset {
+                shell_wrapper: false
+            })
+        ));
+        assert!(matches!(
+            parse(&["__reset-from-zsh".into()]),
+            Ok(Command::Reset {
+                shell_wrapper: true
+            })
+        ));
+        assert!(parse(&["reset".into(), "--force".into()]).is_err());
+        assert!(parse(&["__reset-from-zsh".into(), "extra".into()]).is_err());
+        assert!(!HELP.contains("__reset-from-zsh"));
+    }
+
+    #[test]
     fn parses_only_the_exact_backup_grammar() {
         assert!(matches!(
             parse(&["backup".into(), "/tmp/vault.backup".into()]),
@@ -2470,6 +2580,23 @@ mod tests {
         assert!(!output.contains("profile"));
         assert!(!output.contains("TOKEN"));
         assert!(!output.contains("CANARY"));
+    }
+
+    #[test]
+    fn reset_success_reports_only_safe_recovery_metadata_and_shell_guidance() {
+        let receipt = ResetReceipt {
+            vault_id: crate::VaultId::from_bytes([1; 16]),
+            key_id: crate::KeyId::from_bytes([2; 16]),
+            recovery_bundle: RecoveryBundleId::from_bytes([3; 16]),
+        };
+        let direct = render_reset_success(receipt, false);
+        assert!(direct.contains("03030303030303030303030303030303"));
+        assert!(direct.contains("current shell was not changed"));
+        assert!(!direct.contains("TOKEN"));
+        assert!(!direct.contains("CANARY"));
+
+        let wrapped = render_reset_success(receipt, true);
+        assert!(!wrapped.contains("current shell was not changed"));
     }
 
     #[test]
@@ -2706,6 +2833,29 @@ mod tests {
                 shortcut_conflict: false,
             };
             assert!(!render_startup_success(&unchanged).contains("open a new shell"));
+        }
+
+        #[test]
+        fn reset_preparation_turns_off_an_existing_startup_profile_without_removing_integration() {
+            let test = TestDirectory::new();
+            let editor = test.editor();
+            let profile = ProfileName::new("work").unwrap();
+            install_startup(&editor, &profile);
+            let paths = test.paths();
+            let resolved = ResolvedZshConfig {
+                editor,
+                saved: None,
+                preferences: ShellPreferenceStore::new(paths.data_directory().to_owned()),
+            };
+
+            disable_startup_for_reset(&resolved).unwrap();
+
+            let state = resolved.editor.inspect().unwrap();
+            let configuration = state.configuration().unwrap();
+            assert!(configuration.profile().is_none());
+            assert!(!configuration.shortcut());
+            let saved = resolved.preferences.read().unwrap().unwrap();
+            assert_eq!(saved.rc_file(), resolved.editor.path());
         }
 
         fn installed_shell() -> ZshDiagnostic {

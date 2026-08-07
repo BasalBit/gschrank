@@ -379,6 +379,34 @@ const WRAPPER_PREFIX: &str = r#"function __gschrank_dispatch_v1 {
         return "$GSCHRANK_SHELL_RC_V1"
       fi
       ;;
+    reset)
+      if (( $# != 1 )); then
+        builtin command gschrank "$@"
+        return $?
+      fi
+      if GSCHRANK_SHELL_PAYLOAD_V1="$(builtin command gschrank __emit-zsh 1 explicit unload)"; then
+        if GSCHRANK_SHELL_COMMAND_OUTPUT_V1="$(builtin command gschrank __reset-from-zsh)"; then
+          if builtin eval -- "$GSCHRANK_SHELL_PAYLOAD_V1"; then
+            builtin unset GSCHRANK_SHELL_PAYLOAD_V1
+            builtin print -r -- "$GSCHRANK_SHELL_COMMAND_OUTPUT_V1"
+            return 0
+          else
+            GSCHRANK_SHELL_RC_V1=$?
+            builtin unset GSCHRANK_SHELL_PAYLOAD_V1 GSCHRANK_SHELL_COMMAND_OUTPUT_V1
+            builtin print -ru2 -- 'gschrank: vault reset completed but this shell could not be unloaded; close it before running commands'
+            return "$GSCHRANK_SHELL_RC_V1"
+          fi
+        else
+          GSCHRANK_SHELL_RC_V1=$?
+          builtin unset GSCHRANK_SHELL_PAYLOAD_V1 GSCHRANK_SHELL_COMMAND_OUTPUT_V1
+          return "$GSCHRANK_SHELL_RC_V1"
+        fi
+      else
+        GSCHRANK_SHELL_RC_V1=$?
+        builtin unset GSCHRANK_SHELL_PAYLOAD_V1
+        return "$GSCHRANK_SHELL_RC_V1"
+      fi
+      ;;
     profile)
       if (( $# == 3 )) && [[ "$2" == delete && ${GSCHRANK_ACTIVE_PROFILE-} == "$3" ]]; then
         if GSCHRANK_SHELL_PAYLOAD_V1="$(builtin command gschrank __emit-zsh 1 explicit unload)"; then
@@ -975,6 +1003,49 @@ mod tests {
             output.stdout == b"CANARY-preserved\n",
             "failed delete changed the active shell"
         );
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn wrapper_unloads_the_invoking_shell_only_after_a_successful_reset() {
+        let fake = TestDirectory::with_fake_gschrank(
+            "#!/bin/zsh -f\nif [[ \"$1\" == __emit-zsh ]]; then\n  builtin print -rn -- 'builtin unset -- ACTIVE_VALUE GSCHRANK_ENV_PROTOCOL GSCHRANK_ACTIVE_PROFILE GSCHRANK_MANAGED_KEYS;'\n  exit 0\nfi\nif [[ \"$1\" == __reset-from-zsh ]]; then\n  builtin print -r -- 'Initialized a new independently keyed empty vault.'\n  exit 0\nfi\nexit 99\n",
+        );
+        let wrapper = ZshEmitter::new().emit_wrapper(false);
+        let output = run_zsh_parts_with_path(
+            b"builtin export ACTIVE_VALUE=CANARY-reset-active GSCHRANK_ENV_PROTOCOL=1 GSCHRANK_ACTIVE_PROFILE=work GSCHRANK_MANAGED_KEYS=ACTIVE_VALUE\n",
+            wrapper.as_bytes(),
+            b"gschrank reset\nGSCHRANK_TEST_RC=$?\nif builtin command /usr/bin/printenv ACTIVE_VALUE >/dev/null; then exit 96; fi\nif builtin command /usr/bin/printenv GSCHRANK_ACTIVE_PROFILE >/dev/null; then exit 95; fi\nexit $GSCHRANK_TEST_RC\n",
+            Some(fake.path()),
+        );
+        assert!(output.status.success(), "reset wrapper fixture failed");
+        assert_eq!(
+            output.stdout,
+            b"Initialized a new independently keyed empty vault.\n"
+        );
+        assert!(
+            !output
+                .stderr
+                .windows(b"CANARY-reset-active".len())
+                .any(|window| window == b"CANARY-reset-active"),
+            "reset diagnostics exposed an environment value"
+        );
+    }
+
+    #[test]
+    fn failed_reset_preserves_the_invoking_shell_snapshot() {
+        let fake = TestDirectory::with_fake_gschrank(
+            "#!/bin/zsh -f\nif [[ \"$1\" == __emit-zsh ]]; then\n  builtin print -rn -- 'builtin unset -- ACTIVE_VALUE GSCHRANK_ENV_PROTOCOL GSCHRANK_ACTIVE_PROFILE GSCHRANK_MANAGED_KEYS;'\n  exit 0\nfi\nif [[ \"$1\" == __reset-from-zsh ]]; then\n  exit 14\nfi\nexit 99\n",
+        );
+        let wrapper = ZshEmitter::new().emit_wrapper(false);
+        let output = run_zsh_parts_with_path(
+            b"builtin export ACTIVE_VALUE=CANARY-reset-preserved GSCHRANK_ENV_PROTOCOL=1 GSCHRANK_ACTIVE_PROFILE=work GSCHRANK_MANAGED_KEYS=ACTIVE_VALUE\n",
+            wrapper.as_bytes(),
+            b"gschrank reset\nGSCHRANK_TEST_RC=$?\nbuiltin command /usr/bin/printenv ACTIVE_VALUE\nexit $GSCHRANK_TEST_RC\n",
+            Some(fake.path()),
+        );
+        assert_eq!(output.status.code(), Some(14));
+        assert_eq!(output.stdout, b"CANARY-reset-preserved\n");
         assert!(output.stderr.is_empty());
     }
 }

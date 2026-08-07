@@ -19,6 +19,7 @@ mod init;
 mod key_provider;
 mod profiles;
 mod recovery;
+mod reset;
 mod restore;
 mod secret_input;
 mod set_command;

@@ -218,6 +218,42 @@ impl VaultTransaction for LocalTransaction<'_> {
         }
     }
 
+    fn clear_root_artifacts(&mut self) -> Result<CommitOutcome, VaultStoreError> {
+        let live_exists = read_artifact(self.directory, LIVE_FILE)?.is_some();
+        let pending_exists = read_artifact(self.directory, INIT_PENDING_FILE)?.is_some();
+        if !live_exists && !pending_exists {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::MissingState));
+        }
+
+        let mut changed = false;
+        for (exists, name) in [
+            (live_exists, LIVE_FILE),
+            (pending_exists, INIT_PENDING_FILE),
+        ] {
+            if !exists {
+                continue;
+            }
+            if let Err(error) = fs::remove_file(self.directory.join(name)) {
+                if changed {
+                    return Ok(CommitOutcome::Indeterminate);
+                }
+                return Err(map_file_io(error));
+            }
+            changed = true;
+        }
+
+        if sync_directory(self.directory).is_err() {
+            return Ok(CommitOutcome::Indeterminate);
+        }
+        match (
+            read_artifact(self.directory, LIVE_FILE),
+            read_artifact(self.directory, INIT_PENDING_FILE),
+        ) {
+            (Ok(None), Ok(None)) => Ok(CommitOutcome::Committed),
+            _ => Ok(CommitOutcome::Indeterminate),
+        }
+    }
+
     fn replace_live(&mut self, envelope: &[u8]) -> Result<CommitOutcome, VaultStoreError> {
         durably_install(
             self.directory,
@@ -877,6 +913,65 @@ mod tests {
             );
         }
         assert_eq!(fs::read_dir(recovery).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn clears_only_root_artifacts_after_their_recovery_bundle_is_committed() {
+        let test = TestDirectory::new();
+        let store = LocalVaultStore::new(test.data());
+        store
+            .initialization_transaction::<_, VaultStoreError, _>(|transaction| {
+                transaction.create_init_pending(b"old-live")?;
+                transaction.promote_init_pending()?;
+                Ok(())
+            })
+            .unwrap();
+        fs::write(test.data().join(INIT_PENDING_FILE), b"old-pending").unwrap();
+        fs::set_permissions(
+            test.data().join(INIT_PENDING_FILE),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let metadata = RecoveryBundleMetadata {
+            id: RecoveryBundleId::from_bytes([0x6b; 16]),
+            created_at_unix_seconds: 1_765_000_002,
+            reason: RecoveryReason::Reset,
+        };
+
+        store
+            .exclusive_transaction::<_, VaultStoreError, _>(|transaction| {
+                let live = transaction.read_live()?.unwrap();
+                let pending = transaction.read_init_pending()?.unwrap();
+                assert_eq!(
+                    transaction.preserve_recovery(
+                        metadata,
+                        RecoveryArtifacts {
+                            live: Some(&live),
+                            init_pending: Some(&pending),
+                        },
+                    )?,
+                    CommitOutcome::Committed
+                );
+                assert_eq!(
+                    transaction.clear_root_artifacts()?,
+                    CommitOutcome::Committed
+                );
+                assert!(transaction.read_live()?.is_none());
+                assert!(transaction.read_init_pending()?.is_none());
+                Ok(())
+            })
+            .unwrap();
+
+        let bundles = store
+            .shared_read::<_, VaultStoreError, _>(|read| read.read_recovery_bundles())
+            .unwrap();
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].metadata, metadata);
+        assert_eq!(bundles[0].live.as_ref().unwrap().as_slice(), b"old-live");
+        assert_eq!(
+            bundles[0].init_pending.as_ref().unwrap().as_slice(),
+            b"old-pending"
+        );
     }
 
     #[test]
