@@ -87,10 +87,16 @@ pub(crate) trait VaultTransaction: VaultRead {
     fn create_init_pending(&mut self, envelope: &[u8]) -> Result<(), VaultStoreError>;
     fn discard_init_pending(&mut self) -> Result<(), VaultStoreError>;
     fn promote_init_pending(&mut self) -> Result<CommitOutcome, VaultStoreError>;
+    fn replace_live(&mut self, envelope: &[u8]) -> Result<CommitOutcome, VaultStoreError>;
 }
 
 /// Transaction-level access to encrypted vault artifacts.
 pub(crate) trait VaultStore: Send + Sync {
+    fn initialization_transaction<T, E, F>(&self, operation: F) -> Result<T, E>
+    where
+        E: From<VaultStoreError>,
+        F: FnOnce(&mut dyn VaultTransaction) -> Result<T, E>;
+
     #[allow(dead_code)]
     fn shared_read<T, E, F>(&self, operation: F) -> Result<T, E>
     where

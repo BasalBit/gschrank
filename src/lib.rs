@@ -13,6 +13,7 @@ mod domain;
 mod envelope;
 mod init;
 mod key_provider;
+mod profiles;
 mod vault_store;
 
 #[cfg(target_os = "macos")]

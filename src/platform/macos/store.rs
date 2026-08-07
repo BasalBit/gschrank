@@ -25,6 +25,12 @@ const INIT_PENDING_FILE: &str = "vault.init.pending";
 const TEMP_ATTEMPTS: usize = 16;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
+#[derive(Clone, Copy)]
+enum DestinationState {
+    Absent,
+    Present,
+}
+
 /// Locked, permission-validating local encrypted-vault storage for macOS/APFS.
 pub(crate) struct LocalVaultStore {
     directory: PathBuf,
@@ -76,6 +82,21 @@ impl LocalVaultStore {
 }
 
 impl VaultStore for LocalVaultStore {
+    fn initialization_transaction<T, E, F>(&self, operation: F) -> Result<T, E>
+    where
+        E: From<VaultStoreError>,
+        F: FnOnce(&mut dyn VaultTransaction) -> Result<T, E>,
+    {
+        self.prepare_directory(true).map_err(E::from)?;
+        let lock = self.open_lock(true).map_err(E::from)?;
+        lock.lock().map_err(|error| E::from(map_lock_io(error)))?;
+        let mut transaction = LocalTransaction {
+            directory: &self.directory,
+            _lock: lock,
+        };
+        operation(&mut transaction)
+    }
+
     fn shared_read<T, E, F>(&self, operation: F) -> Result<T, E>
     where
         E: From<VaultStoreError>,
@@ -97,8 +118,8 @@ impl VaultStore for LocalVaultStore {
         E: From<VaultStoreError>,
         F: FnOnce(&mut dyn VaultTransaction) -> Result<T, E>,
     {
-        self.prepare_directory(true).map_err(E::from)?;
-        let lock = self.open_lock(true).map_err(E::from)?;
+        self.prepare_directory(false).map_err(E::from)?;
+        let lock = self.open_lock(false).map_err(E::from)?;
         lock.lock().map_err(|error| E::from(map_lock_io(error)))?;
         let mut transaction = LocalTransaction {
             directory: &self.directory,
@@ -130,7 +151,13 @@ impl VaultTransaction for LocalTransaction<'_> {
         {
             return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
         }
-        durably_write_new(self.directory, INIT_PENDING_FILE, envelope)
+        durably_install(
+            self.directory,
+            INIT_PENDING_FILE,
+            envelope,
+            DestinationState::Absent,
+        )
+        .map(|_| ())
     }
 
     fn discard_init_pending(&mut self) -> Result<(), VaultStoreError> {
@@ -155,6 +182,15 @@ impl VaultTransaction for LocalTransaction<'_> {
             Ok(()) => Ok(CommitOutcome::Committed),
             Err(error) => Err(map_file_io(error)),
         }
+    }
+
+    fn replace_live(&mut self, envelope: &[u8]) -> Result<CommitOutcome, VaultStoreError> {
+        durably_install(
+            self.directory,
+            LIVE_FILE,
+            envelope,
+            DestinationState::Present,
+        )
     }
 }
 
@@ -200,14 +236,16 @@ fn artifact_exists(directory: &Path, name: &str) -> Result<bool, VaultStoreError
     }
 }
 
-fn durably_write_new(
+fn durably_install(
     directory: &Path,
     destination: &str,
     envelope: &[u8],
-) -> Result<(), VaultStoreError> {
+    destination_state: DestinationState,
+) -> Result<CommitOutcome, VaultStoreError> {
     if envelope.len() > MAX_ENVELOPE_SIZE {
         return Err(VaultStoreError::new(VaultStoreErrorKind::IoFailure));
     }
+    validate_destination_state(directory, destination, destination_state)?;
 
     for _ in 0..TEMP_ATTEMPTS {
         let temporary_name = temporary_name()?;
@@ -230,10 +268,9 @@ fn durably_write_new(
             file.flush().map_err(map_file_io)?;
             system::full_sync(&file).map_err(map_file_io)?;
             drop(file);
-            if artifact_exists(directory, destination)? {
-                return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
-            }
-            fs::rename(&temporary_path, directory.join(destination)).map_err(map_file_io)
+            validate_destination_state(directory, destination, destination_state)?;
+            fs::rename(&temporary_path, directory.join(destination)).map_err(map_file_io)?;
+            Ok(CommitOutcome::Committed)
         })();
 
         if write_result.is_err() {
@@ -243,6 +280,23 @@ fn durably_write_new(
     }
 
     Err(VaultStoreError::new(VaultStoreErrorKind::Conflict))
+}
+
+fn validate_destination_state(
+    directory: &Path,
+    destination: &str,
+    expected: DestinationState,
+) -> Result<(), VaultStoreError> {
+    let exists = artifact_exists(directory, destination)?;
+    match (exists, expected) {
+        (false, DestinationState::Absent) | (true, DestinationState::Present) => Ok(()),
+        (true, DestinationState::Absent) => {
+            Err(VaultStoreError::new(VaultStoreErrorKind::Conflict))
+        }
+        (false, DestinationState::Present) => {
+            Err(VaultStoreError::new(VaultStoreErrorKind::MissingState))
+        }
+    }
 }
 
 fn temporary_name() -> Result<String, VaultStoreError> {
@@ -323,8 +377,10 @@ mod tests {
 
     use super::*;
     use crate::{
+        ProfileName,
         init::{InitOutcome, Initializer},
         key_provider::InteractionPolicy,
+        profiles::{ProfileOperationError, ProfileOperations},
         testing::MemoryKeyProvider,
     };
 
@@ -358,7 +414,7 @@ mod tests {
         let test = TestDirectory::new();
         let store = LocalVaultStore::new(test.data());
         store
-            .exclusive_transaction::<_, VaultStoreError, _>(|transaction| {
+            .initialization_transaction::<_, VaultStoreError, _>(|transaction| {
                 transaction.create_init_pending(b"encrypted-envelope")?;
                 assert_eq!(
                     transaction.read_init_pending()?.unwrap().as_slice(),
@@ -371,6 +427,14 @@ mod tests {
                 assert_eq!(
                     transaction.read_live()?.unwrap().as_slice(),
                     b"encrypted-envelope"
+                );
+                assert_eq!(
+                    transaction.replace_live(b"replacement-envelope")?,
+                    CommitOutcome::Committed
+                );
+                assert_eq!(
+                    transaction.read_live()?.unwrap().as_slice(),
+                    b"replacement-envelope"
                 );
                 Ok(())
             })
@@ -400,9 +464,35 @@ mod tests {
         fs::set_permissions(test.data(), fs::Permissions::from_mode(0o755)).unwrap();
         let store = LocalVaultStore::new(test.data());
         let error = store
-            .exclusive_transaction::<_, VaultStoreError, _>(|_| Ok(()))
+            .initialization_transaction::<_, VaultStoreError, _>(|_| Ok(()))
             .unwrap_err();
         assert_eq!(error.kind(), VaultStoreErrorKind::UnsafePath);
+    }
+
+    #[test]
+    fn ordinary_reads_and_mutations_do_not_create_missing_store_state() {
+        let test = TestDirectory::new();
+        let store = LocalVaultStore::new(test.data());
+
+        let read_error = store
+            .shared_read::<_, VaultStoreError, _>(|transaction| transaction.read_live())
+            .unwrap_err();
+        assert_eq!(read_error.kind(), VaultStoreErrorKind::MissingState);
+        assert!(!test.data().exists());
+
+        let mutation_error = store
+            .exclusive_transaction::<_, VaultStoreError, _>(|_| Ok(()))
+            .unwrap_err();
+        assert_eq!(mutation_error.kind(), VaultStoreErrorKind::MissingState);
+        assert!(!test.data().exists());
+
+        let keys = MemoryKeyProvider::new();
+        let profile_error = ProfileOperations::new(&keys, &store)
+            .list(InteractionPolicy::FailFast)
+            .unwrap_err();
+        assert_eq!(profile_error, ProfileOperationError::NotInitialized);
+        assert_eq!(profile_error.exit_code(), 10);
+        assert!(!test.data().exists());
     }
 
     #[test]
@@ -415,14 +505,14 @@ mod tests {
 
         let symlinked_store = LocalVaultStore::new(test.data());
         let error = symlinked_store
-            .exclusive_transaction::<_, VaultStoreError, _>(|_| Ok(()))
+            .initialization_transaction::<_, VaultStoreError, _>(|_| Ok(()))
             .unwrap_err();
         assert_eq!(error.kind(), VaultStoreErrorKind::UnsafePath);
 
         fs::remove_file(test.data()).unwrap();
         let store = LocalVaultStore::new(test.data());
         store
-            .exclusive_transaction::<_, VaultStoreError, _>(|_| Ok(()))
+            .initialization_transaction::<_, VaultStoreError, _>(|_| Ok(()))
             .unwrap();
         let target = test.0.join("outside-vault");
         let mut options = OpenOptions::new();
@@ -456,6 +546,18 @@ mod tests {
                 revision: 0,
             }
         );
+
+        let profiles = ProfileOperations::new(&keys, &store);
+        profiles
+            .create(
+                ProfileName::new("dev").unwrap(),
+                InteractionPolicy::FailFast,
+            )
+            .unwrap();
+        assert_eq!(
+            profiles.list(InteractionPolicy::FailFast).unwrap(),
+            vec![ProfileName::new("dev").unwrap()]
+        );
     }
 
     #[test]
@@ -463,7 +565,7 @@ mod tests {
         let test = TestDirectory::new();
         let store = Arc::new(LocalVaultStore::new(test.data()));
         store
-            .exclusive_transaction::<_, VaultStoreError, _>(|_| Ok(()))
+            .initialization_transaction::<_, VaultStoreError, _>(|_| Ok(()))
             .unwrap();
 
         let (held_sender, held_receiver) = mpsc::channel();

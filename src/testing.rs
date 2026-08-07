@@ -133,10 +133,18 @@ struct MemoryVaultState {
     live: Option<Zeroizing<Vec<u8>>>,
     init_pending: Option<Zeroizing<Vec<u8>>>,
     next_promotion: Option<PromotionFault>,
+    next_replacement: Option<ReplacementFault>,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum PromotionFault {
+    NotCommitted,
+    IndeterminateBeforeCommit,
+    IndeterminateAfterCommit,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ReplacementFault {
     NotCommitted,
     IndeterminateBeforeCommit,
     IndeterminateAfterCommit,
@@ -159,6 +167,10 @@ impl MemoryVaultStore {
 
     pub(crate) fn fail_next_promotion(&self, fault: PromotionFault) {
         self.state().next_promotion = Some(fault);
+    }
+
+    pub(crate) fn fail_next_replacement(&self, fault: ReplacementFault) {
+        self.state().next_replacement = Some(fault);
     }
 
     pub(crate) fn live(&self) -> Option<Vec<u8>> {
@@ -220,6 +232,25 @@ impl VaultTransaction for MemoryTransaction<'_> {
         self.promote()?;
         Ok(CommitOutcome::Committed)
     }
+
+    fn replace_live(&mut self, envelope: &[u8]) -> Result<CommitOutcome, VaultStoreError> {
+        if self.state.live.is_none() {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::MissingState));
+        }
+        match self.state.next_replacement.take() {
+            Some(ReplacementFault::NotCommitted) => return Ok(CommitOutcome::NotCommitted),
+            Some(ReplacementFault::IndeterminateBeforeCommit) => {
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            Some(ReplacementFault::IndeterminateAfterCommit) => {
+                self.state.live = Some(Zeroizing::new(envelope.to_vec()));
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            None => {}
+        }
+        self.state.live = Some(Zeroizing::new(envelope.to_vec()));
+        Ok(CommitOutcome::Committed)
+    }
 }
 
 impl MemoryTransaction<'_> {
@@ -238,6 +269,16 @@ impl MemoryTransaction<'_> {
 }
 
 impl VaultStore for MemoryVaultStore {
+    fn initialization_transaction<T, E, F>(&self, operation: F) -> Result<T, E>
+    where
+        E: From<VaultStoreError>,
+        F: FnOnce(&mut dyn VaultTransaction) -> Result<T, E>,
+    {
+        let mut state = self.state();
+        let mut transaction = MemoryTransaction { state: &mut state };
+        operation(&mut transaction)
+    }
+
     fn shared_read<T, E, F>(&self, operation: F) -> Result<T, E>
     where
         E: From<VaultStoreError>,

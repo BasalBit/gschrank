@@ -9,8 +9,10 @@ The project is currently under implementation. The portable core implements
 the validated profile model, deterministic vault payload codec, and the
 authenticated XChaCha20-Poly1305 envelope. On macOS, `gschrank init` now creates
 an empty encrypted vault through atomic APFS persistence and stores its random
-master key in the login Keychain. Profile editing and shell integration are not
-implemented yet, so the current CLI cannot store environment values.
+master key in the login Keychain. Authenticated `profile create`, `rename`,
+`delete`, `list`, and names-only `inspect` operations atomically rewrite that
+vault. Secret-value entry and shell integration are not implemented yet, so the
+current CLI cannot store or load environment values.
 
 The canonical executable is `gschrank`. Configured interactive Zsh shells will
 also be able to expose the optional `gsch` function once shell integration is

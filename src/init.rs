@@ -125,8 +125,9 @@ where
         &self,
         interaction: InteractionPolicy,
     ) -> Result<InitOutcome, InitError> {
-        self.store
-            .exclusive_transaction(|transaction| self.initialize_locked(transaction, interaction))
+        self.store.initialization_transaction(|transaction| {
+            self.initialize_locked(transaction, interaction)
+        })
     }
 
     fn initialize_locked(
