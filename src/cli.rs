@@ -12,9 +12,10 @@ use crate::{
     config_command::{
         ConfigJourneyOutcome, ConfigPrompter, TerminalConfigPrompter, run_config_journey,
     },
+    import_command::{ImportCommandError, ImportOptions, ImportOutcome, execute_import},
     init::{InitOutcome, Initializer},
     key_provider::InteractionPolicy,
-    profiles::{ProfileInspection, ProfileOperationError, ProfileOperations},
+    profiles::{ImportOperationError, ProfileInspection, ProfileOperationError, ProfileOperations},
     secret_input::{SecretInputMode, read_secret},
     set_command::execute_set,
     shell::{ShellEmitter, ZshEmitter},
@@ -41,6 +42,7 @@ Encrypted environment profiles for your shell.
 Usage:
   gschrank config [--rc-file <absolute-path>]
   gschrank init
+  gschrank import dotenv <profile> [--dry-run] [--replace-existing]
   gschrank profile create <profile>
   gschrank profile rename <old> <new>
   gschrank profile delete <profile>
@@ -59,6 +61,7 @@ Usage:
 Commands:
   config     Guided vault, profile, secret, and Zsh startup setup
   init       Create an empty encrypted vault, or validate the existing vault
+  import     Add a strict stdin-only dotenv document to an existing profile
   profile    Create, rename, delete, list, or inspect profiles
   set        Create or update a variable using hidden or explicit stdin input
   remove     Remove a variable from a profile
@@ -79,6 +82,10 @@ enum Command {
         rc_file: Option<PathBuf>,
     },
     Init,
+    Import {
+        profile: ProfileName,
+        options: ImportOptions,
+    },
     Profile(ProfileCommand),
     Set {
         profile: ProfileName,
@@ -305,6 +312,7 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
         }
         Ok(Command::Config { rc_file }) => run_config(rc_file),
         Ok(Command::Init) => run_init(),
+        Ok(Command::Import { profile, options }) => run_import(&profile, options),
         Ok(Command::Profile(command)) => run_profile(command),
         Ok(Command::Set {
             profile,
@@ -335,6 +343,9 @@ fn parse(arguments: &[OsString]) -> Result<Command, ParseError> {
             })
         }
         [argument] if argument == "init" => Ok(Command::Init),
+        [import, dotenv, arguments @ ..] if import == "import" && dotenv == "dotenv" => {
+            parse_import(arguments)
+        }
         [profile, list] if profile == "profile" && list == "list" => {
             Ok(Command::Profile(ProfileCommand::List))
         }
@@ -387,6 +398,30 @@ fn parse(arguments: &[OsString]) -> Result<Command, ParseError> {
         [unload] if unload == "unload" => Ok(Command::ShellParent(ShellParentCommand::Unload)),
         _ => parse_private(arguments),
     }
+}
+
+fn parse_import(arguments: &[OsString]) -> Result<Command, ParseError> {
+    let Some((profile, flags)) = arguments.split_first() else {
+        return Err(ParseError::InvalidGrammar);
+    };
+    let mut dry_run = false;
+    let mut replace_existing = false;
+    for flag in flags {
+        if flag == "--dry-run" && !dry_run {
+            dry_run = true;
+        } else if flag == "--replace-existing" && !replace_existing {
+            replace_existing = true;
+        } else {
+            return Err(ParseError::InvalidGrammar);
+        }
+    }
+    Ok(Command::Import {
+        profile: parse_profile_name(profile)?,
+        options: ImportOptions {
+            dry_run,
+            replace_existing,
+        },
+    })
 }
 
 fn parse_private(arguments: &[OsString]) -> Result<Command, ParseError> {
@@ -681,6 +716,117 @@ fn run_init() -> ExitCode {
             eprintln!("gschrank: {error}");
             ExitCode::from(error.exit_code())
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_import(profile: &ProfileName, options: ImportOptions) -> ExitCode {
+    if std::io::stdin().is_terminal() {
+        let error = ImportCommandError::TerminalStdin;
+        eprintln!("gschrank: {error}");
+        return ExitCode::from(error.exit_code());
+    }
+    let paths = match MacOsPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(13);
+        }
+    };
+    let keys = MacOsKeychainProvider::new();
+    let store = LocalVaultStore::new(paths.data_directory().to_owned());
+    let operations = ProfileOperations::new(&keys, &store);
+    let interaction = if std::io::stderr().is_terminal() {
+        InteractionPolicy::AllowPrompt
+    } else {
+        InteractionPolicy::FailFast
+    };
+    let stdin = std::io::stdin();
+    match execute_import(
+        &operations,
+        profile,
+        options,
+        interaction,
+        false,
+        stdin.lock(),
+    ) {
+        Ok(outcome) => {
+            let imported = matches!(outcome, ImportOutcome::Imported(_));
+            print!("{}", render_import_outcome(profile, outcome));
+            if imported {
+                eprintln!(
+                    "gschrank: if stdin came from a plaintext file, that file still exists; secure or remove it separately after verification"
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(ImportCommandError::Operation(ImportOperationError::Collisions(names))) => {
+            eprintln!(
+                "gschrank: import would replace existing variables; rerun with --replace-existing to authorize the complete import"
+            );
+            for name in names {
+                eprintln!("{}", name.as_str());
+            }
+            ExitCode::from(14)
+        }
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
+fn render_import_outcome(profile: &ProfileName, outcome: ImportOutcome) -> String {
+    let mut output = String::new();
+    match outcome {
+        ImportOutcome::NoVariables => {
+            output.push_str("No variables were found; nothing changed.\n");
+        }
+        ImportOutcome::DryRun {
+            plan,
+            replace_existing,
+        } => {
+            if plan.created.is_empty() && plan.collisions.is_empty() {
+                output.push_str("No variables were found; the dry run would change nothing.\n");
+                return output;
+            }
+            output.push_str("Dry run for profile '");
+            output.push_str(profile.as_str());
+            output.push_str("'; no vault changes were made.\n");
+            append_import_names(&mut output, "Would add", &plan.created);
+            append_import_names(
+                &mut output,
+                if replace_existing {
+                    "Would replace"
+                } else {
+                    "Collisions"
+                },
+                &plan.collisions,
+            );
+        }
+        ImportOutcome::Imported(receipt) => {
+            let count = receipt.plan.created.len() + receipt.plan.collisions.len();
+            output.push_str("Imported ");
+            output.push_str(&count.to_string());
+            output.push_str(" variable(s) into profile '");
+            output.push_str(profile.as_str());
+            output.push_str("'.\n");
+            append_import_names(&mut output, "Created", &receipt.plan.created);
+            append_import_names(&mut output, "Replaced", &receipt.plan.collisions);
+        }
+    }
+    output
+}
+
+fn append_import_names(output: &mut String, label: &str, names: &[EnvironmentName]) {
+    if names.is_empty() {
+        return;
+    }
+    output.push_str(label);
+    output.push_str(":\n");
+    for name in names {
+        output.push_str(name.as_str());
+        output.push('\n');
     }
 }
 
@@ -1199,6 +1345,12 @@ fn run_config(_explicit_rc_file: Option<PathBuf>) -> ExitCode {
 }
 
 #[cfg(not(target_os = "macos"))]
+fn run_import(_profile: &ProfileName, _options: ImportOptions) -> ExitCode {
+    eprintln!("gschrank: this build does not support encrypted dotenv import");
+    ExitCode::from(1)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn run_init() -> ExitCode {
     eprintln!("gschrank: this build does not support secure vault initialization on this platform");
     ExitCode::from(1)
@@ -1352,6 +1504,79 @@ mod tests {
         ));
         assert!(parse(&["config".into(), "--rc-file".into()]).is_err());
         assert!(parse(&["config".into(), "--other".into(), "value".into()]).is_err());
+    }
+
+    #[test]
+    fn parses_the_exact_stdin_only_dotenv_import_grammar() {
+        assert!(matches!(
+            parse(&["import".into(), "dotenv".into(), "dev".into()]),
+            Ok(Command::Import {
+                options: ImportOptions {
+                    dry_run: false,
+                    replace_existing: false,
+                },
+                ..
+            })
+        ));
+        for flags in [
+            ["--dry-run", "--replace-existing"],
+            ["--replace-existing", "--dry-run"],
+        ] {
+            assert!(matches!(
+                parse(&[
+                    "import".into(),
+                    "dotenv".into(),
+                    "dev".into(),
+                    flags[0].into(),
+                    flags[1].into(),
+                ]),
+                Ok(Command::Import {
+                    options: ImportOptions {
+                        dry_run: true,
+                        replace_existing: true,
+                    },
+                    ..
+                })
+            ));
+        }
+        assert!(
+            parse(&[
+                "import".into(),
+                "dotenv".into(),
+                "dev".into(),
+                "--stdin".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "import".into(),
+                "dotenv".into(),
+                "dev".into(),
+                ".env".into()
+            ])
+            .is_err()
+        );
+        assert!(parse(&["import".into(), "dotenv".into()]).is_err());
+    }
+
+    #[test]
+    fn import_rendering_contains_names_and_counts_but_no_value_fields() {
+        let profile = ProfileName::new("dev").unwrap();
+        let output = render_import_outcome(
+            &profile,
+            ImportOutcome::Imported(crate::profiles::ImportReceipt {
+                plan: crate::domain::ImportPlan {
+                    created: vec![EnvironmentName::new("ADDED").unwrap()],
+                    collisions: vec![EnvironmentName::new("REPLACED").unwrap()],
+                },
+            }),
+        );
+        assert!(output.contains("Imported 2 variable(s)"));
+        assert!(output.contains("ADDED"));
+        assert!(output.contains("REPLACED"));
+        assert!(!output.contains("value"));
+        assert!(!output.contains("CANARY"));
     }
 
     #[test]

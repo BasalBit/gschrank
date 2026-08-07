@@ -5,7 +5,7 @@ use std::{error::Error, fmt};
 use crate::{
     DomainError, EnvelopeError, EnvironmentName, KeyId, MasterKey, Mutation, ProfileName,
     SecretValue, Vault, VaultId,
-    domain::ProfileSnapshot,
+    domain::{ImportPlan, ProfileSnapshot},
     inspect_envelope,
     key_provider::{InteractionPolicy, KeyProvider, KeyProviderError, KeyProviderErrorKind},
     open_envelope, seal_vault,
@@ -33,6 +33,65 @@ pub(crate) struct MutationReceipt {
 pub(crate) struct SetReceipt {
     pub(crate) revision: u64,
     pub(crate) mutation: Mutation,
+}
+
+/// Safe metadata confirming one atomic additive import.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ImportReceipt {
+    pub(crate) plan: ImportPlan,
+}
+
+/// A value-free import failure. Collision details contain names only.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ImportOperationError {
+    Profile(ProfileOperationError),
+    Collisions(Vec<EnvironmentName>),
+}
+
+impl ImportOperationError {
+    pub(crate) const fn exit_code(&self) -> u8 {
+        match self {
+            Self::Profile(error) => error.exit_code(),
+            Self::Collisions(_) => 14,
+        }
+    }
+}
+
+impl fmt::Display for ImportOperationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Profile(error) => error.fmt(formatter),
+            Self::Collisions(_) => formatter.write_str(
+                "import collides with existing variables; use --replace-existing to authorize replacement",
+            ),
+        }
+    }
+}
+
+impl Error for ImportOperationError {}
+
+impl From<ProfileOperationError> for ImportOperationError {
+    fn from(error: ProfileOperationError) -> Self {
+        Self::Profile(error)
+    }
+}
+
+impl From<DomainError> for ImportOperationError {
+    fn from(error: DomainError) -> Self {
+        Self::Profile(error.into())
+    }
+}
+
+impl From<EnvelopeError> for ImportOperationError {
+    fn from(error: EnvelopeError) -> Self {
+        Self::Profile(error.into())
+    }
+}
+
+impl From<VaultStoreError> for ImportOperationError {
+    fn from(error: VaultStoreError) -> Self {
+        Self::Profile(error.into())
+    }
 }
 
 /// A value-free authenticated profile-operation failure.
@@ -229,6 +288,62 @@ where
                 return Err(DomainError::ProfileNotFound.into());
             }
             Ok(())
+        })
+    }
+
+    pub(crate) fn preflight_import(
+        &self,
+        profile: &ProfileName,
+        interaction: InteractionPolicy,
+    ) -> Result<(), ProfileOperationError> {
+        self.preflight_set(profile, interaction)
+    }
+
+    pub(crate) fn preview_import(
+        &self,
+        profile: &ProfileName,
+        imported: &std::collections::BTreeMap<EnvironmentName, SecretValue>,
+        interaction: InteractionPolicy,
+    ) -> Result<ImportPlan, ImportOperationError> {
+        self.store.shared_read(|read| {
+            let (opened, _key) = self.open_current(read, interaction)?;
+            opened
+                .vault
+                .plan_import(profile, imported)
+                .map_err(Into::into)
+        })
+    }
+
+    pub(crate) fn import(
+        &self,
+        profile: &ProfileName,
+        imported: std::collections::BTreeMap<EnvironmentName, SecretValue>,
+        replace_existing: bool,
+        interaction: InteractionPolicy,
+    ) -> Result<ImportReceipt, ImportOperationError> {
+        self.store.exclusive_transaction(|transaction| {
+            let (mut opened, key) = self.open_current(transaction, interaction)?;
+            let preview = opened.vault.plan_import(profile, &imported)?;
+            if !replace_existing && !preview.collisions.is_empty() {
+                return Err(ImportOperationError::Collisions(preview.collisions));
+            }
+            if imported.is_empty() {
+                return Ok(ImportReceipt { plan: preview });
+            }
+
+            let plan = opened.vault.apply_import(profile, imported)?;
+            let expected_revision = opened.vault.revision();
+            let replacement = seal_vault(&opened.vault, opened.vault_id, opened.key_id, &key)?;
+            let outcome = transaction.replace_live(&replacement)?;
+            Self::verify_commit(
+                transaction,
+                outcome,
+                &key,
+                opened.vault_id,
+                opened.key_id,
+                expected_revision,
+            )?;
+            Ok(ImportReceipt { plan })
         })
     }
 

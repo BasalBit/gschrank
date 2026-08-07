@@ -373,6 +373,66 @@ impl Vault {
         Ok(mutation)
     }
 
+    /// Computes a value-free additive-import plan against one profile.
+    ///
+    /// The supplied values are inspected only for enforcing the resulting
+    /// profile limits. They are never copied into the plan.
+    pub(crate) fn plan_import(
+        &self,
+        profile_name: &ProfileName,
+        imported: &BTreeMap<EnvironmentName, SecretValue>,
+    ) -> Result<ImportPlan, DomainError> {
+        let profile = self
+            .profiles
+            .get(profile_name)
+            .ok_or(DomainError::ProfileNotFound)?;
+        let mut created = Vec::new();
+        let mut collisions = Vec::new();
+        for name in imported.keys() {
+            if profile.variables.contains_key(name) {
+                collisions.push(name.clone());
+            } else {
+                created.push(name.clone());
+            }
+        }
+        if profile
+            .variables
+            .len()
+            .checked_add(created.len())
+            .is_none_or(|count| count > MAX_VARIABLES_PER_PROFILE)
+        {
+            return Err(DomainError::VariableLimitExceeded);
+        }
+        resulting_profile_size(profile, imported)?;
+        Ok(ImportPlan {
+            created,
+            collisions,
+        })
+    }
+
+    /// Applies one completely validated additive upsert as one logical
+    /// revision. Existing names absent from `imported` remain untouched.
+    pub(crate) fn apply_import(
+        &mut self,
+        profile_name: &ProfileName,
+        imported: BTreeMap<EnvironmentName, SecretValue>,
+    ) -> Result<ImportPlan, DomainError> {
+        self.ensure_mutable()?;
+        let plan = self.plan_import(profile_name, &imported)?;
+        if imported.is_empty() {
+            return Ok(plan);
+        }
+        let profile = self
+            .profiles
+            .get_mut(profile_name)
+            .ok_or(DomainError::ProfileNotFound)?;
+        let new_size = resulting_profile_size(profile, &imported)?;
+        profile.variables.extend(imported);
+        profile.byte_size = new_size;
+        self.increment_revision();
+        Ok(plan)
+    }
+
     /// Removes one existing value.
     ///
     /// # Errors
@@ -441,6 +501,36 @@ impl Vault {
             .get(name)
             .map(SecretValue::expose)
     }
+}
+
+fn resulting_profile_size(
+    profile: &Profile,
+    imported: &BTreeMap<EnvironmentName, SecretValue>,
+) -> Result<usize, DomainError> {
+    let mut size = profile.byte_size;
+    for (name, value) in imported {
+        if let Some(previous) = profile.variables.get(name) {
+            size = size
+                .checked_sub(name.as_str().len() + previous.expose().len())
+                .ok_or(DomainError::ProfileSizeLimitExceeded)?;
+        }
+        size = size
+            .checked_add(name.as_str().len())
+            .and_then(|size| size.checked_add(value.expose().len()))
+            .ok_or(DomainError::ProfileSizeLimitExceeded)?;
+    }
+    if size > MAX_PROFILE_BYTES {
+        Err(DomainError::ProfileSizeLimitExceeded)
+    } else {
+        Ok(size)
+    }
+}
+
+/// Names-only analysis of one additive import against the latest profile.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ImportPlan {
+    pub(crate) created: Vec<EnvironmentName>,
+    pub(crate) collisions: Vec<EnvironmentName>,
 }
 
 /// Whether a successful `set` created or updated a name.
@@ -632,6 +722,51 @@ mod tests {
     }
 
     #[test]
+    fn additive_import_validates_the_final_profile_and_changes_one_revision() {
+        let mut vault = Vault::empty();
+        let dev = profile("dev");
+        let large = variable("Z_LARGE");
+        let added = variable("A_ADDED");
+        vault.create_profile(dev.clone()).unwrap();
+        vault
+            .set(
+                &dev,
+                large.clone(),
+                SecretValue::new(vec![b'x'; MAX_VALUE_BYTES]).unwrap(),
+            )
+            .unwrap();
+        let revision = vault.revision();
+
+        let mut imported = BTreeMap::new();
+        imported.insert(
+            added.clone(),
+            SecretValue::new(vec![b'y'; MAX_VALUE_BYTES]).unwrap(),
+        );
+        imported.insert(large.clone(), value(""));
+        let plan = vault.apply_import(&dev, imported).unwrap();
+        assert_eq!(plan.created.as_slice(), std::slice::from_ref(&added));
+        assert_eq!(plan.collisions.as_slice(), std::slice::from_ref(&large));
+        assert_eq!(vault.revision(), revision + 1);
+        assert_eq!(vault.secret(&dev, &large), Some(b"".as_slice()));
+        assert_eq!(
+            vault.secret(&dev, &added).map(<[u8]>::len),
+            Some(MAX_VALUE_BYTES)
+        );
+
+        let before_failure = vault.revision();
+        let mut overflow = BTreeMap::new();
+        overflow.insert(
+            variable("B_TOO_LARGE"),
+            SecretValue::new(vec![b'z'; MAX_VALUE_BYTES]).unwrap(),
+        );
+        assert_eq!(
+            vault.apply_import(&dev, overflow),
+            Err(DomainError::ProfileSizeLimitExceeded)
+        );
+        assert_eq!(vault.revision(), before_failure);
+    }
+
+    #[test]
     fn enforces_profile_and_variable_count_limits() {
         let mut vault = Vault::empty();
         for index in 0..MAX_PROFILES {
@@ -650,6 +785,19 @@ mod tests {
         }
         assert_eq!(
             vault.set(&first, variable("OVERFLOW"), value("")),
+            Err(DomainError::VariableLimitExceeded)
+        );
+
+        let mut replacement = BTreeMap::new();
+        replacement.insert(variable("V0"), value("replacement"));
+        assert_eq!(
+            vault.plan_import(&first, &replacement).unwrap().collisions,
+            [variable("V0")]
+        );
+        let mut additive = BTreeMap::new();
+        additive.insert(variable("OVERFLOW"), value(""));
+        assert_eq!(
+            vault.plan_import(&first, &additive),
             Err(DomainError::VariableLimitExceeded)
         );
     }
