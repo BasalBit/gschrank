@@ -47,9 +47,12 @@ impl ZshConfigEditor {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn at_path(rc_file: PathBuf) -> Self {
         Self { rc_file }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.rc_file
     }
 
     pub(crate) fn inspect(&self) -> Result<ShellIntegrationState, ZshConfigError> {

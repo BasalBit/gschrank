@@ -73,9 +73,13 @@ impl LocalVaultStore {
             .create(create)
             .mode(0o600)
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-        let lock = options
-            .open(self.directory.join(LOCK_FILE))
-            .map_err(map_file_io)?;
+        let lock = match options.open(self.directory.join(LOCK_FILE)) {
+            Ok(lock) => lock,
+            Err(error) if !create && error.kind() == io::ErrorKind::NotFound => {
+                return Err(VaultStoreError::new(VaultStoreErrorKind::MissingState));
+            }
+            Err(error) => return Err(map_file_io(error)),
+        };
         validate_regular_file(&lock.metadata().map_err(map_file_io)?)?;
         Ok(lock)
     }
@@ -493,6 +497,20 @@ mod tests {
         assert_eq!(profile_error, ProfileOperationError::NotInitialized);
         assert_eq!(profile_error.exit_code(), 10);
         assert!(!test.data().exists());
+    }
+
+    #[test]
+    fn a_preferences_only_data_directory_still_reports_an_uninitialized_vault() {
+        let test = TestDirectory::new();
+        let mut builder = DirBuilder::new();
+        builder.mode(0o700).create(test.data()).unwrap();
+        let store = LocalVaultStore::new(test.data());
+
+        let error = store
+            .shared_read::<_, VaultStoreError, _>(|transaction| transaction.read_live())
+            .unwrap_err();
+        assert_eq!(error.kind(), VaultStoreErrorKind::MissingState);
+        assert!(!test.data().join(LOCK_FILE).exists());
     }
 
     #[test]

@@ -9,6 +9,7 @@
 
 mod cli;
 mod codec;
+mod config_command;
 mod domain;
 mod envelope;
 mod init;

@@ -3,11 +3,15 @@
 use std::{
     ffi::OsString,
     io::{IsTerminal, Write},
+    path::PathBuf,
     process::ExitCode,
 };
 
 use crate::{
     DomainError, EnvironmentName, Mutation, ProfileName,
+    config_command::{
+        ConfigJourneyOutcome, ConfigPrompter, TerminalConfigPrompter, run_config_journey,
+    },
     init::{InitOutcome, Initializer},
     key_provider::InteractionPolicy,
     profiles::{ProfileInspection, ProfileOperationError, ProfileOperations},
@@ -23,8 +27,8 @@ use crate::{
 
 #[cfg(target_os = "macos")]
 use crate::platform::macos::{
-    LocalVaultStore, MacOsKeychainProvider, MacOsPathError, MacOsPaths, ZshConfigEditor,
-    ZshConfigError,
+    LocalVaultStore, MacOsKeychainProvider, MacOsPathError, MacOsPaths, PreferenceError,
+    ShellPreferenceStore, ShellPreferences, ZshConfigEditor, ZshConfigError,
 };
 
 const HELP: &str = concat!(
@@ -35,6 +39,7 @@ const HELP: &str = concat!(
 Encrypted environment profiles for your shell.
 
 Usage:
+  gschrank config [--rc-file <absolute-path>]
   gschrank init
   gschrank profile create <profile>
   gschrank profile rename <old> <new>
@@ -52,6 +57,7 @@ Usage:
   gschrank --version
 
 Commands:
+  config     Guided vault, profile, secret, and Zsh startup setup
   init       Create an empty encrypted vault, or validate the existing vault
   profile    Create, rename, delete, list, or inspect profiles
   set        Create or update a variable using hidden or explicit stdin input
@@ -69,6 +75,9 @@ parent shell."
 enum Command {
     Help,
     Version,
+    Config {
+        rc_file: Option<PathBuf>,
+    },
     Init,
     Profile(ProfileCommand),
     Set {
@@ -117,6 +126,72 @@ enum ProfileCommand {
     Inspect(ProfileName),
 }
 
+#[cfg(target_os = "macos")]
+struct ResolvedZshConfig {
+    editor: ZshConfigEditor,
+    saved: Option<ShellPreferences>,
+    preferences: ShellPreferenceStore,
+}
+
+#[cfg(target_os = "macos")]
+impl ResolvedZshConfig {
+    fn remember(&self, shortcut: bool) -> Result<(), ShellConfigurationError> {
+        let preferences = ShellPreferences::new(self.editor.path().to_owned(), shortcut)?;
+        self.preferences.write(&preferences)?;
+        Ok(())
+    }
+
+    fn shortcut_default(&self) -> bool {
+        self.saved.as_ref().is_none_or(ShellPreferences::shortcut)
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellConfigurationError {
+    Preferences(PreferenceError),
+    Editor(ZshConfigError),
+    DifferentRcFile,
+}
+
+#[cfg(target_os = "macos")]
+impl ShellConfigurationError {
+    const fn exit_code(self) -> u8 {
+        match self {
+            Self::Preferences(error) => error.exit_code(),
+            Self::Editor(error) => error.exit_code(),
+            Self::DifferentRcFile => 14,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Display for ShellConfigurationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Preferences(error) => error.fmt(formatter),
+            Self::Editor(error) => error.fmt(formatter),
+            Self::DifferentRcFile => formatter.write_str(
+                "a different Zsh startup file is already selected; changing rc files safely is not available yet",
+            ),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<PreferenceError> for ShellConfigurationError {
+    fn from(error: PreferenceError) -> Self {
+        Self::Preferences(error)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<ZshConfigError> for ShellConfigurationError {
+    fn from(error: ZshConfigError) -> Self {
+        Self::Editor(error)
+    }
+}
+
 enum ProfileSuccess {
     Created(ProfileName),
     Renamed {
@@ -141,7 +216,7 @@ enum ProfileSuccess {
 #[derive(Debug)]
 enum ProfileCommandError {
     Profile(ProfileOperationError),
-    ShellConfig(ZshConfigError),
+    ShellConfig(ShellConfigurationError),
     ConfiguredStartupProfile,
     RenameRollbackFailed,
 }
@@ -184,6 +259,13 @@ impl From<ProfileOperationError> for ProfileCommandError {
 #[cfg(target_os = "macos")]
 impl From<ZshConfigError> for ProfileCommandError {
     fn from(error: ZshConfigError) -> Self {
+        Self::ShellConfig(error.into())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<ShellConfigurationError> for ProfileCommandError {
+    fn from(error: ShellConfigurationError) -> Self {
         Self::ShellConfig(error)
     }
 }
@@ -221,6 +303,7 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
             println!("gschrank {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        Ok(Command::Config { rc_file }) => run_config(rc_file),
         Ok(Command::Init) => run_init(),
         Ok(Command::Profile(command)) => run_profile(command),
         Ok(Command::Set {
@@ -245,6 +328,12 @@ fn parse(arguments: &[OsString]) -> Result<Command, ParseError> {
         [] => Ok(Command::Help),
         [argument] if argument == "--help" || argument == "-h" => Ok(Command::Help),
         [argument] if argument == "--version" || argument == "-V" => Ok(Command::Version),
+        [config] if config == "config" => Ok(Command::Config { rc_file: None }),
+        [config, rc_file, path] if config == "config" && rc_file == "--rc-file" => {
+            Ok(Command::Config {
+                rc_file: Some(PathBuf::from(path)),
+            })
+        }
         [argument] if argument == "init" => Ok(Command::Init),
         [profile, list] if profile == "profile" && list == "list" => {
             Ok(Command::Profile(ProfileCommand::List))
@@ -379,6 +468,133 @@ fn interaction_policy() -> InteractionPolicy {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn resolve_zsh_config(
+    paths: &MacOsPaths,
+    explicit_rc_file: Option<PathBuf>,
+) -> Result<ResolvedZshConfig, ShellConfigurationError> {
+    let preferences = ShellPreferenceStore::new(paths.data_directory().to_owned());
+    let saved = preferences.read()?;
+    let editor = match explicit_rc_file {
+        Some(path) => {
+            // Reuse the persisted preference validator before any vault or rc
+            // state is changed.
+            let candidate = ShellPreferences::new(path.clone(), false)?;
+            if saved
+                .as_ref()
+                .is_some_and(|saved| saved.rc_file() != candidate.rc_file())
+            {
+                return Err(ShellConfigurationError::DifferentRcFile);
+            }
+            ZshConfigEditor::at_path(path)
+        }
+        None => saved.as_ref().map_or_else(
+            || ZshConfigEditor::discover().map_err(ShellConfigurationError::from),
+            |saved| Ok(ZshConfigEditor::at_path(saved.rc_file().to_owned())),
+        )?,
+    };
+    Ok(ResolvedZshConfig {
+        editor,
+        saved,
+        preferences,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn run_config(explicit_rc_file: Option<PathBuf>) -> ExitCode {
+    let mut prompts = match TerminalConfigPrompter::new() {
+        Ok(prompts) => prompts,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let paths = match MacOsPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(13);
+        }
+    };
+    let resolved = match resolve_zsh_config(&paths, explicit_rc_file) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let integration = match resolved.editor.inspect() {
+        Ok(integration) => integration,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let shortcut_default = integration.configuration().map_or_else(
+        || resolved.shortcut_default(),
+        StartupConfiguration::shortcut,
+    );
+
+    let keys = MacOsKeychainProvider::new();
+    let store = LocalVaultStore::new(paths.data_directory().to_owned());
+    let initializer = Initializer::new(&keys, &store);
+    let operations = ProfileOperations::new(&keys, &store);
+    let interaction = InteractionPolicy::AllowPrompt;
+    let selection = match run_config_journey(
+        &initializer,
+        &operations,
+        &mut prompts,
+        interaction,
+        shortcut_default,
+    ) {
+        Ok(ConfigJourneyOutcome::Cancelled) => return ExitCode::SUCCESS,
+        Ok(ConfigJourneyOutcome::Selected(selection)) => selection,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+
+    let requested = StartupConfiguration::new(
+        selection.startup.then(|| selection.profile.clone()),
+        selection.shortcut,
+    );
+    if let Err(error) = prompts.announce("Installing the managed Zsh startup integration...") {
+        eprintln!("gschrank: {error}");
+        return ExitCode::from(error.exit_code());
+    }
+    let success = match configure_startup(&resolved.editor, requested) {
+        Ok(success) => success,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    if let Err(error) = resolved.remember(success.configuration.shortcut()) {
+        eprintln!(
+            "gschrank: the Zsh startup file was updated, but its selected path could not be saved: {error}"
+        );
+        return ExitCode::from(error.exit_code());
+    }
+    if success.shortcut_conflict {
+        eprintln!(
+            "gschrank: the optional 'gsch' name is already in use; installed only the canonical 'gschrank' function"
+        );
+    }
+    print!("{}", render_startup_success(&success));
+    println!(
+        "Configuration complete for profile '{}'; {} variable(s) changed{}.",
+        selection.profile.as_str(),
+        selection.variables_changed,
+        if selection.created_vault {
+            " in the newly initialized vault"
+        } else {
+            ""
+        }
+    );
+    ExitCode::SUCCESS
+}
+
 fn render_profile_success(success: ProfileSuccess) -> String {
     let mut output = String::new();
     match success {
@@ -493,7 +709,7 @@ fn run_profile(command: ProfileCommand) -> ExitCode {
         ProfileCommand::Rename { old, new } => {
             let output_old = old.clone();
             let output_new = new.clone();
-            rename_profile_and_startup(&operations, &old, new, interaction).map(|()| {
+            rename_profile_and_startup(&paths, &operations, &old, new, interaction).map(|()| {
                 ProfileSuccess::Renamed {
                     old: output_old,
                     new: output_new,
@@ -501,7 +717,7 @@ fn run_profile(command: ProfileCommand) -> ExitCode {
             })
         }
         ProfileCommand::Delete(profile) => {
-            delete_profile_with_startup_guard(&operations, &profile, interaction)
+            delete_profile_with_startup_guard(&paths, &operations, &profile, interaction)
                 .map(|()| ProfileSuccess::Deleted(profile))
         }
         ProfileCommand::List => operations
@@ -528,6 +744,7 @@ fn run_profile(command: ProfileCommand) -> ExitCode {
 
 #[cfg(target_os = "macos")]
 fn rename_profile_and_startup<K, S>(
+    paths: &MacOsPaths,
     operations: &ProfileOperations<'_, K, S>,
     old: &ProfileName,
     new: ProfileName,
@@ -537,8 +754,8 @@ where
     K: crate::key_provider::KeyProvider,
     S: crate::vault_store::VaultStore,
 {
-    let editor = ZshConfigEditor::discover()?;
-    rename_profile_and_startup_using(&editor, operations, old, new, interaction)
+    let resolved = resolve_zsh_config(paths, None)?;
+    rename_profile_and_startup_using(&resolved.editor, operations, old, new, interaction)
 }
 
 #[cfg(target_os = "macos")]
@@ -587,6 +804,7 @@ where
 
 #[cfg(target_os = "macos")]
 fn delete_profile_with_startup_guard<K, S>(
+    paths: &MacOsPaths,
     operations: &ProfileOperations<'_, K, S>,
     profile: &ProfileName,
     interaction: InteractionPolicy,
@@ -595,8 +813,8 @@ where
     K: crate::key_provider::KeyProvider,
     S: crate::vault_store::VaultStore,
 {
-    let editor = ZshConfigEditor::discover()?;
-    delete_profile_with_startup_guard_using(&editor, operations, profile, interaction)
+    let resolved = resolve_zsh_config(paths, None)?;
+    delete_profile_with_startup_guard_using(&resolved.editor, operations, profile, interaction)
 }
 
 #[cfg(target_os = "macos")]
@@ -695,8 +913,15 @@ fn run_remove(profile: &ProfileName, variable: &EnvironmentName) -> ExitCode {
 
 #[cfg(target_os = "macos")]
 fn run_startup(command: StartupCommand) -> ExitCode {
-    let editor = match ZshConfigEditor::discover() {
-        Ok(editor) => editor,
+    let paths = match MacOsPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(13);
+        }
+    };
+    let resolved = match resolve_zsh_config(&paths, None) {
+        Ok(resolved) => resolved,
         Err(error) => {
             eprintln!("gschrank: {error}");
             return ExitCode::from(error.exit_code());
@@ -705,13 +930,6 @@ fn run_startup(command: StartupCommand) -> ExitCode {
 
     let requested_profile = match command {
         StartupCommand::Set(profile) => {
-            let paths = match MacOsPaths::discover() {
-                Ok(paths) => paths,
-                Err(error) => {
-                    eprintln!("gschrank: {error}");
-                    return ExitCode::from(13);
-                }
-            };
             let keys = MacOsKeychainProvider::new();
             let store = LocalVaultStore::new(paths.data_directory().to_owned());
             if let Err(error) =
@@ -725,7 +943,7 @@ fn run_startup(command: StartupCommand) -> ExitCode {
         StartupCommand::Off => None,
     };
 
-    let state = match editor.inspect() {
+    let state = match resolved.editor.inspect() {
         Ok(state) => state,
         Err(error) => {
             eprintln!("gschrank: {error}");
@@ -735,11 +953,17 @@ fn run_startup(command: StartupCommand) -> ExitCode {
     let base = state
         .configuration()
         .cloned()
-        .unwrap_or_else(|| StartupConfiguration::new(None, true));
+        .unwrap_or_else(|| StartupConfiguration::new(None, resolved.shortcut_default()));
     let requested = base.with_profile(requested_profile);
 
-    match configure_startup(&editor, requested) {
+    match configure_startup(&resolved.editor, requested) {
         Ok(success) => {
+            if let Err(error) = resolved.remember(success.configuration.shortcut()) {
+                eprintln!(
+                    "gschrank: the Zsh startup file was updated, but its selected path could not be saved: {error}"
+                );
+                return ExitCode::from(error.exit_code());
+            }
             if success.shortcut_conflict {
                 eprintln!(
                     "gschrank: the optional 'gsch' name is already in use; installed only the canonical 'gschrank' function"
@@ -969,6 +1193,12 @@ fn run_emit_zsh(_context: OperationContext, _operation: EmitOperation) -> ExitCo
 }
 
 #[cfg(not(target_os = "macos"))]
+fn run_config(_explicit_rc_file: Option<PathBuf>) -> ExitCode {
+    eprintln!("gschrank: this build does not support guided macOS and Zsh configuration");
+    ExitCode::from(1)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn run_init() -> ExitCode {
     eprintln!("gschrank: this build does not support secure vault initialization on this platform");
     ExitCode::from(1)
@@ -1107,6 +1337,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_exact_guided_configuration_grammar() {
+        assert!(matches!(
+            parse(&["config".into()]),
+            Ok(Command::Config { rc_file: None })
+        ));
+        assert!(matches!(
+            parse(&[
+                "config".into(),
+                "--rc-file".into(),
+                "/tmp/custom-zdot/.zshrc".into()
+            ]),
+            Ok(Command::Config { rc_file: Some(_) })
+        ));
+        assert!(parse(&["config".into(), "--rc-file".into()]).is_err());
+        assert!(parse(&["config".into(), "--other".into(), "value".into()]).is_err());
+    }
+
+    #[test]
     fn parses_the_exact_startup_configuration_grammar() {
         assert!(matches!(
             parse(&["startup".into(), "set".into(), "dev".into()]),
@@ -1191,6 +1439,10 @@ mod tests {
 
             fn editor(&self) -> ZshConfigEditor {
                 ZshConfigEditor::at_path(self.0.join(".zshrc"))
+            }
+
+            fn paths(&self) -> MacOsPaths {
+                MacOsPaths::at_data_directory(self.0.join("data"))
             }
         }
 
@@ -1336,6 +1588,25 @@ mod tests {
                 shortcut_conflict: false,
             };
             assert!(!render_startup_success(&unchanged).contains("open a new shell"));
+        }
+
+        #[test]
+        fn saved_rc_file_is_reused_and_conflicting_overrides_fail_before_editing() {
+            let test = TestDirectory::new();
+            let paths = test.paths();
+            let rc_file = test.0.join("custom.zshrc");
+            let selected = resolve_zsh_config(&paths, Some(rc_file.clone())).unwrap();
+            assert_eq!(selected.editor.path(), rc_file);
+            selected.remember(false).unwrap();
+
+            let reused = resolve_zsh_config(&paths, None).unwrap();
+            assert_eq!(reused.editor.path(), rc_file);
+            assert!(!reused.shortcut_default());
+            assert!(matches!(
+                resolve_zsh_config(&paths, Some(test.0.join("other.zshrc"))),
+                Err(ShellConfigurationError::DifferentRcFile)
+            ));
+            assert!(!test.0.join("other.zshrc").exists());
         }
     }
 }

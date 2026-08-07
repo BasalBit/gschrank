@@ -34,6 +34,11 @@ impl MacOsPaths {
     pub(crate) fn data_directory(&self) -> &std::path::Path {
         &self.data_directory
     }
+
+    #[cfg(test)]
+    pub(crate) fn at_data_directory(data_directory: PathBuf) -> Self {
+        Self { data_directory }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
