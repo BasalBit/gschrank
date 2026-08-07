@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 
-use std::{ffi::OsString, io::IsTerminal, process::ExitCode};
+use std::{
+    ffi::OsString,
+    io::{IsTerminal, Write},
+    process::ExitCode,
+};
 
 use crate::{
     DomainError, EnvironmentName, Mutation, ProfileName,
@@ -9,10 +13,15 @@ use crate::{
     profiles::{ProfileInspection, ProfileOperations},
     secret_input::{SecretInputMode, read_secret},
     set_command::execute_set,
+    shell::{ShellEmitter, ZshEmitter},
+    shell_transition::{
+        ACTIVE_PROFILE_NAME, ENV_PROTOCOL_NAME, MANAGED_KEYS_NAME, ManagedState, ManagedStateError,
+        OperationContext, ShellTransition,
+    },
 };
 
 #[cfg(target_os = "macos")]
-use crate::platform::macos::{LocalVaultStore, MacOsKeychainProvider, MacOsPaths};
+use crate::platform::macos::{LocalVaultStore, MacOsKeychainProvider, MacOsPathError, MacOsPaths};
 
 const HELP: &str = concat!(
     "gschrank ",
@@ -30,6 +39,9 @@ Usage:
   gschrank profile inspect <profile>
   gschrank set <profile> <variable> [--stdin]
   gschrank remove <profile> <variable>
+  gschrank load <profile>
+  gschrank reload
+  gschrank unload
   gschrank --help
   gschrank --version
 
@@ -38,9 +50,13 @@ Commands:
   profile    Create, rename, delete, list, or inspect profiles
   set        Create or update a variable using hidden or explicit stdin input
   remove     Remove a variable from a profile
+  load       Load a profile through the installed current-shell wrapper
+  reload     Reload the active profile through the current-shell wrapper
+  unload     Clear the active profile through the current-shell wrapper
 
-Only macOS is supported in this development milestone. Zsh integration
-commands are not implemented yet."
+Only macOS and Zsh are supported in this development milestone. Current-shell
+commands require the managed Zsh function; the executable cannot mutate its
+parent shell."
 );
 
 enum Command {
@@ -57,6 +73,27 @@ enum Command {
         profile: ProfileName,
         variable: EnvironmentName,
     },
+    ShellParent(ShellParentCommand),
+    ShellInit {
+        shortcut: bool,
+    },
+    EmitZsh {
+        context: OperationContext,
+        operation: EmitOperation,
+    },
+}
+
+enum ShellParentCommand {
+    Load(ProfileName),
+    StartupLoad(ProfileName),
+    Reload,
+    Unload,
+}
+
+enum EmitOperation {
+    Load(ProfileName),
+    Reload,
+    Unload,
 }
 
 enum ProfileCommand {
@@ -121,6 +158,9 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
             input,
         }) => run_set(&profile, variable, input),
         Ok(Command::Remove { profile, variable }) => run_remove(&profile, &variable),
+        Ok(Command::ShellParent(command)) => run_shell_parent(command),
+        Ok(Command::ShellInit { shortcut }) => run_shell_init(shortcut),
+        Ok(Command::EmitZsh { context, operation }) => run_emit_zsh(context, operation),
         Err(error) => {
             eprintln!("gschrank: {error}\n\n{HELP}");
             ExitCode::from(2)
@@ -166,7 +206,74 @@ fn parse(arguments: &[OsString]) -> Result<Command, ParseError> {
             profile: parse_profile_name(profile)?,
             variable: parse_environment_name(variable)?,
         }),
+        [load, profile] if load == "load" => Ok(Command::ShellParent(ShellParentCommand::Load(
+            parse_profile_name(profile)?,
+        ))),
+        [load, startup, separator, profile]
+            if load == "load" && startup == "--startup" && separator == "--" =>
+        {
+            Ok(Command::ShellParent(ShellParentCommand::StartupLoad(
+                parse_profile_name(profile)?,
+            )))
+        }
+        [reload] if reload == "reload" => Ok(Command::ShellParent(ShellParentCommand::Reload)),
+        [unload] if unload == "unload" => Ok(Command::ShellParent(ShellParentCommand::Unload)),
+        [shell_init, shell, protocol]
+            if shell_init == "__shell-init" && shell == "zsh" && protocol == "1" =>
+        {
+            Ok(Command::ShellInit { shortcut: false })
+        }
+        [shell_init, shell, protocol, shortcut]
+            if shell_init == "__shell-init"
+                && shell == "zsh"
+                && protocol == "1"
+                && shortcut == "--shortcut" =>
+        {
+            Ok(Command::ShellInit { shortcut: true })
+        }
+        [emit, protocol, context, load, separator, profile]
+            if emit == "__emit-zsh" && protocol == "1" && load == "load" && separator == "--" =>
+        {
+            Ok(Command::EmitZsh {
+                context: parse_operation_context(context)?,
+                operation: EmitOperation::Load(parse_profile_name(profile)?),
+            })
+        }
+        [emit, protocol, context, reload]
+            if emit == "__emit-zsh" && protocol == "1" && reload == "reload" =>
+        {
+            let context = parse_operation_context(context)?;
+            if context != OperationContext::Explicit {
+                return Err(ParseError::InvalidGrammar);
+            }
+            Ok(Command::EmitZsh {
+                context,
+                operation: EmitOperation::Reload,
+            })
+        }
+        [emit, protocol, context, unload]
+            if emit == "__emit-zsh" && protocol == "1" && unload == "unload" =>
+        {
+            let context = parse_operation_context(context)?;
+            if context != OperationContext::Explicit {
+                return Err(ParseError::InvalidGrammar);
+            }
+            Ok(Command::EmitZsh {
+                context,
+                operation: EmitOperation::Unload,
+            })
+        }
         _ => Err(ParseError::InvalidGrammar),
+    }
+}
+
+fn parse_operation_context(argument: &OsString) -> Result<OperationContext, ParseError> {
+    if argument == "explicit" {
+        Ok(OperationContext::Explicit)
+    } else if argument == "startup" {
+        Ok(OperationContext::AutomaticStartup)
+    } else {
+        Err(ParseError::InvalidGrammar)
     }
 }
 
@@ -400,6 +507,171 @@ fn run_remove(profile: &ProfileName, variable: &EnvironmentName) -> ExitCode {
     }
 }
 
+fn run_shell_parent(command: ShellParentCommand) -> ExitCode {
+    let operation = match command {
+        ShellParentCommand::Load(_profile) | ShellParentCommand::StartupLoad(_profile) => "load",
+        ShellParentCommand::Reload => "reload",
+        ShellParentCommand::Unload => "unload",
+    };
+    eprintln!(
+        "gschrank: '{operation}' must run through the managed Zsh function to change the current shell; install or refresh shell integration first"
+    );
+    ExitCode::from(16)
+}
+
+fn run_shell_init(shortcut: bool) -> ExitCode {
+    let source = ZshEmitter::new().emit_wrapper(shortcut);
+    let mut stdout = std::io::stdout().lock();
+    if stdout
+        .write_all(source.as_bytes())
+        .and_then(|()| stdout.flush())
+        .is_err()
+    {
+        eprintln!("gschrank: failed to write the Zsh wrapper");
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+fn inherited_managed_state() -> Result<ManagedState, ManagedStateError> {
+    let protocol = std::env::var_os(ENV_PROTOCOL_NAME);
+    let active_profile = std::env::var_os(ACTIVE_PROFILE_NAME);
+    let managed_names = std::env::var_os(MANAGED_KEYS_NAME);
+    if [&protocol, &active_profile, &managed_names]
+        .into_iter()
+        .any(|value| value.as_ref().is_some_and(|value| value.to_str().is_none()))
+    {
+        return Err(ManagedStateError::InvalidManagedNames);
+    }
+    ManagedState::from_metadata(
+        protocol.as_deref().and_then(std::ffi::OsStr::to_str),
+        active_profile.as_deref().and_then(std::ffi::OsStr::to_str),
+        managed_names.as_deref().and_then(std::ffi::OsStr::to_str),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn run_emit_zsh(context: OperationContext, operation: EmitOperation) -> ExitCode {
+    if std::io::stdout().is_terminal() {
+        eprintln!("gschrank: the private shell emitter refuses terminal output");
+        return ExitCode::from(16);
+    }
+    let current = match inherited_managed_state() {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(16);
+        }
+    };
+
+    let emitter = ZshEmitter::new();
+    let source = match operation {
+        EmitOperation::Unload => emitter.emit_cleanup(current.managed_names()),
+        EmitOperation::Load(profile) => {
+            match authenticated_snapshot(&profile, interaction_for_context(context)) {
+                Ok(snapshot) => {
+                    let transition = ShellTransition::load(current, snapshot, context);
+                    emitter.emit_apply(&transition)
+                }
+                Err(error) => {
+                    eprintln!("gschrank: {error}");
+                    return ExitCode::from(error.exit_code());
+                }
+            }
+        }
+        EmitOperation::Reload => {
+            let profile = match ShellTransition::reload_profile(&current) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    eprintln!("gschrank: {error}");
+                    return ExitCode::from(16);
+                }
+            };
+            match authenticated_snapshot(&profile, interaction_for_context(context)) {
+                Ok(snapshot) => {
+                    let transition = ShellTransition::load(current, snapshot, context);
+                    emitter.emit_apply(&transition)
+                }
+                Err(error) => {
+                    eprintln!("gschrank: {error}");
+                    return ExitCode::from(error.exit_code());
+                }
+            }
+        }
+    };
+    let source = match source {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut stdout = std::io::stdout().lock();
+    if stdout
+        .write_all(&source)
+        .and_then(|()| stdout.flush())
+        .is_err()
+    {
+        eprintln!("gschrank: failed to write the shell transition");
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+fn authenticated_snapshot(
+    profile: &ProfileName,
+    interaction: InteractionPolicy,
+) -> Result<crate::domain::ProfileSnapshot, SnapshotLoadError> {
+    let paths = MacOsPaths::discover().map_err(SnapshotLoadError::Paths)?;
+    let keys = MacOsKeychainProvider::new();
+    let store = LocalVaultStore::new(paths.data_directory().to_owned());
+    ProfileOperations::new(&keys, &store)
+        .snapshot(profile, interaction)
+        .map_err(SnapshotLoadError::Profile)
+}
+
+#[cfg(target_os = "macos")]
+enum SnapshotLoadError {
+    Paths(MacOsPathError),
+    Profile(crate::profiles::ProfileOperationError),
+}
+
+#[cfg(target_os = "macos")]
+impl SnapshotLoadError {
+    const fn exit_code(&self) -> u8 {
+        match self {
+            Self::Paths(_) => 13,
+            Self::Profile(error) => error.exit_code(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Display for SnapshotLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Paths(error) => std::fmt::Display::fmt(error, formatter),
+            Self::Profile(error) => std::fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn interaction_for_context(context: OperationContext) -> InteractionPolicy {
+    match context {
+        OperationContext::Explicit => interaction_policy(),
+        OperationContext::AutomaticStartup => InteractionPolicy::FailFast,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_emit_zsh(_context: OperationContext, _operation: EmitOperation) -> ExitCode {
+    eprintln!("gschrank: this build does not support encrypted profiles on this platform");
+    ExitCode::from(1)
+}
+
 #[cfg(not(target_os = "macos"))]
 fn run_init() -> ExitCode {
     eprintln!("gschrank: this build does not support secure vault initialization on this platform");
@@ -477,6 +749,36 @@ mod tests {
             parse(&["remove".into(), "dev".into(), "API_TOKEN".into()]),
             Ok(Command::Remove { .. })
         ));
+        assert!(matches!(
+            parse(&["load".into(), "dev".into()]),
+            Ok(Command::ShellParent(ShellParentCommand::Load(_)))
+        ));
+        assert!(matches!(
+            parse(&["reload".into()]),
+            Ok(Command::ShellParent(ShellParentCommand::Reload))
+        ));
+        assert!(matches!(
+            parse(&["unload".into()]),
+            Ok(Command::ShellParent(ShellParentCommand::Unload))
+        ));
+        assert!(matches!(
+            parse(&["__shell-init".into(), "zsh".into(), "1".into()]),
+            Ok(Command::ShellInit { shortcut: false })
+        ));
+        assert!(matches!(
+            parse(&[
+                "__emit-zsh".into(),
+                "1".into(),
+                "startup".into(),
+                "load".into(),
+                "--".into(),
+                "dev".into(),
+            ]),
+            Ok(Command::EmitZsh {
+                context: OperationContext::AutomaticStartup,
+                operation: EmitOperation::Load(_),
+            })
+        ));
         assert!(parse(&["init".into(), "extra".into()]).is_err());
         assert!(parse(&["profile".into()]).is_err());
         assert!(parse(&["profile".into(), "create".into(), "NOT VALID".into()]).is_err());
@@ -489,6 +791,17 @@ mod tests {
             ])
             .is_err()
         );
+        assert!(
+            parse(&[
+                "__emit-zsh".into(),
+                "1".into(),
+                "startup".into(),
+                "reload".into(),
+            ])
+            .is_err()
+        );
+        assert!(!HELP.contains("__emit-zsh"));
+        assert!(!HELP.contains("__shell-init"));
     }
 
     #[test]

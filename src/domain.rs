@@ -142,6 +142,26 @@ struct Profile {
     byte_size: usize,
 }
 
+/// One owned profile snapshot for a transient shell transition.
+///
+/// The snapshot intentionally implements neither `Debug` nor `Clone` because
+/// it owns secret values. Shell adapters can inspect it only through the
+/// narrow names-and-values iterator below.
+pub(crate) struct ProfileSnapshot {
+    name: ProfileName,
+    variables: Vec<(EnvironmentName, SecretValue)>,
+}
+
+impl ProfileSnapshot {
+    pub(crate) fn name(&self) -> &ProfileName {
+        &self.name
+    }
+
+    pub(crate) fn variables(&self) -> &[(EnvironmentName, SecretValue)] {
+        &self.variables
+    }
+}
+
 impl Profile {
     fn empty() -> Self {
         Self {
@@ -225,6 +245,25 @@ impl Vault {
     #[must_use]
     pub fn contains_profile(&self, profile: &ProfileName) -> bool {
         self.profiles.contains_key(profile)
+    }
+
+    /// Consumes the vault and extracts one owned profile snapshot.
+    ///
+    /// This is used only for transient shell emission. Consuming the vault
+    /// drops every unselected decrypted profile before the snapshot leaves the
+    /// authenticated-read boundary and avoids cloning any secret value.
+    pub(crate) fn into_profile_snapshot(
+        mut self,
+        name: &ProfileName,
+    ) -> Result<ProfileSnapshot, DomainError> {
+        let profile = self
+            .profiles
+            .remove(name)
+            .ok_or(DomainError::ProfileNotFound)?;
+        Ok(ProfileSnapshot {
+            name: name.clone(),
+            variables: profile.variables.into_iter().collect(),
+        })
     }
 
     /// Creates a new empty profile.

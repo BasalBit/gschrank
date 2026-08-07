@@ -13,8 +13,12 @@ master key in the login Keychain. Authenticated `profile create`, `rename`,
 `delete`, `list`, and names-only `inspect` operations atomically rewrite that
 vault. `set` accepts a value only through a no-echo terminal prompt or explicit
 non-terminal `--stdin`; `remove` deletes a named value, and neither command
-prints secret data. Shell integration is not implemented yet, so the current
-CLI cannot load profiles into a shell.
+prints secret data. The versioned Zsh wrapper and private apply protocol now
+support transactional profile replacement, reload, and unload with inherited
+names-only metadata. Automated `.zshrc` installation and startup-profile
+configuration are the next implementation slice, so public current-shell
+commands still fail with installation guidance until that managed block is in
+place.
 
 The canonical executable is `gschrank`. Configured interactive Zsh shells will
 also be able to expose the optional `gsch` function once shell integration is

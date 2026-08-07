@@ -4,7 +4,9 @@ use std::{error::Error, fmt};
 
 use crate::{
     DomainError, EnvelopeError, EnvironmentName, KeyId, MasterKey, Mutation, ProfileName,
-    SecretValue, Vault, VaultId, inspect_envelope,
+    SecretValue, Vault, VaultId,
+    domain::ProfileSnapshot,
+    inspect_envelope,
     key_provider::{InteractionPolicy, KeyProvider, KeyProviderError, KeyProviderErrorKind},
     open_envelope, seal_vault,
     vault_store::{
@@ -264,6 +266,20 @@ where
         })
     }
 
+    pub(crate) fn snapshot(
+        &self,
+        profile: &ProfileName,
+        interaction: InteractionPolicy,
+    ) -> Result<ProfileSnapshot, ProfileOperationError> {
+        self.store.shared_read(|read| {
+            let (opened, _key) = self.open_current(read, interaction)?;
+            opened
+                .vault
+                .into_profile_snapshot(profile)
+                .map_err(Into::into)
+        })
+    }
+
     fn mutate<R>(
         &self,
         interaction: InteractionPolicy,
@@ -476,6 +492,44 @@ mod tests {
                 .variables
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn authenticated_snapshot_consumes_only_the_selected_profile_without_rewriting() {
+        let (keys, store) = initialized();
+        let operations = ProfileOperations::new(&keys, &store);
+        let work = profile("work");
+        let other = profile("other");
+        operations.create(work.clone(), INTERACTION).unwrap();
+        operations.create(other.clone(), INTERACTION).unwrap();
+        operations
+            .set(
+                &work,
+                EnvironmentName::new("TOKEN").unwrap(),
+                SecretValue::from_string("CANARY-selected".to_owned()).unwrap(),
+                INTERACTION,
+            )
+            .unwrap();
+        operations
+            .set(
+                &other,
+                EnvironmentName::new("OTHER_TOKEN").unwrap(),
+                SecretValue::from_string("CANARY-unselected".to_owned()).unwrap(),
+                INTERACTION,
+            )
+            .unwrap();
+        let before = store.live().unwrap();
+
+        let snapshot = operations.snapshot(&work, INTERACTION).unwrap();
+        assert_eq!(snapshot.name(), &work);
+        let variables = snapshot.variables();
+        assert_eq!(variables.len(), 1);
+        assert_eq!(variables[0].0, EnvironmentName::new("TOKEN").unwrap());
+        assert!(
+            variables[0].1.expose() == b"CANARY-selected",
+            "snapshot secret bytes mismatch"
+        );
+        assert_eq!(store.live().unwrap(), before);
     }
 
     #[test]
