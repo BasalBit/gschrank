@@ -3,7 +3,8 @@
 use std::{error::Error, fmt};
 
 use crate::{
-    DomainError, EnvelopeError, KeyId, MasterKey, ProfileName, Vault, VaultId, inspect_envelope,
+    DomainError, EnvelopeError, EnvironmentName, KeyId, MasterKey, Mutation, ProfileName,
+    SecretValue, Vault, VaultId, inspect_envelope,
     key_provider::{InteractionPolicy, KeyProvider, KeyProviderError, KeyProviderErrorKind},
     open_envelope, seal_vault,
     vault_store::{
@@ -23,6 +24,13 @@ pub(crate) struct ProfileInspection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MutationReceipt {
     pub(crate) revision: u64,
+}
+
+/// Safe metadata confirming whether `set` created or updated a variable name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SetReceipt {
+    pub(crate) revision: u64,
+    pub(crate) mutation: Mutation,
 }
 
 /// A value-free authenticated profile-operation failure.
@@ -158,7 +166,11 @@ where
         profile: ProfileName,
         interaction: InteractionPolicy,
     ) -> Result<MutationReceipt, ProfileOperationError> {
-        self.mutate(interaction, move |vault| vault.create_profile(profile))
+        self.mutate(interaction, move |vault| {
+            vault.create_profile(profile)?;
+            Ok(())
+        })
+        .map(|(receipt, ())| receipt)
     }
 
     pub(crate) fn rename(
@@ -167,7 +179,11 @@ where
         new: ProfileName,
         interaction: InteractionPolicy,
     ) -> Result<MutationReceipt, ProfileOperationError> {
-        self.mutate(interaction, move |vault| vault.rename_profile(old, new))
+        self.mutate(interaction, move |vault| {
+            vault.rename_profile(old, new)?;
+            Ok(())
+        })
+        .map(|(receipt, ())| receipt)
     }
 
     pub(crate) fn delete(
@@ -175,7 +191,52 @@ where
         profile: &ProfileName,
         interaction: InteractionPolicy,
     ) -> Result<MutationReceipt, ProfileOperationError> {
-        self.mutate(interaction, move |vault| vault.delete_profile(profile))
+        self.mutate(interaction, move |vault| {
+            vault.delete_profile(profile)?;
+            Ok(())
+        })
+        .map(|(receipt, ())| receipt)
+    }
+
+    pub(crate) fn preflight_set(
+        &self,
+        profile: &ProfileName,
+        interaction: InteractionPolicy,
+    ) -> Result<(), ProfileOperationError> {
+        self.store.shared_read(|read| {
+            let (opened, _key) = self.open_current(read, interaction)?;
+            if !opened.vault.contains_profile(profile) {
+                return Err(DomainError::ProfileNotFound.into());
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn set(
+        &self,
+        profile: &ProfileName,
+        name: EnvironmentName,
+        value: SecretValue,
+        interaction: InteractionPolicy,
+    ) -> Result<SetReceipt, ProfileOperationError> {
+        self.mutate(interaction, move |vault| vault.set(profile, name, value))
+            .map(|(receipt, mutation)| SetReceipt {
+                revision: receipt.revision,
+                mutation,
+            })
+    }
+
+    pub(crate) fn remove(
+        &self,
+        profile: &ProfileName,
+        name: &EnvironmentName,
+        interaction: InteractionPolicy,
+    ) -> Result<MutationReceipt, ProfileOperationError> {
+        self.mutate(interaction, move |vault| {
+            vault.remove(profile, name)?;
+            Ok(())
+        })
+        .map(|(receipt, ())| receipt)
     }
 
     pub(crate) fn list(
@@ -203,14 +264,14 @@ where
         })
     }
 
-    fn mutate(
+    fn mutate<R>(
         &self,
         interaction: InteractionPolicy,
-        operation: impl FnOnce(&mut Vault) -> Result<(), DomainError>,
-    ) -> Result<MutationReceipt, ProfileOperationError> {
+        operation: impl FnOnce(&mut Vault) -> Result<R, DomainError>,
+    ) -> Result<(MutationReceipt, R), ProfileOperationError> {
         self.store.exclusive_transaction(|transaction| {
             let (mut opened, key) = self.open_current(transaction, interaction)?;
-            operation(&mut opened.vault)?;
+            let result = operation(&mut opened.vault)?;
             let expected_revision = opened.vault.revision();
             let replacement = seal_vault(&opened.vault, opened.vault_id, opened.key_id, &key)?;
             let outcome = transaction.replace_live(&replacement)?;
@@ -222,9 +283,12 @@ where
                 opened.key_id,
                 expected_revision,
             )?;
-            Ok(MutationReceipt {
-                revision: expected_revision,
-            })
+            Ok((
+                MutationReceipt {
+                    revision: expected_revision,
+                },
+                result,
+            ))
         })
     }
 
@@ -355,6 +419,105 @@ mod tests {
     }
 
     #[test]
+    fn sets_updates_and_removes_exact_secret_values() {
+        let (keys, store) = initialized();
+        let operations = ProfileOperations::new(&keys, &store);
+        let dev = profile("dev");
+        let variable = EnvironmentName::new("API_TOKEN").unwrap();
+        operations.create(dev.clone(), INTERACTION).unwrap();
+        operations.preflight_set(&dev, INTERACTION).unwrap();
+
+        let created = operations
+            .set(
+                &dev,
+                variable.clone(),
+                SecretValue::new(b"  first\n\n".to_vec()).unwrap(),
+                INTERACTION,
+            )
+            .unwrap();
+        assert_eq!(
+            created,
+            SetReceipt {
+                revision: 2,
+                mutation: Mutation::Created,
+            }
+        );
+        let updated = operations
+            .set(
+                &dev,
+                variable.clone(),
+                SecretValue::from_string("ü $() `updated`\t".to_owned()).unwrap(),
+                INTERACTION,
+            )
+            .unwrap();
+        assert_eq!(updated.revision, 3);
+        assert_eq!(updated.mutation, Mutation::Updated);
+
+        let live = store.live().unwrap();
+        let metadata = inspect_envelope(&live).unwrap();
+        let key = keys.load(&metadata.key_id, INTERACTION).unwrap();
+        let opened = open_envelope(&live, &key).unwrap();
+        assert!(
+            opened.vault.secret(&dev, &variable) == Some("ü $() `updated`\t".as_bytes()),
+            "updated secret bytes mismatch"
+        );
+
+        assert_eq!(
+            operations
+                .remove(&dev, &variable, INTERACTION)
+                .unwrap()
+                .revision,
+            4
+        );
+        assert!(
+            operations
+                .inspect(&dev, INTERACTION)
+                .unwrap()
+                .variables
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn set_preflight_rejects_missing_profile_before_mutation() {
+        let (keys, store) = initialized();
+        let before = store.live().unwrap();
+        let error = ProfileOperations::new(&keys, &store)
+            .preflight_set(&profile("missing"), INTERACTION)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ProfileOperationError::Domain(DomainError::ProfileNotFound)
+        );
+        assert_eq!(store.live().unwrap(), before);
+    }
+
+    #[test]
+    fn failed_set_commit_never_places_canary_in_live_state() {
+        let (keys, store) = initialized();
+        let operations = ProfileOperations::new(&keys, &store);
+        let dev = profile("dev");
+        operations.create(dev.clone(), INTERACTION).unwrap();
+        let before = store.live().unwrap();
+        store.fail_next_replacement(ReplacementFault::NotCommitted);
+
+        let error = operations
+            .set(
+                &dev,
+                EnvironmentName::new("TOKEN").unwrap(),
+                SecretValue::from_string("CANARY-not-committed".to_owned()).unwrap(),
+                INTERACTION,
+            )
+            .unwrap_err();
+        assert_eq!(error, ProfileOperationError::CommitNotCompleted);
+        assert_eq!(store.live().unwrap(), before);
+        assert!(
+            !before.windows(6).any(|window| window == b"CANARY"),
+            "failed mutation exposed secret bytes"
+        );
+    }
+
+    #[test]
     fn domain_failure_does_not_rewrite_the_envelope() {
         let (keys, store) = initialized();
         let operations = ProfileOperations::new(&keys, &store);
@@ -444,13 +607,19 @@ mod tests {
         operations.create(profile("work"), INTERACTION).unwrap();
         let inspection = operations.inspect(&dev, INTERACTION).unwrap();
         assert_eq!(inspection.variables, vec![variable.clone()]);
-        assert!(!format!("{inspection:?}").contains("CANARY-very-secret"));
+        assert!(
+            !format!("{inspection:?}").contains("CANARY-very-secret"),
+            "profile inspection exposed secret bytes"
+        );
         let committed = store.live().unwrap();
-        assert!(!committed.windows(6).any(|window| window == b"CANARY"));
+        assert!(
+            !committed.windows(6).any(|window| window == b"CANARY"),
+            "committed envelope exposed secret bytes"
+        );
         let opened = open_envelope(&committed, &key).unwrap();
-        assert_eq!(
-            opened.vault.secret(&dev, &variable),
-            Some(b"CANARY-very-secret".as_slice())
+        assert!(
+            opened.vault.secret(&dev, &variable) == Some(b"CANARY-very-secret".as_slice()),
+            "preserved secret bytes mismatch"
         );
     }
 

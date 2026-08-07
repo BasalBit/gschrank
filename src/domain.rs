@@ -109,13 +109,17 @@ impl SecretValue {
     /// Returns [`DomainError::InvalidValue`] for non-UTF-8 or NUL-containing
     /// input and [`DomainError::ValueLimitExceeded`] for an oversized value.
     pub fn new(value: Vec<u8>) -> Result<Self, DomainError> {
+        Self::from_zeroizing(Zeroizing::new(value))
+    }
+
+    pub(crate) fn from_zeroizing(value: Zeroizing<Vec<u8>>) -> Result<Self, DomainError> {
         if value.len() > MAX_VALUE_BYTES {
             return Err(DomainError::ValueLimitExceeded);
         }
         if value.contains(&0) || std::str::from_utf8(&value).is_err() {
             return Err(DomainError::InvalidValue);
         }
-        Ok(Self(Zeroizing::new(value)))
+        Ok(Self(value))
     }
 
     /// Creates a value from a UTF-8 string.
@@ -524,7 +528,10 @@ mod tests {
             vault.set(&dev, key.clone(), value("two")).unwrap(),
             Mutation::Updated
         );
-        assert_eq!(vault.secret(&dev, &key), Some(b"two".as_slice()));
+        assert!(
+            vault.secret(&dev, &key) == Some(b"two".as_slice()),
+            "stored secret bytes mismatch"
+        );
 
         vault.remove(&dev, &key).unwrap();
         assert_eq!(vault.remove(&dev, &key), Err(DomainError::VariableNotFound));

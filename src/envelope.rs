@@ -429,7 +429,8 @@ mod tests {
         assert!(
             !envelope
                 .windows(b"canary-secret".len())
-                .any(|window| window == b"canary-secret")
+                .any(|window| window == b"canary-secret"),
+            "encrypted envelope exposed secret bytes"
         );
 
         let metadata = inspect_envelope(&envelope).unwrap();
@@ -450,9 +451,9 @@ mod tests {
         let opened = open_envelope(&envelope, &key).unwrap();
         let profile = ProfileName::new("dev").unwrap();
         let variable = EnvironmentName::new("API_KEY").unwrap();
-        assert_eq!(
-            opened.vault.secret(&profile, &variable),
-            Some(b"canary-secret".as_slice())
+        assert!(
+            opened.vault.secret(&profile, &variable) == Some(b"canary-secret".as_slice()),
+            "opened secret bytes mismatch"
         );
     }
 
@@ -545,6 +546,9 @@ mod tests {
     #[test]
     fn public_errors_never_include_secret_bytes() {
         let error = open_error(b"canary-secret", &MasterKey::from_bytes([0; 32])).to_string();
-        assert!(!error.contains("canary-secret"));
+        assert!(
+            !error.contains("canary-secret"),
+            "envelope error exposed secret bytes"
+        );
     }
 }

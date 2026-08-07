@@ -333,15 +333,18 @@ mod tests {
         let vault = fixture();
         let first = encode_payload(&vault).unwrap();
         let second = encode_payload(&vault).unwrap();
-        assert_eq!(&*first, &*second);
+        assert!(
+            first.as_slice() == second.as_slice(),
+            "deterministic payload encoding mismatch"
+        );
 
         let decoded = decode_payload(&first).unwrap();
         let dev = ProfileName::new("dev").unwrap();
         let key = EnvironmentName::new("API_KEY").unwrap();
         assert_eq!(decoded.revision(), 2);
-        assert_eq!(
-            decoded.secret(&dev, &key),
-            Some(b"canary-secret".as_slice())
+        assert!(
+            decoded.secret(&dev, &key) == Some(b"canary-secret".as_slice()),
+            "decoded secret bytes mismatch"
         );
     }
 
@@ -447,13 +450,19 @@ mod tests {
         let decoded = decode_payload(&encode_payload(&vault).unwrap()).unwrap();
         for (name, value) in cases {
             let name = EnvironmentName::new(name).unwrap();
-            assert_eq!(decoded.secret(&dev, &name), Some(value.as_bytes()));
+            assert!(
+                decoded.secret(&dev, &name) == Some(value.as_bytes()),
+                "decoded hostile-value bytes mismatch"
+            );
         }
     }
 
     #[test]
     fn errors_do_not_include_secret_bytes() {
         let error = decode_error(b"canary-secret").to_string();
-        assert!(!error.contains("canary-secret"));
+        assert!(
+            !error.contains("canary-secret"),
+            "payload error exposed secret bytes"
+        );
     }
 }

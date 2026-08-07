@@ -11,8 +11,10 @@ authenticated XChaCha20-Poly1305 envelope. On macOS, `gschrank init` now creates
 an empty encrypted vault through atomic APFS persistence and stores its random
 master key in the login Keychain. Authenticated `profile create`, `rename`,
 `delete`, `list`, and names-only `inspect` operations atomically rewrite that
-vault. Secret-value entry and shell integration are not implemented yet, so the
-current CLI cannot store or load environment values.
+vault. `set` accepts a value only through a no-echo terminal prompt or explicit
+non-terminal `--stdin`; `remove` deletes a named value, and neither command
+prints secret data. Shell integration is not implemented yet, so the current
+CLI cannot load profiles into a shell.
 
 The canonical executable is `gschrank`. Configured interactive Zsh shells will
 also be able to expose the optional `gsch` function once shell integration is

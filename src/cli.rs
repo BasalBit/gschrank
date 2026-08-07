@@ -3,10 +3,12 @@
 use std::{ffi::OsString, io::IsTerminal, process::ExitCode};
 
 use crate::{
-    DomainError, ProfileName,
+    DomainError, EnvironmentName, Mutation, ProfileName,
     init::{InitOutcome, Initializer},
     key_provider::InteractionPolicy,
     profiles::{ProfileInspection, ProfileOperations},
+    secret_input::{SecretInputMode, read_secret},
+    set_command::execute_set,
 };
 
 #[cfg(target_os = "macos")]
@@ -26,15 +28,19 @@ Usage:
   gschrank profile delete <profile>
   gschrank profile list
   gschrank profile inspect <profile>
+  gschrank set <profile> <variable> [--stdin]
+  gschrank remove <profile> <variable>
   gschrank --help
   gschrank --version
 
 Commands:
   init       Create an empty encrypted vault, or validate the existing vault
   profile    Create, rename, delete, list, or inspect profiles
+  set        Create or update a variable using hidden or explicit stdin input
+  remove     Remove a variable from a profile
 
-Only macOS is supported in this development milestone. Secret-value entry and
-Zsh integration commands are not implemented yet."
+Only macOS is supported in this development milestone. Zsh integration
+commands are not implemented yet."
 );
 
 enum Command {
@@ -42,6 +48,15 @@ enum Command {
     Version,
     Init,
     Profile(ProfileCommand),
+    Set {
+        profile: ProfileName,
+        variable: EnvironmentName,
+        input: SecretInputMode,
+    },
+    Remove {
+        profile: ProfileName,
+        variable: EnvironmentName,
+    },
 }
 
 enum ProfileCommand {
@@ -54,10 +69,22 @@ enum ProfileCommand {
 
 enum ProfileSuccess {
     Created(ProfileName),
-    Renamed { old: ProfileName, new: ProfileName },
+    Renamed {
+        old: ProfileName,
+        new: ProfileName,
+    },
     Deleted(ProfileName),
     Listed(Vec<ProfileName>),
     Inspected(ProfileInspection),
+    Set {
+        profile: ProfileName,
+        variable: EnvironmentName,
+        mutation: Mutation,
+    },
+    Removed {
+        profile: ProfileName,
+        variable: EnvironmentName,
+    },
 }
 
 enum ParseError {
@@ -88,6 +115,12 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
         }
         Ok(Command::Init) => run_init(),
         Ok(Command::Profile(command)) => run_profile(command),
+        Ok(Command::Set {
+            profile,
+            variable,
+            input,
+        }) => run_set(&profile, variable, input),
+        Ok(Command::Remove { profile, variable }) => run_remove(&profile, &variable),
         Err(error) => {
             eprintln!("gschrank: {error}\n\n{HELP}");
             ExitCode::from(2)
@@ -119,6 +152,20 @@ fn parse(arguments: &[OsString]) -> Result<Command, ParseError> {
                 new: parse_profile_name(new)?,
             }))
         }
+        [set, profile, variable] if set == "set" => Ok(Command::Set {
+            profile: parse_profile_name(profile)?,
+            variable: parse_environment_name(variable)?,
+            input: SecretInputMode::HiddenTerminal,
+        }),
+        [set, profile, variable, stdin] if set == "set" && stdin == "--stdin" => Ok(Command::Set {
+            profile: parse_profile_name(profile)?,
+            variable: parse_environment_name(variable)?,
+            input: SecretInputMode::Stdin,
+        }),
+        [remove, profile, variable] if remove == "remove" => Ok(Command::Remove {
+            profile: parse_profile_name(profile)?,
+            variable: parse_environment_name(variable)?,
+        }),
         _ => Err(ParseError::InvalidGrammar),
     }
 }
@@ -126,6 +173,11 @@ fn parse(arguments: &[OsString]) -> Result<Command, ParseError> {
 fn parse_profile_name(argument: &OsString) -> Result<ProfileName, ParseError> {
     let name = argument.to_str().ok_or(ParseError::InvalidGrammar)?;
     ProfileName::new(name).map_err(ParseError::InvalidName)
+}
+
+fn parse_environment_name(argument: &OsString) -> Result<EnvironmentName, ParseError> {
+    let name = argument.to_str().ok_or(ParseError::InvalidGrammar)?;
+    EnvironmentName::new(name).map_err(ParseError::InvalidName)
 }
 
 fn interaction_policy() -> InteractionPolicy {
@@ -169,6 +221,27 @@ fn render_profile_success(success: ProfileSuccess) -> String {
                 output.push_str(variable.as_str());
                 output.push('\n');
             }
+        }
+        ProfileSuccess::Set {
+            profile,
+            variable,
+            mutation,
+        } => {
+            output.push_str(match mutation {
+                Mutation::Created => "Created variable '",
+                Mutation::Updated => "Updated variable '",
+            });
+            output.push_str(variable.as_str());
+            output.push_str("' in profile '");
+            output.push_str(profile.as_str());
+            output.push_str("'.\n");
+        }
+        ProfileSuccess::Removed { profile, variable } => {
+            output.push_str("Removed variable '");
+            output.push_str(variable.as_str());
+            output.push_str("' from profile '");
+            output.push_str(profile.as_str());
+            output.push_str("'.\n");
         }
     }
     output
@@ -256,6 +329,77 @@ fn run_profile(command: ProfileCommand) -> ExitCode {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn run_set(profile: &ProfileName, variable: EnvironmentName, input: SecretInputMode) -> ExitCode {
+    let paths = match MacOsPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(13);
+        }
+    };
+    let keys = MacOsKeychainProvider::new();
+    let store = LocalVaultStore::new(paths.data_directory().to_owned());
+    let operations = ProfileOperations::new(&keys, &store);
+    let interaction = interaction_policy();
+
+    let output_profile = ProfileName::clone(profile);
+    let output_variable = variable.clone();
+    match execute_set(&operations, profile, variable, interaction, || {
+        read_secret(input)
+    }) {
+        Ok(receipt) => {
+            print!(
+                "{}",
+                render_profile_success(ProfileSuccess::Set {
+                    profile: output_profile,
+                    variable: output_variable,
+                    mutation: receipt.mutation,
+                })
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_remove(profile: &ProfileName, variable: &EnvironmentName) -> ExitCode {
+    let paths = match MacOsPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(13);
+        }
+    };
+    let keys = MacOsKeychainProvider::new();
+    let store = LocalVaultStore::new(paths.data_directory().to_owned());
+    let operations = ProfileOperations::new(&keys, &store);
+    let interaction = interaction_policy();
+    let output_profile = ProfileName::clone(profile);
+    let output_variable = EnvironmentName::clone(variable);
+
+    match operations.remove(profile, variable, interaction) {
+        Ok(_) => {
+            print!(
+                "{}",
+                render_profile_success(ProfileSuccess::Removed {
+                    profile: output_profile,
+                    variable: output_variable,
+                })
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 fn run_init() -> ExitCode {
     eprintln!("gschrank: this build does not support secure vault initialization on this platform");
@@ -264,6 +408,22 @@ fn run_init() -> ExitCode {
 
 #[cfg(not(target_os = "macos"))]
 fn run_profile(_command: ProfileCommand) -> ExitCode {
+    eprintln!("gschrank: this build does not support encrypted profiles on this platform");
+    ExitCode::from(1)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_set(
+    _profile: &ProfileName,
+    _variable: EnvironmentName,
+    _input: SecretInputMode,
+) -> ExitCode {
+    eprintln!("gschrank: this build does not support encrypted profiles on this platform");
+    ExitCode::from(1)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_remove(_profile: &ProfileName, _variable: &EnvironmentName) -> ExitCode {
     eprintln!("gschrank: this build does not support encrypted profiles on this platform");
     ExitCode::from(1)
 }
@@ -294,9 +454,41 @@ mod tests {
             ]),
             Ok(Command::Profile(ProfileCommand::Rename { .. }))
         ));
+        assert!(matches!(
+            parse(&["set".into(), "dev".into(), "API_TOKEN".into()]),
+            Ok(Command::Set {
+                input: SecretInputMode::HiddenTerminal,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&[
+                "set".into(),
+                "dev".into(),
+                "API_TOKEN".into(),
+                "--stdin".into()
+            ]),
+            Ok(Command::Set {
+                input: SecretInputMode::Stdin,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&["remove".into(), "dev".into(), "API_TOKEN".into()]),
+            Ok(Command::Remove { .. })
+        ));
         assert!(parse(&["init".into(), "extra".into()]).is_err());
         assert!(parse(&["profile".into()]).is_err());
         assert!(parse(&["profile".into(), "create".into(), "NOT VALID".into()]).is_err());
+        assert!(
+            parse(&[
+                "set".into(),
+                "dev".into(),
+                "API_TOKEN".into(),
+                "secret-positionally".into()
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -318,6 +510,21 @@ mod tests {
                 ProfileName::new("work").unwrap(),
             ])),
             "dev\nwork\n"
+        );
+        assert_eq!(
+            render_profile_success(ProfileSuccess::Set {
+                profile: ProfileName::new("dev").unwrap(),
+                variable: EnvironmentName::new("API_TOKEN").unwrap(),
+                mutation: Mutation::Updated,
+            }),
+            "Updated variable 'API_TOKEN' in profile 'dev'.\n"
+        );
+        assert_eq!(
+            render_profile_success(ProfileSuccess::Removed {
+                profile: ProfileName::new("dev").unwrap(),
+                variable: EnvironmentName::new("API_TOKEN").unwrap(),
+            }),
+            "Removed variable 'API_TOKEN' from profile 'dev'.\n"
         );
     }
 }

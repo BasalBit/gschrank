@@ -14,6 +14,8 @@ mod envelope;
 mod init;
 mod key_provider;
 mod profiles;
+mod secret_input;
+mod set_command;
 mod vault_store;
 
 #[cfg(target_os = "macos")]

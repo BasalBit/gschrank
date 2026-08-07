@@ -377,7 +377,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        ProfileName,
+        EnvironmentName, Mutation, ProfileName, SecretValue,
         init::{InitOutcome, Initializer},
         key_provider::InteractionPolicy,
         profiles::{ProfileOperationError, ProfileOperations},
@@ -558,6 +558,35 @@ mod tests {
             profiles.list(InteractionPolicy::FailFast).unwrap(),
             vec![ProfileName::new("dev").unwrap()]
         );
+
+        let dev = ProfileName::new("dev").unwrap();
+        let variable = EnvironmentName::new("TOKEN").unwrap();
+        let set = profiles
+            .set(
+                &dev,
+                variable.clone(),
+                SecretValue::from_string("CANARY-production-store-$()`".to_owned()).unwrap(),
+                InteractionPolicy::FailFast,
+            )
+            .unwrap();
+        assert_eq!(set.mutation, Mutation::Created);
+        assert_eq!(
+            profiles
+                .inspect(&dev, InteractionPolicy::FailFast)
+                .unwrap()
+                .variables,
+            vec![variable]
+        );
+        for entry in fs::read_dir(test.data()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                let bytes = fs::read(entry.path()).unwrap();
+                assert!(
+                    !bytes.windows(6).any(|window| window == b"CANARY"),
+                    "vault-store artifact exposed secret bytes"
+                );
+            }
+        }
     }
 
     #[test]
