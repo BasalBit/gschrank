@@ -57,15 +57,22 @@ pub(crate) struct RecoveryInspection {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryList {
     pub(crate) bundles: Vec<RecoveryInspection>,
+    pub(crate) purge_pending: Vec<RecoveryBundleId>,
 }
 
 impl RecoveryList {
     pub(crate) fn exit_code(&self) -> u8 {
-        self.bundles
+        let bundle_exit = self
+            .bundles
             .iter()
             .map(|bundle| bundle.authentication.exit_code())
             .max()
-            .unwrap_or(0)
+            .unwrap_or(0);
+        if self.purge_pending.is_empty() {
+            bundle_exit
+        } else {
+            bundle_exit.max(14)
+        }
     }
 }
 
@@ -75,6 +82,7 @@ pub(crate) struct RecoveryOverview {
     pub(crate) initialization_pending: bool,
     pub(crate) rebuild_pending: bool,
     pub(crate) bundle_count: usize,
+    pub(crate) purge_pending_count: usize,
 }
 
 /// A safe recovery inventory failure.
@@ -144,10 +152,12 @@ where
 
     pub(crate) fn overview(&self) -> Result<RecoveryOverview, RecoveryOperationError> {
         self.store.shared_read(|read| {
+            let purge_pending_count = read.read_recovery_purge_pending()?.len();
             Ok(RecoveryOverview {
                 initialization_pending: read.read_init_pending()?.is_some(),
                 rebuild_pending: read.read_rebuild_pending()?.is_some(),
                 bundle_count: read.read_recovery_bundles()?.len(),
+                purge_pending_count,
             })
         })
     }
@@ -163,7 +173,16 @@ where
                 .map(|bundle| self.inspect_bundle(&bundle, interaction))
                 .collect::<Vec<_>>();
             bundles.sort_by_key(|bundle| (bundle.created_at_unix_seconds, bundle.id));
-            Ok(RecoveryList { bundles })
+            let mut purge_pending = read
+                .read_recovery_purge_pending()?
+                .into_iter()
+                .map(|pending| pending.id)
+                .collect::<Vec<_>>();
+            purge_pending.sort_unstable();
+            Ok(RecoveryList {
+                bundles,
+                purge_pending,
+            })
         })
     }
 
@@ -346,6 +365,38 @@ mod tests {
                 initialization_pending: true,
                 rebuild_pending: true,
                 bundle_count: 1,
+                purge_pending_count: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn lists_staged_bundle_purges_separately_and_marks_recovery_actionable() {
+        let (keys, store) = initialized_recovery();
+        let key_id = inspect_envelope(&store.live().unwrap()).unwrap().key_id;
+        store
+            .exclusive_transaction::<_, VaultStoreError, _>(|transaction| {
+                assert_eq!(
+                    transaction.stage_recovery_purge(BUNDLE_ID, &[key_id])?,
+                    CommitOutcome::Committed
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let operations = RecoveryOperations::new(&keys, &store);
+        let list = operations.list(INTERACTION).unwrap();
+
+        assert!(list.bundles.is_empty());
+        assert_eq!(list.purge_pending, vec![BUNDLE_ID]);
+        assert_eq!(list.exit_code(), 14);
+        assert_eq!(
+            operations.overview().unwrap(),
+            RecoveryOverview {
+                initialization_pending: false,
+                rebuild_pending: false,
+                bundle_count: 0,
+                purge_pending_count: 1,
             }
         );
     }

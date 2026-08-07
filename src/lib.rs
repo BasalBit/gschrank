@@ -20,6 +20,7 @@ mod key_provider;
 mod profiles;
 mod rebuild;
 mod recovery;
+mod recovery_purge;
 mod reset;
 mod restore;
 mod secret_input;

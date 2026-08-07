@@ -11,8 +11,9 @@ use crate::{
     KeyId, MasterKey,
     key_provider::{InteractionPolicy, KeyProvider, KeyProviderError, KeyProviderErrorKind},
     vault_store::{
-        CommitOutcome, RecoveryArtifacts, RecoveryBundle, RecoveryBundleMetadata, VaultRead,
-        VaultStore, VaultStoreError, VaultStoreErrorKind, VaultTransaction,
+        CommitOutcome, RecoveryArtifacts, RecoveryBundle, RecoveryBundleMetadata,
+        RecoveryPurgePending, VaultRead, VaultStore, VaultStoreError, VaultStoreErrorKind,
+        VaultTransaction,
     },
 };
 
@@ -26,6 +27,7 @@ struct MemoryKeyState {
     next_load_error: Option<KeyProviderErrorKind>,
     next_store_error: Option<KeyProviderErrorKind>,
     always_store_error: Option<KeyProviderErrorKind>,
+    next_delete_error: Option<KeyProviderErrorKind>,
     load_calls: usize,
     store_calls: usize,
 }
@@ -47,6 +49,10 @@ impl MemoryKeyProvider {
 
     pub(crate) fn always_fail_store(&self, kind: KeyProviderErrorKind) {
         self.state().always_store_error = Some(kind);
+    }
+
+    pub(crate) fn fail_next_delete(&self, kind: KeyProviderErrorKind) {
+        self.state().next_delete_error = Some(kind);
     }
 
     pub(crate) fn insert(&self, key_id: KeyId, key: &MasterKey) {
@@ -116,7 +122,11 @@ impl KeyProvider for MemoryKeyProvider {
         key_id: &KeyId,
         _interaction: InteractionPolicy,
     ) -> Result<(), KeyProviderError> {
-        if self.state().keys.remove(key_id).is_some() {
+        let mut state = self.state();
+        if let Some(kind) = state.next_delete_error.take() {
+            return Err(KeyProviderError::new(kind));
+        }
+        if state.keys.remove(key_id).is_some() {
             Ok(())
         } else {
             Err(KeyProviderError::new(KeyProviderErrorKind::NotFound))
@@ -134,11 +144,14 @@ struct MemoryVaultState {
     init_pending: Option<Zeroizing<Vec<u8>>>,
     rebuild_pending: Option<Zeroizing<Vec<u8>>>,
     recovery: Vec<RecoveryBundle>,
+    recovery_purge_pending: Vec<RecoveryPurgePending>,
     next_promotion: Option<PromotionFault>,
     next_replacement: Option<ReplacementFault>,
     next_recovery_preservation: Option<RecoveryPreservationFault>,
     next_root_clear: Option<RootClearFault>,
     next_rebuild_promotion: Option<RebuildPromotionFault>,
+    next_recovery_purge_stage: Option<RecoveryPurgeStageFault>,
+    next_recovery_purge_removal: Option<RecoveryPurgeRemovalFault>,
 }
 
 #[derive(Clone, Copy)]
@@ -171,6 +184,20 @@ pub(crate) enum RootClearFault {
 
 #[derive(Clone, Copy)]
 pub(crate) enum RebuildPromotionFault {
+    NotCommitted,
+    IndeterminateBeforeCommit,
+    IndeterminateAfterCommit,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RecoveryPurgeStageFault {
+    NotCommitted,
+    IndeterminateBeforeCommit,
+    IndeterminateAfterCommit,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RecoveryPurgeRemovalFault {
     NotCommitted,
     IndeterminateBeforeCommit,
     IndeterminateAfterCommit,
@@ -217,6 +244,14 @@ impl MemoryVaultStore {
 
     pub(crate) fn fail_next_rebuild_promotion(&self, fault: RebuildPromotionFault) {
         self.state().next_rebuild_promotion = Some(fault);
+    }
+
+    pub(crate) fn fail_next_recovery_purge_stage(&self, fault: RecoveryPurgeStageFault) {
+        self.state().next_recovery_purge_stage = Some(fault);
+    }
+
+    pub(crate) fn fail_next_recovery_purge_removal(&self, fault: RecoveryPurgeRemovalFault) {
+        self.state().next_recovery_purge_removal = Some(fault);
     }
 
     pub(crate) fn live(&self) -> Option<Vec<u8>> {
@@ -270,6 +305,17 @@ impl VaultRead for MemoryTransaction<'_> {
                 init_pending: bundle.init_pending.clone(),
                 rebuild_pending: bundle.rebuild_pending.clone(),
             })
+            .collect())
+    }
+
+    fn read_recovery_purge_pending(
+        &mut self,
+    ) -> Result<Vec<RecoveryPurgePending>, VaultStoreError> {
+        Ok(self
+            .state
+            .recovery_purge_pending
+            .iter()
+            .map(clone_recovery_purge_pending)
             .collect())
     }
 }
@@ -441,9 +487,109 @@ impl VaultTransaction for MemoryTransaction<'_> {
         self.commit_recovery(metadata, artifacts);
         Ok(CommitOutcome::Committed)
     }
+
+    fn stage_recovery_purge(
+        &mut self,
+        bundle_id: crate::vault_store::RecoveryBundleId,
+        key_ids: &[KeyId],
+    ) -> Result<CommitOutcome, VaultStoreError> {
+        match self.state.next_recovery_purge_stage.take() {
+            Some(RecoveryPurgeStageFault::NotCommitted) => {
+                return Ok(CommitOutcome::NotCommitted);
+            }
+            Some(RecoveryPurgeStageFault::IndeterminateBeforeCommit) => {
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            Some(RecoveryPurgeStageFault::IndeterminateAfterCommit) => {
+                self.commit_recovery_purge_stage(bundle_id, key_ids)?;
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            None => {}
+        }
+        self.commit_recovery_purge_stage(bundle_id, key_ids)?;
+        Ok(CommitOutcome::Committed)
+    }
+
+    fn remove_recovery_purge_pending(
+        &mut self,
+        bundle_id: crate::vault_store::RecoveryBundleId,
+    ) -> Result<CommitOutcome, VaultStoreError> {
+        match self.state.next_recovery_purge_removal.take() {
+            Some(RecoveryPurgeRemovalFault::NotCommitted) => {
+                return Ok(CommitOutcome::NotCommitted);
+            }
+            Some(RecoveryPurgeRemovalFault::IndeterminateBeforeCommit) => {
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            Some(RecoveryPurgeRemovalFault::IndeterminateAfterCommit) => {
+                self.commit_recovery_purge_removal(bundle_id)?;
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            None => {}
+        }
+        self.commit_recovery_purge_removal(bundle_id)?;
+        Ok(CommitOutcome::Committed)
+    }
 }
 
 impl MemoryTransaction<'_> {
+    fn commit_recovery_purge_stage(
+        &mut self,
+        bundle_id: crate::vault_store::RecoveryBundleId,
+        key_ids: &[KeyId],
+    ) -> Result<(), VaultStoreError> {
+        if key_ids.is_empty() || key_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+        }
+        if let Some(pending) = self
+            .state
+            .recovery_purge_pending
+            .iter_mut()
+            .find(|pending| pending.id == bundle_id)
+        {
+            if pending.key_ids.as_deref().is_some_and(|ids| ids != key_ids) {
+                return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+            }
+            pending.key_ids = Some(key_ids.to_vec());
+            return Ok(());
+        }
+        let position = self
+            .state
+            .recovery
+            .iter()
+            .position(|bundle| bundle.metadata.id == bundle_id)
+            .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::MissingState))?;
+        let bundle = self.state.recovery.remove(position);
+        self.state
+            .recovery_purge_pending
+            .push(RecoveryPurgePending {
+                id: bundle_id,
+                bundle: Some(bundle),
+                key_ids: Some(key_ids.to_vec()),
+            });
+        Ok(())
+    }
+
+    fn commit_recovery_purge_removal(
+        &mut self,
+        bundle_id: crate::vault_store::RecoveryBundleId,
+    ) -> Result<(), VaultStoreError> {
+        let position = self
+            .state
+            .recovery_purge_pending
+            .iter()
+            .position(|pending| pending.id == bundle_id)
+            .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::MissingState))?;
+        if self.state.recovery_purge_pending[position]
+            .key_ids
+            .is_none()
+        {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+        }
+        self.state.recovery_purge_pending.remove(position);
+        Ok(())
+    }
+
     fn commit_recovery(
         &mut self,
         metadata: RecoveryBundleMetadata,
@@ -482,6 +628,23 @@ impl MemoryTransaction<'_> {
             .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::MissingState))?;
         self.state.live = Some(pending);
         Ok(())
+    }
+}
+
+fn clone_recovery_bundle(bundle: &RecoveryBundle) -> RecoveryBundle {
+    RecoveryBundle {
+        metadata: bundle.metadata,
+        live: bundle.live.clone(),
+        init_pending: bundle.init_pending.clone(),
+        rebuild_pending: bundle.rebuild_pending.clone(),
+    }
+}
+
+fn clone_recovery_purge_pending(pending: &RecoveryPurgePending) -> RecoveryPurgePending {
+    RecoveryPurgePending {
+        id: pending.id,
+        bundle: pending.bundle.as_ref().map(clone_recovery_bundle),
+        key_ids: pending.key_ids.clone(),
     }
 }
 

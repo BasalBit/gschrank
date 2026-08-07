@@ -103,7 +103,6 @@ pub(crate) trait KeyProvider: Send + Sync {
         interaction: InteractionPolicy,
     ) -> Result<(), KeyProviderError>;
 
-    #[allow(dead_code)]
     fn delete(
         &self,
         key_id: &KeyId,

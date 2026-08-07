@@ -4,6 +4,8 @@ use std::{error::Error, fmt};
 
 use zeroize::Zeroizing;
 
+use crate::KeyId;
+
 /// The portable semantic result of a local-vault-store failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VaultStoreErrorKind {
@@ -168,6 +170,17 @@ pub(crate) struct RecoveryBundle {
     pub(crate) rebuild_pending: Option<Zeroizing<Vec<u8>>>,
 }
 
+/// A recovery bundle moved out of the active set for explicit key deletion.
+///
+/// A present key-ID plan was durably recorded only after the complete bundle
+/// authenticated. The bundle may be absent after an interrupted ciphertext
+/// cleanup, while the plan keeps the remaining deletion sequence resumable.
+pub(crate) struct RecoveryPurgePending {
+    pub(crate) id: RecoveryBundleId,
+    pub(crate) bundle: Option<RecoveryBundle>,
+    pub(crate) key_ids: Option<Vec<KeyId>>,
+}
+
 /// Borrowed encrypted artifacts to preserve as one recovery bundle.
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -183,6 +196,8 @@ pub(crate) trait VaultRead {
     fn read_init_pending(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError>;
     fn read_rebuild_pending(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, VaultStoreError>;
     fn read_recovery_bundles(&mut self) -> Result<Vec<RecoveryBundle>, VaultStoreError>;
+    fn read_recovery_purge_pending(&mut self)
+    -> Result<Vec<RecoveryPurgePending>, VaultStoreError>;
 }
 
 /// Initialization artifact operations while the exclusive lock is retained.
@@ -203,6 +218,15 @@ pub(crate) trait VaultTransaction: VaultRead {
         &mut self,
         metadata: RecoveryBundleMetadata,
         artifacts: RecoveryArtifacts<'_>,
+    ) -> Result<CommitOutcome, VaultStoreError>;
+    fn stage_recovery_purge(
+        &mut self,
+        bundle_id: RecoveryBundleId,
+        key_ids: &[KeyId],
+    ) -> Result<CommitOutcome, VaultStoreError>;
+    fn remove_recovery_purge_pending(
+        &mut self,
+        bundle_id: RecoveryBundleId,
     ) -> Result<CommitOutcome, VaultStoreError>;
 }
 

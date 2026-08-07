@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    collections::BTreeSet,
     fs::{self, DirBuilder, File, Metadata, OpenOptions},
     io::{self, Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
@@ -10,11 +11,11 @@ use std::{
 use zeroize::Zeroizing;
 
 use crate::{
-    MAX_ENVELOPE_SIZE,
+    KeyId, MAX_ENVELOPE_SIZE,
     vault_store::{
         CommitOutcome, RecoveryArtifacts, RecoveryBundle, RecoveryBundleId, RecoveryBundleMetadata,
-        RecoveryReason, VaultRead, VaultStore, VaultStoreError, VaultStoreErrorKind,
-        VaultTransaction,
+        RecoveryPurgePending, RecoveryReason, VaultRead, VaultStore, VaultStoreError,
+        VaultStoreErrorKind, VaultTransaction,
     },
 };
 
@@ -25,6 +26,7 @@ const LOCK_FILE: &str = "vault.lock";
 const INIT_PENDING_FILE: &str = "vault.init.pending";
 const REBUILD_PENDING_FILE: &str = "vault.rebuild.pending";
 const RECOVERY_DIRECTORY: &str = "recovery";
+const RECOVERY_PURGE_DIRECTORY: &str = "recovery-purge.pending";
 const RECOVERY_MANIFEST_FILE: &str = "manifest";
 const RECOVERY_LIVE_FILE: &str = "vault";
 const RECOVERY_INIT_FILE: &str = "vault.init.pending";
@@ -35,6 +37,12 @@ const RECOVERY_MANIFEST_LENGTH: usize = 40;
 const RECOVERY_FLAG_LIVE: u8 = 0b0000_0001;
 const RECOVERY_FLAG_INIT: u8 = 0b0000_0010;
 const RECOVERY_FLAG_REBUILD: u8 = 0b0000_0100;
+const RECOVERY_PURGE_PLAN_SUFFIX: &str = ".plan";
+const RECOVERY_PURGE_PLAN_TEMP_SUFFIX: &str = ".plan.pending";
+const RECOVERY_PURGE_PLAN_MAGIC: &[u8; 8] = b"GSCHPGR1";
+const RECOVERY_PURGE_PLAN_VERSION: u16 = 1;
+const RECOVERY_PURGE_PLAN_PREFIX_LENGTH: usize = 32;
+const MAX_RECOVERY_PURGE_KEYS: usize = 3;
 const TEMP_ATTEMPTS: usize = 16;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -176,6 +184,12 @@ impl VaultRead for LocalTransaction<'_> {
 
     fn read_recovery_bundles(&mut self) -> Result<Vec<RecoveryBundle>, VaultStoreError> {
         read_recovery_bundles(self.directory)
+    }
+
+    fn read_recovery_purge_pending(
+        &mut self,
+    ) -> Result<Vec<RecoveryPurgePending>, VaultStoreError> {
+        read_recovery_purge_pending(self.directory)
     }
 }
 
@@ -334,6 +348,21 @@ impl VaultTransaction for LocalTransaction<'_> {
         artifacts: RecoveryArtifacts<'_>,
     ) -> Result<CommitOutcome, VaultStoreError> {
         preserve_recovery_bundle(self.directory, metadata, artifacts)
+    }
+
+    fn stage_recovery_purge(
+        &mut self,
+        bundle_id: RecoveryBundleId,
+        key_ids: &[KeyId],
+    ) -> Result<CommitOutcome, VaultStoreError> {
+        stage_recovery_purge(self.directory, bundle_id, key_ids)
+    }
+
+    fn remove_recovery_purge_pending(
+        &mut self,
+        bundle_id: RecoveryBundleId,
+    ) -> Result<CommitOutcome, VaultStoreError> {
+        remove_recovery_purge_pending(self.directory, bundle_id)
     }
 }
 
@@ -559,6 +588,383 @@ fn read_recovery_bundles(directory: &Path) -> Result<Vec<RecoveryBundle>, VaultS
     }
     bundles.sort_by_key(|bundle| (bundle.metadata.created_at_unix_seconds, bundle.metadata.id));
     Ok(bundles)
+}
+
+fn read_recovery_purge_pending(
+    directory: &Path,
+) -> Result<Vec<RecoveryPurgePending>, VaultStoreError> {
+    let purge = directory.join(RECOVERY_PURGE_DIRECTORY);
+    match fs::symlink_metadata(&purge) {
+        Ok(metadata) => validate_directory(&metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(map_directory_io(error)),
+    }
+
+    let mut ids = BTreeSet::new();
+    for entry in fs::read_dir(&purge).map_err(map_directory_io)? {
+        let entry = entry.map_err(map_directory_io)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(map_directory_io)?;
+        if metadata.is_dir() {
+            validate_directory(&metadata)?;
+            ids.insert(parse_recovery_bundle_id(&name)?);
+        } else if let Some(encoded_id) = name.strip_suffix(RECOVERY_PURGE_PLAN_TEMP_SUFFIX) {
+            validate_regular_file(&metadata)?;
+            ids.insert(parse_recovery_bundle_id(encoded_id)?);
+        } else if let Some(encoded_id) = name.strip_suffix(RECOVERY_PURGE_PLAN_SUFFIX) {
+            validate_regular_file(&metadata)?;
+            ids.insert(parse_recovery_bundle_id(encoded_id)?);
+        } else {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+        }
+    }
+
+    ids.into_iter()
+        .map(|id| {
+            let bundle_path = purge.join(id.to_hex());
+            let bundle = match fs::symlink_metadata(&bundle_path) {
+                Ok(metadata) => {
+                    validate_directory(&metadata)?;
+                    if let Ok(bundle) = read_recovery_bundle(&bundle_path, id) {
+                        Some(bundle)
+                    } else {
+                        validate_partial_purge_bundle(&bundle_path)?;
+                        None
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(map_directory_io(error)),
+            };
+            let key_ids = read_recovery_purge_plan(&purge, id)?;
+            if bundle.is_none() && key_ids.is_none() {
+                return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+            }
+            Ok(RecoveryPurgePending {
+                id,
+                bundle,
+                key_ids,
+            })
+        })
+        .collect()
+}
+
+fn stage_recovery_purge(
+    directory: &Path,
+    bundle_id: RecoveryBundleId,
+    key_ids: &[KeyId],
+) -> Result<CommitOutcome, VaultStoreError> {
+    validate_recovery_purge_key_ids(key_ids)?;
+    let recovery = ensure_recovery_directory(directory)?;
+    let purge = ensure_recovery_purge_directory(directory)?;
+    let active = recovery.join(bundle_id.to_hex());
+    let staged = purge.join(bundle_id.to_hex());
+    let active_state = fs::symlink_metadata(&active);
+    let staged_state = fs::symlink_metadata(&staged);
+    match (active_state, staged_state) {
+        (Ok(active_metadata), Err(staged_error))
+            if staged_error.kind() == io::ErrorKind::NotFound =>
+        {
+            validate_directory(&active_metadata)?;
+            read_recovery_bundle(&active, bundle_id)?;
+            fs::rename(&active, &staged).map_err(map_directory_io)?;
+            if sync_directory(&recovery).is_err() || sync_directory(&purge).is_err() {
+                return Ok(CommitOutcome::Indeterminate);
+            }
+        }
+        (Err(active_error), Ok(staged_metadata))
+            if active_error.kind() == io::ErrorKind::NotFound =>
+        {
+            validate_directory(&staged_metadata)?;
+            validate_partial_purge_bundle(&staged)?;
+            if sync_directory(&recovery).is_err() || sync_directory(&purge).is_err() {
+                return Ok(CommitOutcome::Indeterminate);
+            }
+        }
+        (Ok(_), Ok(_)) => return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict)),
+        (Err(active_error), Err(staged_error))
+            if active_error.kind() == io::ErrorKind::NotFound
+                && staged_error.kind() == io::ErrorKind::NotFound =>
+        {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::MissingState));
+        }
+        (Err(error), _) | (_, Err(error)) => return Err(map_directory_io(error)),
+    }
+
+    let plan_outcome = match read_recovery_purge_plan(&purge, bundle_id)? {
+        Some(existing) if existing == key_ids => {
+            if sync_directory(&purge).is_err() {
+                CommitOutcome::Indeterminate
+            } else {
+                CommitOutcome::Committed
+            }
+        }
+        Some(_) => return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict)),
+        None => {
+            let plan = encode_recovery_purge_plan(bundle_id, key_ids)?;
+            publish_recovery_purge_plan(&purge, bundle_id, &plan)?
+        }
+    };
+
+    let pending = read_recovery_purge_pending(directory)?;
+    if pending
+        .iter()
+        .any(|pending| pending.id == bundle_id && pending.key_ids.as_deref() == Some(key_ids))
+    {
+        Ok(plan_outcome)
+    } else {
+        Ok(CommitOutcome::Indeterminate)
+    }
+}
+
+fn remove_recovery_purge_pending(
+    directory: &Path,
+    bundle_id: RecoveryBundleId,
+) -> Result<CommitOutcome, VaultStoreError> {
+    let purge = directory.join(RECOVERY_PURGE_DIRECTORY);
+    validate_directory(&fs::symlink_metadata(&purge).map_err(map_directory_io)?)?;
+    let pending = read_recovery_purge_pending(directory)?;
+    let selected = pending
+        .iter()
+        .find(|pending| pending.id == bundle_id)
+        .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::MissingState))?;
+    if selected.key_ids.is_none() {
+        return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+    }
+
+    let staged = purge.join(bundle_id.to_hex());
+    let mut changed = false;
+    match fs::symlink_metadata(&staged) {
+        Ok(metadata) => {
+            validate_directory(&metadata)?;
+            validate_partial_purge_bundle(&staged)?;
+            for entry in fs::read_dir(&staged).map_err(map_directory_io)? {
+                let entry = entry.map_err(map_directory_io)?;
+                if let Err(error) = fs::remove_file(entry.path()) {
+                    if changed {
+                        return Ok(CommitOutcome::Indeterminate);
+                    }
+                    return Err(map_file_io(error));
+                }
+                changed = true;
+            }
+            if let Err(error) = fs::remove_dir(&staged) {
+                if changed {
+                    return Ok(CommitOutcome::Indeterminate);
+                }
+                return Err(map_directory_io(error));
+            }
+            changed = true;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(map_directory_io(error)),
+    }
+
+    let temporary_plan = purge.join(recovery_purge_plan_temporary_name(bundle_id));
+    match fs::remove_file(&temporary_plan) {
+        Ok(()) => changed = true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_error) if changed => return Ok(CommitOutcome::Indeterminate),
+        Err(error) => return Err(map_file_io(error)),
+    }
+
+    let plan = purge.join(recovery_purge_plan_name(bundle_id));
+    match fs::remove_file(&plan) {
+        Ok(()) => changed = true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_error) if changed => return Ok(CommitOutcome::Indeterminate),
+        Err(error) => return Err(map_file_io(error)),
+    }
+    if !changed {
+        return Err(VaultStoreError::new(VaultStoreErrorKind::MissingState));
+    }
+    if sync_directory(&purge).is_err() {
+        return Ok(CommitOutcome::Indeterminate);
+    }
+    if read_recovery_purge_pending(directory)?
+        .iter()
+        .any(|pending| pending.id == bundle_id)
+    {
+        Ok(CommitOutcome::Indeterminate)
+    } else {
+        Ok(CommitOutcome::Committed)
+    }
+}
+
+fn ensure_recovery_purge_directory(directory: &Path) -> Result<PathBuf, VaultStoreError> {
+    let purge = directory.join(RECOVERY_PURGE_DIRECTORY);
+    match fs::symlink_metadata(&purge) {
+        Ok(metadata) => validate_directory(&metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(&purge).map_err(map_directory_io)?;
+            validate_directory(&fs::symlink_metadata(&purge).map_err(map_directory_io)?)?;
+            sync_directory(directory).map_err(map_directory_io)?;
+        }
+        Err(error) => return Err(map_directory_io(error)),
+    }
+    Ok(purge)
+}
+
+fn validate_partial_purge_bundle(directory: &Path) -> Result<(), VaultStoreError> {
+    for entry in fs::read_dir(directory).map_err(map_directory_io)? {
+        let entry = entry.map_err(map_directory_io)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))?;
+        if !matches!(
+            name.as_str(),
+            RECOVERY_MANIFEST_FILE
+                | RECOVERY_LIVE_FILE
+                | RECOVERY_INIT_FILE
+                | RECOVERY_REBUILD_FILE
+        ) {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+        }
+        validate_regular_file(&fs::symlink_metadata(entry.path()).map_err(map_file_io)?)?;
+    }
+    Ok(())
+}
+
+fn validate_recovery_purge_key_ids(key_ids: &[KeyId]) -> Result<(), VaultStoreError> {
+    if key_ids.is_empty()
+        || key_ids.len() > MAX_RECOVERY_PURGE_KEYS
+        || key_ids.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+    }
+    Ok(())
+}
+
+fn recovery_purge_plan_name(bundle_id: RecoveryBundleId) -> String {
+    format!("{}{RECOVERY_PURGE_PLAN_SUFFIX}", bundle_id.to_hex())
+}
+
+fn recovery_purge_plan_temporary_name(bundle_id: RecoveryBundleId) -> String {
+    format!("{}{RECOVERY_PURGE_PLAN_TEMP_SUFFIX}", bundle_id.to_hex())
+}
+
+fn publish_recovery_purge_plan(
+    purge: &Path,
+    bundle_id: RecoveryBundleId,
+    bytes: &[u8],
+) -> Result<CommitOutcome, VaultStoreError> {
+    let destination = purge.join(recovery_purge_plan_name(bundle_id));
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) => {
+            validate_regular_file(&metadata)?;
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(map_file_io(error)),
+    }
+
+    let temporary = purge.join(recovery_purge_plan_temporary_name(bundle_id));
+    match fs::symlink_metadata(&temporary) {
+        Ok(metadata) => {
+            validate_regular_file(&metadata)?;
+            fs::remove_file(&temporary).map_err(map_file_io)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(map_file_io(error)),
+    }
+
+    let write_result = (|| {
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let mut file = options.open(&temporary).map_err(map_file_io)?;
+        validate_regular_file(&file.metadata().map_err(map_file_io)?)?;
+        file.write_all(bytes).map_err(map_file_io)?;
+        file.flush().map_err(map_file_io)?;
+        system::full_sync(&file).map_err(map_file_io)?;
+        drop(file);
+        fs::rename(&temporary, &destination).map_err(map_file_io)?;
+        if sync_directory(purge).is_err() {
+            return Ok(CommitOutcome::Indeterminate);
+        }
+        if read_recovery_purge_plan(purge, bundle_id)?.is_none() {
+            return Ok(CommitOutcome::Indeterminate);
+        }
+        Ok(CommitOutcome::Committed)
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn encode_recovery_purge_plan(
+    bundle_id: RecoveryBundleId,
+    key_ids: &[KeyId],
+) -> Result<Vec<u8>, VaultStoreError> {
+    validate_recovery_purge_key_ids(key_ids)?;
+    let mut bytes = Vec::with_capacity(RECOVERY_PURGE_PLAN_PREFIX_LENGTH + key_ids.len() * 16);
+    bytes.extend_from_slice(RECOVERY_PURGE_PLAN_MAGIC);
+    bytes.extend_from_slice(&RECOVERY_PURGE_PLAN_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&0_u16.to_be_bytes());
+    bytes.extend_from_slice(bundle_id.as_bytes());
+    bytes.extend_from_slice(
+        &u16::try_from(key_ids.len())
+            .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))?
+            .to_be_bytes(),
+    );
+    bytes.extend_from_slice(&0_u16.to_be_bytes());
+    for key_id in key_ids {
+        bytes.extend_from_slice(key_id.as_bytes());
+    }
+    Ok(bytes)
+}
+
+fn read_recovery_purge_plan(
+    purge: &Path,
+    bundle_id: RecoveryBundleId,
+) -> Result<Option<Vec<KeyId>>, VaultStoreError> {
+    let Some(bytes) = read_artifact(purge, &recovery_purge_plan_name(bundle_id))? else {
+        return Ok(None);
+    };
+    if bytes.len() < RECOVERY_PURGE_PLAN_PREFIX_LENGTH
+        || &bytes[..8] != RECOVERY_PURGE_PLAN_MAGIC
+        || u16::from_be_bytes([bytes[8], bytes[9]]) != RECOVERY_PURGE_PLAN_VERSION
+        || bytes[10..12].iter().any(|byte| *byte != 0)
+        || bytes[30..32].iter().any(|byte| *byte != 0)
+    {
+        return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+    }
+    let encoded_id = RecoveryBundleId::from_bytes(
+        bytes[12..28]
+            .try_into()
+            .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))?,
+    );
+    if encoded_id != bundle_id {
+        return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+    }
+    let count = usize::from(u16::from_be_bytes([bytes[28], bytes[29]]));
+    let expected_length = RECOVERY_PURGE_PLAN_PREFIX_LENGTH
+        .checked_add(count * 16)
+        .ok_or_else(|| VaultStoreError::new(VaultStoreErrorKind::Conflict))?;
+    if bytes.len() != expected_length || count == 0 || count > MAX_RECOVERY_PURGE_KEYS {
+        return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+    }
+    let key_ids = bytes[RECOVERY_PURGE_PLAN_PREFIX_LENGTH..]
+        .chunks_exact(16)
+        .map(|bytes| {
+            KeyId::from_bytes(
+                bytes
+                    .try_into()
+                    .expect("purge-plan key identifier has fixed width"),
+            )
+        })
+        .collect::<Vec<_>>();
+    validate_recovery_purge_key_ids(&key_ids)?;
+    Ok(Some(key_ids))
 }
 
 fn read_recovery_bundle(
@@ -1042,6 +1448,188 @@ mod tests {
             );
         }
         assert_eq!(fs::read_dir(recovery).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn stages_plans_and_removes_recovery_purges_with_restrictive_durability() {
+        let test = TestDirectory::new();
+        let store = LocalVaultStore::new(test.data());
+        let metadata = RecoveryBundleMetadata {
+            id: RecoveryBundleId::from_bytes([0x4c; 16]),
+            created_at_unix_seconds: 1_765_000_003,
+            reason: RecoveryReason::Rebuild,
+        };
+        let key_ids = [KeyId::from_bytes([1; 16]), KeyId::from_bytes([2; 16])];
+        store
+            .initialization_transaction::<_, VaultStoreError, _>(|transaction| {
+                transaction.preserve_recovery(
+                    metadata,
+                    RecoveryArtifacts {
+                        live: Some(b"opaque-live"),
+                        init_pending: Some(b"opaque-init"),
+                        rebuild_pending: None,
+                    },
+                )?;
+                assert_eq!(
+                    transaction.stage_recovery_purge(metadata.id, &key_ids)?,
+                    CommitOutcome::Committed
+                );
+                assert!(transaction.read_recovery_bundles()?.is_empty());
+                let pending = transaction.read_recovery_purge_pending()?;
+                assert_eq!(pending.len(), 1);
+                assert_eq!(pending[0].id, metadata.id);
+                assert_eq!(pending[0].key_ids.as_deref(), Some(key_ids.as_slice()));
+                assert_eq!(
+                    pending[0]
+                        .bundle
+                        .as_ref()
+                        .and_then(|bundle| bundle.live.as_ref())
+                        .map(|bytes| bytes.as_slice()),
+                    Some(&b"opaque-live"[..])
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let purge = test.data().join(RECOVERY_PURGE_DIRECTORY);
+        assert_eq!(
+            fs::metadata(&purge).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(purge.join(metadata.id.to_hex()))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(purge.join(recovery_purge_plan_name(metadata.id)))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        store
+            .exclusive_transaction::<_, VaultStoreError, _>(|transaction| {
+                assert_eq!(
+                    transaction.remove_recovery_purge_pending(metadata.id)?,
+                    CommitOutcome::Committed
+                );
+                assert!(transaction.read_recovery_purge_pending()?.is_empty());
+                Ok(())
+            })
+            .unwrap();
+        assert!(fs::read_dir(purge).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn purge_plan_survives_partial_ciphertext_cleanup_and_rejects_noncanonical_keys() {
+        let test = TestDirectory::new();
+        let store = LocalVaultStore::new(test.data());
+        let id = RecoveryBundleId::from_bytes([0x5d; 16]);
+        let metadata = RecoveryBundleMetadata {
+            id,
+            created_at_unix_seconds: 1,
+            reason: RecoveryReason::Reset,
+        };
+        let key_ids = [KeyId::from_bytes([3; 16])];
+        store
+            .initialization_transaction::<_, VaultStoreError, _>(|transaction| {
+                transaction.preserve_recovery(
+                    metadata,
+                    RecoveryArtifacts {
+                        live: Some(b"opaque-live"),
+                        init_pending: None,
+                        rebuild_pending: None,
+                    },
+                )?;
+                transaction.stage_recovery_purge(id, &key_ids)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let purge = test.data().join(RECOVERY_PURGE_DIRECTORY);
+        fs::remove_file(purge.join(id.to_hex()).join(RECOVERY_LIVE_FILE)).unwrap();
+        let pending = store
+            .shared_read::<_, VaultStoreError, _>(|read| read.read_recovery_purge_pending())
+            .unwrap();
+        assert!(pending[0].bundle.is_none());
+        assert_eq!(pending[0].key_ids.as_deref(), Some(key_ids.as_slice()));
+        store
+            .exclusive_transaction::<_, VaultStoreError, _>(|transaction| {
+                transaction.remove_recovery_purge_pending(id)?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(
+            encode_recovery_purge_plan(
+                id,
+                &[KeyId::from_bytes([2; 16]), KeyId::from_bytes([1; 16])]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn interrupted_temporary_purge_plan_is_recognized_and_republished_atomically() {
+        let test = TestDirectory::new();
+        let store = LocalVaultStore::new(test.data());
+        let id = RecoveryBundleId::from_bytes([0x6e; 16]);
+        let metadata = RecoveryBundleMetadata {
+            id,
+            created_at_unix_seconds: 2,
+            reason: RecoveryReason::Restore,
+        };
+        store
+            .initialization_transaction::<_, VaultStoreError, _>(|transaction| {
+                transaction.preserve_recovery(
+                    metadata,
+                    RecoveryArtifacts {
+                        live: Some(b"opaque-live"),
+                        init_pending: None,
+                        rebuild_pending: None,
+                    },
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let recovery = test.data().join(RECOVERY_DIRECTORY);
+        let purge = ensure_recovery_purge_directory(&test.data()).unwrap();
+        fs::rename(recovery.join(id.to_hex()), purge.join(id.to_hex())).unwrap();
+        write_new_synced(
+            &purge,
+            &recovery_purge_plan_temporary_name(id),
+            b"interrupted-plan",
+        )
+        .unwrap();
+        let pending = store
+            .shared_read::<_, VaultStoreError, _>(|read| read.read_recovery_purge_pending())
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].bundle.is_some());
+        assert!(pending[0].key_ids.is_none());
+
+        let key_ids = [KeyId::from_bytes([4; 16])];
+        store
+            .exclusive_transaction::<_, VaultStoreError, _>(|transaction| {
+                assert_eq!(
+                    transaction.stage_recovery_purge(id, &key_ids)?,
+                    CommitOutcome::Committed
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert!(!purge.join(recovery_purge_plan_temporary_name(id)).exists());
+        assert_eq!(
+            read_recovery_purge_plan(&purge, id).unwrap(),
+            Some(key_ids.to_vec())
+        );
     }
 
     #[test]

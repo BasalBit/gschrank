@@ -22,6 +22,7 @@ use crate::{
     },
     rebuild::{RebuildOperations, RebuildReceipt},
     recovery::{RecoveryList, RecoveryOperationError, RecoveryOperations, RecoveryOverview},
+    recovery_purge::{RecoveryPurgeOperations, RecoveryPurgeReceipt},
     reset::{ResetError, ResetOperations, ResetPreparationError, ResetReceipt},
     restore::{RestoreOperations, RestoreReceipt},
     secret_input::{SecretInputMode, read_secret},
@@ -60,6 +61,7 @@ Usage:
   gschrank reset
   gschrank recovery list
   gschrank recovery restore <bundle-id>
+  gschrank recovery purge <bundle-id>
   gschrank import dotenv <profile> [--dry-run] [--replace-existing]
   gschrank profile create <profile>
   gschrank profile rename <old> <new>
@@ -85,7 +87,7 @@ Commands:
   restore    Authenticate and restore a Keychain-bound encrypted vault backup
   rebuild    Re-encrypt every profile under a new vault identity and master key
   reset      Preserve current state and create a new independently keyed empty vault
-  recovery   List, validate, or restore durable internal recovery bundles
+  recovery   List, validate, restore, or purge durable internal recovery bundles
   import     Add a strict stdin-only dotenv document to an existing profile
   profile    Create, rename, delete, list, or inspect profiles
   set        Create or update a variable using hidden or explicit stdin input
@@ -117,6 +119,7 @@ enum Command {
     },
     RecoveryList,
     RecoveryRestore(RecoveryBundleId),
+    RecoveryPurge(RecoveryBundleId),
     Import {
         profile: ProfileName,
         options: ImportOptions,
@@ -331,7 +334,8 @@ struct StatusReport {
 impl StatusReport {
     fn exit_code(&self) -> u8 {
         if self.recovery.is_ok_and(|overview| {
-            overview.rebuild_pending
+            overview.purge_pending_count > 0
+                || overview.rebuild_pending
                 || (overview.initialization_pending
                     && matches!(self.vault, Err(ProfileOperationError::NotInitialized)))
         }) {
@@ -367,7 +371,8 @@ struct DoctorReport {
 impl DoctorReport {
     fn exit_code(&self) -> u8 {
         if self.recovery.is_ok_and(|overview| {
-            overview.rebuild_pending
+            overview.purge_pending_count > 0
+                || overview.rebuild_pending
                 || (overview.initialization_pending
                     && matches!(self.vault, Err(ProfileOperationError::NotInitialized)))
         }) {
@@ -436,6 +441,7 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
         Ok(Command::Reset { shell_wrapper }) => run_reset(shell_wrapper),
         Ok(Command::RecoveryList) => run_recovery_list(),
         Ok(Command::RecoveryRestore(bundle_id)) => run_recovery_restore(bundle_id),
+        Ok(Command::RecoveryPurge(bundle_id)) => run_recovery_purge(bundle_id),
         Ok(Command::Import { profile, options }) => run_import(&profile, options),
         Ok(Command::Profile(command)) => run_profile(command),
         Ok(Command::Set {
@@ -481,6 +487,12 @@ fn parse(arguments: &[OsString]) -> Result<Command, ParseError> {
         [recovery, restore, bundle_id] if recovery == "recovery" && restore == "restore" => {
             let bundle_id = bundle_id.to_str().ok_or(ParseError::InvalidGrammar)?;
             Ok(Command::RecoveryRestore(
+                RecoveryBundleId::from_hex(bundle_id).ok_or(ParseError::InvalidGrammar)?,
+            ))
+        }
+        [recovery, purge, bundle_id] if recovery == "recovery" && purge == "purge" => {
+            let bundle_id = bundle_id.to_str().ok_or(ParseError::InvalidGrammar)?;
+            Ok(Command::RecoveryPurge(
                 RecoveryBundleId::from_hex(bundle_id).ok_or(ParseError::InvalidGrammar)?,
             ))
         }
@@ -995,6 +1007,43 @@ fn run_recovery_restore(bundle_id: RecoveryBundleId) -> ExitCode {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn run_recovery_purge(bundle_id: RecoveryBundleId) -> ExitCode {
+    let paths = match MacOsPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(13);
+        }
+    };
+    let keys = MacOsKeychainProvider::new();
+    let store = LocalVaultStore::new(paths.data_directory().to_owned());
+    let mut confirmer = TerminalTypedConfirmer;
+    match RecoveryPurgeOperations::new(&keys, &store).purge(
+        bundle_id,
+        interaction_policy(),
+        &mut confirmer,
+    ) {
+        Ok(receipt) => {
+            print!("{}", render_recovery_purge_success(receipt));
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
+fn render_recovery_purge_success(receipt: RecoveryPurgeReceipt) -> String {
+    format!(
+        "Purged recovery bundle {}.\nRetired Keychain items: {}\nRetained shared Keychain items: {}\n",
+        receipt.bundle_id.to_hex(),
+        receipt.retired_key_count,
+        receipt.retained_key_count
+    )
+}
+
 fn render_restore_success(receipt: RestoreReceipt) -> String {
     let mut output = format!(
         "Restored the authenticated encrypted vault at revision {}.\n",
@@ -1138,30 +1187,40 @@ fn render_recovery_list(list: &RecoveryList) -> String {
     let mut output = String::from("Recovery bundles:\n");
     if list.bundles.is_empty() {
         output.push_str("  (none)\n");
-        return output;
+    } else {
+        for bundle in &list.bundles {
+            output.push_str("  ");
+            output.push_str(&bundle.id.to_hex());
+            output.push_str("\n    Created: ");
+            output.push_str(&bundle.created_at_unix_seconds.to_string());
+            output.push_str(" Unix seconds\n    Reason: ");
+            output.push_str(bundle.reason.label());
+            output.push_str("\n    Vault ID: ");
+            output.push_str(
+                &bundle
+                    .vault_id
+                    .map_or_else(|| "unavailable".to_owned(), crate::VaultId::to_hex),
+            );
+            output.push_str("\n    Key ID: ");
+            output.push_str(
+                &bundle
+                    .key_id
+                    .map_or_else(|| "unavailable".to_owned(), crate::KeyId::to_hex),
+            );
+            output.push_str("\n    Authentication: ");
+            output.push_str(bundle.authentication.label());
+            output.push('\n');
+        }
     }
-    for bundle in &list.bundles {
-        output.push_str("  ");
-        output.push_str(&bundle.id.to_hex());
-        output.push_str("\n    Created: ");
-        output.push_str(&bundle.created_at_unix_seconds.to_string());
-        output.push_str(" Unix seconds\n    Reason: ");
-        output.push_str(bundle.reason.label());
-        output.push_str("\n    Vault ID: ");
-        output.push_str(
-            &bundle
-                .vault_id
-                .map_or_else(|| "unavailable".to_owned(), crate::VaultId::to_hex),
-        );
-        output.push_str("\n    Key ID: ");
-        output.push_str(
-            &bundle
-                .key_id
-                .map_or_else(|| "unavailable".to_owned(), crate::KeyId::to_hex),
-        );
-        output.push_str("\n    Authentication: ");
-        output.push_str(bundle.authentication.label());
-        output.push('\n');
+    output.push_str("Recovery purges pending:\n");
+    if list.purge_pending.is_empty() {
+        output.push_str("  (none)\n");
+    } else {
+        for id in &list.purge_pending {
+            output.push_str("  ");
+            output.push_str(&id.to_hex());
+            output.push('\n');
+        }
     }
     output
 }
@@ -1207,7 +1266,7 @@ fn report_diagnostic_errors<T>(
 #[cfg(target_os = "macos")]
 fn render_path_failure(command: &str) -> String {
     format!(
-        "{command}: unavailable\nLifecycle: unavailable\nVault: unavailable\nInitialization candidate: unknown\nRebuild candidate: unknown\nRecovery bundles: unknown\nShell integration: unavailable\nRemediation: use private, user-owned local paths and retry.\n"
+        "{command}: unavailable\nLifecycle: unavailable\nVault: unavailable\nInitialization candidate: unknown\nRebuild candidate: unknown\nRecovery bundles: unknown\nRecovery purges pending: unknown\nShell integration: unavailable\nRemediation: use private, user-owned local paths and retry.\n"
     )
 }
 
@@ -1286,11 +1345,14 @@ fn append_recovery_overview(
         });
         output.push_str("\nRecovery bundles: ");
         output.push_str(&overview.bundle_count.to_string());
+        output.push_str("\nRecovery purges pending: ");
+        output.push_str(&overview.purge_pending_count.to_string());
         output.push('\n');
     } else {
         output.push_str("Initialization candidate: unknown\n");
         output.push_str("Rebuild candidate: unknown\n");
         output.push_str("Recovery bundles: unknown\n");
+        output.push_str("Recovery purges pending: unknown\n");
     }
 }
 
@@ -1467,6 +1529,13 @@ fn lifecycle_label<T>(
         (
             _,
             Ok(RecoveryOverview {
+                purge_pending_count: 1..,
+                ..
+            }),
+        ) => "recovery purge pending",
+        (
+            _,
+            Ok(RecoveryOverview {
                 rebuild_pending: true,
                 ..
             }),
@@ -1497,6 +1566,13 @@ fn status_outcome(report: &StatusReport) -> &'static str {
         (
             _,
             Ok(RecoveryOverview {
+                purge_pending_count: 1..,
+                ..
+            }),
+        ) => "recovery purge pending",
+        (
+            _,
+            Ok(RecoveryOverview {
                 rebuild_pending: true,
                 ..
             }),
@@ -1519,6 +1595,13 @@ fn status_outcome(report: &StatusReport) -> &'static str {
 #[cfg(target_os = "macos")]
 fn doctor_outcome(report: &DoctorReport) -> &'static str {
     match (&report.vault, &report.recovery) {
+        (
+            _,
+            Ok(RecoveryOverview {
+                purge_pending_count: 1..,
+                ..
+            }),
+        ) => "recovery purge pending",
         (
             _,
             Ok(RecoveryOverview {
@@ -1549,6 +1632,12 @@ fn doctor_outcome(report: &DoctorReport) -> &'static str {
 
 #[cfg(target_os = "macos")]
 fn doctor_remediation(report: &DoctorReport) -> &'static str {
+    if report
+        .recovery
+        .is_ok_and(|overview| overview.purge_pending_count > 0)
+    {
+        return "run 'gschrank recovery list', then resume the listed pending purge with 'gschrank recovery purge <bundle-id>'.";
+    }
     if matches!(
         (&report.vault, &report.recovery),
         (
@@ -2351,6 +2440,12 @@ fn run_recovery_restore(_bundle_id: RecoveryBundleId) -> ExitCode {
 }
 
 #[cfg(not(target_os = "macos"))]
+fn run_recovery_purge(_bundle_id: RecoveryBundleId) -> ExitCode {
+    eprintln!("gschrank: this build does not support vault recovery on this platform");
+    ExitCode::from(1)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn run_backup(_destination: PathBuf) -> ExitCode {
     eprintln!("gschrank: this build does not support encrypted backups on this platform");
     ExitCode::from(1)
@@ -2507,11 +2602,16 @@ mod tests {
             parse(&["recovery".into(), "restore".into(), bundle_id.into()]),
             Ok(Command::RecoveryRestore(_))
         ));
+        assert!(matches!(
+            parse(&["recovery".into(), "purge".into(), bundle_id.into()]),
+            Ok(Command::RecoveryPurge(_))
+        ));
         assert!(parse(&["restore".into()]).is_err());
         assert!(parse(&["restore".into(), "/tmp/a".into(), "extra".into()]).is_err());
         assert!(parse(&["recovery".into()]).is_err());
         assert!(parse(&["recovery".into(), "list".into(), "extra".into()]).is_err());
         assert!(parse(&["recovery".into(), "restore".into(), "invalid-id".into()]).is_err());
+        assert!(parse(&["recovery".into(), "purge".into(), "invalid-id".into()]).is_err());
     }
 
     #[test]
@@ -2692,6 +2792,20 @@ mod tests {
         assert!(output.contains("revision 0"));
         assert!(output.contains("03030303030303030303030303030303"));
         assert!(output.contains("Existing shells keep"));
+        assert!(!output.contains("TOKEN"));
+        assert!(!output.contains("CANARY"));
+    }
+
+    #[test]
+    fn recovery_purge_success_reports_only_safe_counts_and_identifier() {
+        let output = render_recovery_purge_success(RecoveryPurgeReceipt {
+            bundle_id: RecoveryBundleId::from_bytes([3; 16]),
+            retired_key_count: 1,
+            retained_key_count: 2,
+        });
+        assert!(output.contains("03030303030303030303030303030303"));
+        assert!(output.contains("Retired Keychain items: 1"));
+        assert!(output.contains("Retained shared Keychain items: 2"));
         assert!(!output.contains("TOKEN"));
         assert!(!output.contains("CANARY"));
     }
@@ -2970,6 +3084,7 @@ mod tests {
                 initialization_pending: false,
                 rebuild_pending: false,
                 bundle_count: 0,
+                purge_pending_count: 0,
             }
         }
 
@@ -2990,11 +3105,14 @@ mod tests {
                     key_id: Some(KeyId::from_bytes([3; 16])),
                     authentication: RecoveryAuthentication::Authenticated,
                 }],
+                purge_pending: vec![RecoveryBundleId::from_bytes([4; 16])],
             });
 
             assert!(output.contains("01010101010101010101010101010101"));
             assert!(output.contains("Reason: restore"));
             assert!(output.contains("Authentication: authenticated"));
+            assert!(output.contains("Recovery purges pending:"));
+            assert!(output.contains("04040404040404040404040404040404"));
             assert!(!output.contains("profile"));
             assert!(!output.contains("TOKEN"));
             assert!(!output.contains("CANARY-super-secret"));
@@ -3052,6 +3170,7 @@ mod tests {
                     initialization_pending: true,
                     rebuild_pending: false,
                     bundle_count: 2,
+                    purge_pending_count: 0,
                 }),
                 shell: Ok(installed_shell()),
                 current_shell: Ok(ManagedState::empty()),
@@ -3073,6 +3192,7 @@ mod tests {
                     initialization_pending: false,
                     rebuild_pending: true,
                     bundle_count: 1,
+                    purge_pending_count: 0,
                 }),
                 shell: Ok(installed_shell()),
                 current_shell: Ok(ManagedState::empty()),
@@ -3082,6 +3202,28 @@ mod tests {
             assert!(output.contains("Doctor: rebuild pending"));
             assert!(output.contains("Rebuild candidate: present"));
             assert!(output.contains("run 'gschrank rebuild'"));
+            assert!(!output.contains("TOKEN"));
+            assert_eq!(report.exit_code(), 14);
+        }
+
+        #[test]
+        fn diagnostics_make_an_interrupted_recovery_purge_actionable() {
+            let report = DoctorReport {
+                vault: Ok(VaultReadiness { revision: 7 }),
+                recovery: Ok(RecoveryOverview {
+                    initialization_pending: false,
+                    rebuild_pending: false,
+                    bundle_count: 0,
+                    purge_pending_count: 1,
+                }),
+                shell: Ok(installed_shell()),
+                current_shell: Ok(ManagedState::empty()),
+            };
+
+            let output = render_doctor(&report);
+            assert!(output.contains("Doctor: recovery purge pending"));
+            assert!(output.contains("Recovery purges pending: 1"));
+            assert!(output.contains("gschrank recovery list"));
             assert!(!output.contains("TOKEN"));
             assert_eq!(report.exit_code(), 14);
         }
