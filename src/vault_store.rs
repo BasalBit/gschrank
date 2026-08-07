@@ -187,6 +187,7 @@ pub(crate) trait VaultTransaction: VaultRead {
     fn create_init_pending(&mut self, envelope: &[u8]) -> Result<(), VaultStoreError>;
     fn discard_init_pending(&mut self) -> Result<(), VaultStoreError>;
     fn promote_init_pending(&mut self) -> Result<CommitOutcome, VaultStoreError>;
+    fn install_live(&mut self, envelope: &[u8]) -> Result<CommitOutcome, VaultStoreError>;
     fn replace_live(&mut self, envelope: &[u8]) -> Result<CommitOutcome, VaultStoreError>;
     #[allow(dead_code)]
     fn preserve_recovery(

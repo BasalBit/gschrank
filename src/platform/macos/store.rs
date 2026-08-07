@@ -227,6 +227,15 @@ impl VaultTransaction for LocalTransaction<'_> {
         )
     }
 
+    fn install_live(&mut self, envelope: &[u8]) -> Result<CommitOutcome, VaultStoreError> {
+        durably_install(
+            self.directory,
+            LIVE_FILE,
+            envelope,
+            DestinationState::Absent,
+        )
+    }
+
     fn preserve_recovery(
         &mut self,
         metadata: RecoveryBundleMetadata,
@@ -385,10 +394,12 @@ fn preserve_recovery_bundle(
         cleanup_recovery_temporary(&temporary);
         return Err(map_directory_io(error));
     }
-    sync_directory(&recovery)
-        .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::OutcomeIndeterminate))?;
-    let committed = read_recovery_bundle(&destination, metadata.id)
-        .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::OutcomeIndeterminate))?;
+    if sync_directory(&recovery).is_err() {
+        return Ok(CommitOutcome::Indeterminate);
+    }
+    let Ok(committed) = read_recovery_bundle(&destination, metadata.id) else {
+        return Ok(CommitOutcome::Indeterminate);
+    };
     if committed.metadata != metadata
         || committed.live.as_ref().map(|bytes| bytes.as_slice()) != artifacts.live
         || committed
@@ -397,9 +408,7 @@ fn preserve_recovery_bundle(
             .map(|bytes| bytes.as_slice())
             != artifacts.init_pending
     {
-        return Err(VaultStoreError::new(
-            VaultStoreErrorKind::OutcomeIndeterminate,
-        ));
+        return Ok(CommitOutcome::Indeterminate);
     }
     Ok(CommitOutcome::Committed)
 }

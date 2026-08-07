@@ -170,6 +170,10 @@ impl MemoryVaultStore {
         self.state().live = Some(Zeroizing::new(envelope));
     }
 
+    pub(crate) fn clear_live(&self) {
+        self.state().live = None;
+    }
+
     pub(crate) fn set_pending(&self, envelope: Vec<u8>) {
         self.state().init_pending = Some(Zeroizing::new(envelope));
     }
@@ -262,6 +266,25 @@ impl VaultTransaction for MemoryTransaction<'_> {
     fn replace_live(&mut self, envelope: &[u8]) -> Result<CommitOutcome, VaultStoreError> {
         if self.state.live.is_none() {
             return Err(VaultStoreError::new(VaultStoreErrorKind::MissingState));
+        }
+        match self.state.next_replacement.take() {
+            Some(ReplacementFault::NotCommitted) => return Ok(CommitOutcome::NotCommitted),
+            Some(ReplacementFault::IndeterminateBeforeCommit) => {
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            Some(ReplacementFault::IndeterminateAfterCommit) => {
+                self.state.live = Some(Zeroizing::new(envelope.to_vec()));
+                return Ok(CommitOutcome::Indeterminate);
+            }
+            None => {}
+        }
+        self.state.live = Some(Zeroizing::new(envelope.to_vec()));
+        Ok(CommitOutcome::Committed)
+    }
+
+    fn install_live(&mut self, envelope: &[u8]) -> Result<CommitOutcome, VaultStoreError> {
+        if self.state.live.is_some() {
+            return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
         }
         match self.state.next_replacement.take() {
             Some(ReplacementFault::NotCommitted) => return Ok(CommitOutcome::NotCommitted),

@@ -4,6 +4,7 @@ mod backup;
 mod keychain;
 mod paths;
 mod preferences;
+mod restore_source;
 mod store;
 mod zsh_config;
 
@@ -17,6 +18,7 @@ pub(crate) use backup::EncryptedBackupWriter;
 pub(crate) use keychain::MacOsKeychainProvider;
 pub(crate) use paths::{MacOsPathError, MacOsPaths};
 pub(crate) use preferences::{PreferenceError, ShellPreferenceStore, ShellPreferences};
+pub(crate) use restore_source::EncryptedRestoreSource;
 pub(crate) use store::LocalVaultStore;
 pub(crate) use terminal::{HiddenInputError, read_hidden_stdin};
 pub(crate) use zsh_config::{ShortcutDiagnostic, ZshConfigEditor, ZshConfigError, ZshDiagnostic};

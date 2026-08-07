@@ -12,6 +12,7 @@ use crate::{
     config_command::{
         ConfigJourneyOutcome, ConfigPrompter, TerminalConfigPrompter, run_config_journey,
     },
+    confirmation::TerminalTypedConfirmer,
     import_command::{ImportCommandError, ImportOptions, ImportOutcome, execute_import},
     init::{InitOutcome, Initializer},
     key_provider::InteractionPolicy,
@@ -20,6 +21,7 @@ use crate::{
         ProfileOperations, VaultInspection, VaultReadiness,
     },
     recovery::{RecoveryList, RecoveryOperationError, RecoveryOperations, RecoveryOverview},
+    restore::{RestoreOperations, RestoreReceipt},
     secret_input::{SecretInputMode, read_secret},
     set_command::execute_set,
     shell::{ShellEmitter, ZshEmitter},
@@ -28,13 +30,14 @@ use crate::{
         ACTIVE_PROFILE_NAME, ENV_PROTOCOL_NAME, MANAGED_KEYS_NAME, ManagedState, ManagedStateError,
         OperationContext, ShellTransition,
     },
+    vault_store::RecoveryBundleId,
 };
 
 #[cfg(target_os = "macos")]
 use crate::platform::macos::{
-    EncryptedBackupWriter, LocalVaultStore, MacOsKeychainProvider, MacOsPathError, MacOsPaths,
-    PreferenceError, ShellPreferenceStore, ShellPreferences, ShortcutDiagnostic, ZshConfigEditor,
-    ZshConfigError, ZshDiagnostic,
+    EncryptedBackupWriter, EncryptedRestoreSource, LocalVaultStore, MacOsKeychainProvider,
+    MacOsPathError, MacOsPaths, PreferenceError, ShellPreferenceStore, ShellPreferences,
+    ShortcutDiagnostic, ZshConfigEditor, ZshConfigError, ZshDiagnostic,
 };
 
 const HELP: &str = concat!(
@@ -50,7 +53,9 @@ Usage:
   gschrank status
   gschrank doctor
   gschrank backup <absolute-destination>
+  gschrank restore <absolute-source>
   gschrank recovery list
+  gschrank recovery restore <bundle-id>
   gschrank import dotenv <profile> [--dry-run] [--replace-existing]
   gschrank profile create <profile>
   gschrank profile rename <old> <new>
@@ -73,7 +78,8 @@ Commands:
   status     Show authenticated names-only vault and current-shell state
   doctor     Check vault and shell readiness without showing decrypted names
   backup     Create a Keychain-bound encrypted vault backup without overwriting
-  recovery   List and validate durable internal recovery bundles
+  restore    Authenticate and restore a Keychain-bound encrypted vault backup
+  recovery   List, validate, or restore durable internal recovery bundles
   import     Add a strict stdin-only dotenv document to an existing profile
   profile    Create, rename, delete, list, or inspect profiles
   set        Create or update a variable using hidden or explicit stdin input
@@ -98,7 +104,9 @@ enum Command {
     Status,
     Doctor,
     Backup(PathBuf),
+    Restore(PathBuf),
     RecoveryList,
+    RecoveryRestore(RecoveryBundleId),
     Import {
         profile: ProfileName,
         options: ImportOptions,
@@ -413,7 +421,9 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
         Ok(Command::Status) => run_status(),
         Ok(Command::Doctor) => run_doctor(),
         Ok(Command::Backup(destination)) => run_backup(destination),
+        Ok(Command::Restore(source)) => run_restore(source),
         Ok(Command::RecoveryList) => run_recovery_list(),
+        Ok(Command::RecoveryRestore(bundle_id)) => run_recovery_restore(bundle_id),
         Ok(Command::Import { profile, options }) => run_import(&profile, options),
         Ok(Command::Profile(command)) => run_profile(command),
         Ok(Command::Set {
@@ -450,7 +460,14 @@ fn parse(arguments: &[OsString]) -> Result<Command, ParseError> {
         [backup, destination] if backup == "backup" => {
             Ok(Command::Backup(PathBuf::from(destination)))
         }
+        [restore, source] if restore == "restore" => Ok(Command::Restore(PathBuf::from(source))),
         [recovery, list] if recovery == "recovery" && list == "list" => Ok(Command::RecoveryList),
+        [recovery, restore, bundle_id] if recovery == "recovery" && restore == "restore" => {
+            let bundle_id = bundle_id.to_str().ok_or(ParseError::InvalidGrammar)?;
+            Ok(Command::RecoveryRestore(
+                RecoveryBundleId::from_hex(bundle_id).ok_or(ParseError::InvalidGrammar)?,
+            ))
+        }
         [import, dotenv, arguments @ ..] if import == "import" && dotenv == "dotenv" => {
             parse_import(arguments)
         }
@@ -894,6 +911,82 @@ fn render_backup_success(receipt: BackupReceipt) -> String {
         "Created an encrypted vault backup at revision {}.\n",
         receipt.revision
     )
+}
+
+#[cfg(target_os = "macos")]
+fn run_restore(source: PathBuf) -> ExitCode {
+    let envelope = match EncryptedRestoreSource::new(source).read() {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let paths = match MacOsPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(13);
+        }
+    };
+    let keys = MacOsKeychainProvider::new();
+    let store = LocalVaultStore::new(paths.data_directory().to_owned());
+    let mut confirmer = TerminalTypedConfirmer;
+    match RestoreOperations::new(&keys, &store).restore_external(
+        &envelope,
+        interaction_policy(),
+        &mut confirmer,
+    ) {
+        Ok(receipt) => {
+            print!("{}", render_restore_success(receipt));
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_recovery_restore(bundle_id: RecoveryBundleId) -> ExitCode {
+    let paths = match MacOsPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(13);
+        }
+    };
+    let keys = MacOsKeychainProvider::new();
+    let store = LocalVaultStore::new(paths.data_directory().to_owned());
+    let mut confirmer = TerminalTypedConfirmer;
+    match RestoreOperations::new(&keys, &store).restore_bundle(
+        bundle_id,
+        interaction_policy(),
+        &mut confirmer,
+    ) {
+        Ok(receipt) => {
+            print!("{}", render_restore_success(receipt));
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
+fn render_restore_success(receipt: RestoreReceipt) -> String {
+    let mut output = format!(
+        "Restored the authenticated encrypted vault at revision {}.\n",
+        receipt.revision
+    );
+    if let Some(bundle_id) = receipt.displaced_to {
+        output.push_str("Previous live ciphertext retained as recovery bundle ");
+        output.push_str(&bundle_id.to_hex());
+        output.push_str(".\n");
+    }
+    output
 }
 
 #[cfg(target_os = "macos")]
@@ -2078,6 +2171,18 @@ fn run_recovery_list() -> ExitCode {
 }
 
 #[cfg(not(target_os = "macos"))]
+fn run_restore(_source: PathBuf) -> ExitCode {
+    eprintln!("gschrank: this build does not support vault restore on this platform");
+    ExitCode::from(1)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_recovery_restore(_bundle_id: RecoveryBundleId) -> ExitCode {
+    eprintln!("gschrank: this build does not support vault recovery on this platform");
+    ExitCode::from(1)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn run_backup(_destination: PathBuf) -> ExitCode {
     eprintln!("gschrank: this build does not support encrypted backups on this platform");
     ExitCode::from(1)
@@ -2220,13 +2325,25 @@ mod tests {
     }
 
     #[test]
-    fn parses_only_the_exact_recovery_list_grammar() {
+    fn parses_only_the_exact_restore_and_recovery_grammar() {
+        let bundle_id = "01010101010101010101010101010101";
+        assert!(matches!(
+            parse(&["restore".into(), "/tmp/vault.backup".into()]),
+            Ok(Command::Restore(_))
+        ));
         assert!(matches!(
             parse(&["recovery".into(), "list".into()]),
             Ok(Command::RecoveryList)
         ));
+        assert!(matches!(
+            parse(&["recovery".into(), "restore".into(), bundle_id.into()]),
+            Ok(Command::RecoveryRestore(_))
+        ));
+        assert!(parse(&["restore".into()]).is_err());
+        assert!(parse(&["restore".into(), "/tmp/a".into(), "extra".into()]).is_err());
         assert!(parse(&["recovery".into()]).is_err());
         assert!(parse(&["recovery".into(), "list".into(), "extra".into()]).is_err());
+        assert!(parse(&["recovery".into(), "restore".into(), "invalid-id".into()]).is_err());
     }
 
     #[test]
@@ -2340,6 +2457,19 @@ mod tests {
         assert!(!output.contains("CANARY"));
         assert!(!output.contains("key"));
         assert!(!output.contains("value"));
+    }
+
+    #[test]
+    fn restore_success_reports_only_revision_and_recovery_identifier() {
+        let output = render_restore_success(RestoreReceipt {
+            revision: 7,
+            displaced_to: Some(RecoveryBundleId::from_bytes([0x0a; 16])),
+        });
+        assert!(output.contains("revision 7"));
+        assert!(output.contains("0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"));
+        assert!(!output.contains("profile"));
+        assert!(!output.contains("TOKEN"));
+        assert!(!output.contains("CANARY"));
     }
 
     #[test]

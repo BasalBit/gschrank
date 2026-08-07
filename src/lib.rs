@@ -10,6 +10,7 @@
 mod cli;
 mod codec;
 mod config_command;
+mod confirmation;
 mod domain;
 mod dotenv;
 mod envelope;
@@ -18,6 +19,7 @@ mod init;
 mod key_provider;
 mod profiles;
 mod recovery;
+mod restore;
 mod secret_input;
 mod set_command;
 mod shell;
