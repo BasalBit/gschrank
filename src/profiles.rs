@@ -4,6 +4,7 @@ use std::{error::Error, fmt};
 
 use zeroize::Zeroizing;
 
+use crate::profile_rename::VaultRenameObservation;
 use crate::{
     DomainError, EnvelopeError, EnvironmentName, KeyId, MasterKey, Mutation, ProfileName,
     SecretValue, Vault, VaultId,
@@ -357,7 +358,7 @@ where
         old: &ProfileName,
         new: &ProfileName,
         interaction: InteractionPolicy,
-    ) -> Result<(), ProfileOperationError> {
+    ) -> Result<VaultRenameObservation, ProfileOperationError> {
         self.store.shared_read(|read| {
             let (opened, _key) = self.open_current(read, interaction)?;
             if !opened.vault.contains_profile(old) {
@@ -366,7 +367,27 @@ where
             if opened.vault.contains_profile(new) {
                 return Err(DomainError::ProfileAlreadyExists.into());
             }
-            Ok(())
+            Ok(VaultRenameObservation {
+                vault_id: opened.vault_id,
+                old_exists: true,
+                new_exists: false,
+            })
+        })
+    }
+
+    pub(crate) fn inspect_rename_state(
+        &self,
+        old: &ProfileName,
+        new: &ProfileName,
+        interaction: InteractionPolicy,
+    ) -> Result<VaultRenameObservation, ProfileOperationError> {
+        self.store.shared_read(|read| {
+            let (opened, _key) = self.open_current(read, interaction)?;
+            Ok(VaultRenameObservation {
+                vault_id: opened.vault_id,
+                old_exists: opened.vault.contains_profile(old),
+                new_exists: opened.vault.contains_profile(new),
+            })
         })
     }
 

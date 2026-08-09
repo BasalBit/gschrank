@@ -4,6 +4,7 @@ mod backup;
 mod keychain;
 mod paths;
 mod preferences;
+mod profile_rename;
 mod restore_source;
 mod store;
 mod zsh_config;
@@ -18,6 +19,9 @@ pub(crate) use backup::EncryptedBackupWriter;
 pub(crate) use keychain::MacOsKeychainProvider;
 pub(crate) use paths::{MacOsPathError, MacOsPaths};
 pub(crate) use preferences::{PreferenceError, ShellPreferenceStore, ShellPreferences};
+pub(crate) use profile_rename::{
+    ApplicationOperationLock, OperationLockMode, ProfileRenameStoreError,
+};
 pub(crate) use restore_source::EncryptedRestoreSource;
 pub(crate) use store::LocalVaultStore;
 pub(crate) use system::suppress_core_dumps;

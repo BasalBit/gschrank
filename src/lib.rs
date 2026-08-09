@@ -18,6 +18,7 @@ mod import_command;
 mod init;
 mod key_provider;
 mod process_security;
+mod profile_rename;
 mod profiles;
 mod purge;
 mod rebuild;

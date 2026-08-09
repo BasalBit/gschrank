@@ -74,13 +74,9 @@ impl ZshEmitter {
         }
         source.extend_from_slice(MANAGED_BLOCK_WRAPPER_INIT.as_bytes());
         match configuration.profile() {
-            Some(profile) => {
-                source.extend_from_slice(b"  if ! gschrank load --startup -- '");
-                source.extend_from_slice(profile.as_str().as_bytes());
-                source.extend_from_slice(
-                    b"'; then\n    __gschrank_clear_inherited_v1 || :\n    builtin print -ru2 -- 'gschrank: startup profile failed; inherited profile cleanup attempted'\n  fi\n",
-                );
-            }
+            Some(_) => source.extend_from_slice(
+                b"  if ! gschrank load --startup; then\n    __gschrank_clear_inherited_v1 || :\n    builtin print -ru2 -- 'gschrank: startup profile failed; inherited profile cleanup attempted'\n  fi\n",
+            ),
             None => source.extend_from_slice(
                 b"  if ! __gschrank_clear_inherited_v1; then\n    builtin print -ru2 -- 'gschrank: inherited profile cleanup was incomplete; close the parent shell or unload manually'\n  fi\n",
             ),
@@ -311,17 +307,23 @@ const WRAPPER_PREFIX: &str = r#"function __gschrank_dispatch_v1 {
   fi
   case "$1" in
     load)
-      if (( $# == 2 )); then
+      if (( $# == 2 )) && [[ "$2" == --startup ]]; then
+        GSCHRANK_SHELL_CONTEXT_V1=startup
+      elif (( $# == 2 )); then
         GSCHRANK_SHELL_CONTEXT_V1=explicit
         GSCHRANK_SHELL_PROFILE_V1="$2"
-      elif (( $# == 4 )) && [[ "$2" == --startup && "$3" == -- ]]; then
-        GSCHRANK_SHELL_CONTEXT_V1=startup
-        GSCHRANK_SHELL_PROFILE_V1="$4"
       else
         builtin command gschrank "$@"
         return $?
       fi
-      if GSCHRANK_SHELL_PAYLOAD_V1="$(builtin command gschrank __emit-zsh 1 "$GSCHRANK_SHELL_CONTEXT_V1" load -- "$GSCHRANK_SHELL_PROFILE_V1")"; then
+      if [[ "$GSCHRANK_SHELL_CONTEXT_V1" == startup ]]; then
+        GSCHRANK_SHELL_PAYLOAD_V1="$(builtin command gschrank __emit-zsh 1 startup startup-load)"
+        GSCHRANK_SHELL_RC_V1=$?
+      else
+        GSCHRANK_SHELL_PAYLOAD_V1="$(builtin command gschrank __emit-zsh 1 explicit load -- "$GSCHRANK_SHELL_PROFILE_V1")"
+        GSCHRANK_SHELL_RC_V1=$?
+      fi
+      if (( GSCHRANK_SHELL_RC_V1 == 0 )); then
         if builtin eval -- "$GSCHRANK_SHELL_PAYLOAD_V1"; then
           builtin unset GSCHRANK_SHELL_PAYLOAD_V1
           return 0
@@ -334,7 +336,6 @@ const WRAPPER_PREFIX: &str = r#"function __gschrank_dispatch_v1 {
           return "$GSCHRANK_SHELL_RC_V1"
         fi
       else
-        GSCHRANK_SHELL_RC_V1=$?
         builtin unset GSCHRANK_SHELL_PAYLOAD_V1
         return "$GSCHRANK_SHELL_RC_V1"
       fi
@@ -1128,6 +1129,12 @@ mod tests {
             assert!(block.source().starts_with(ZSH_MANAGED_BLOCK_START));
             assert!(block.source().ends_with(b"<<<\n"));
             assert!(!block.source().windows(9).any(|bytes| bytes == b"API_TOKEN"));
+            assert!(
+                !block
+                    .source()
+                    .windows(16)
+                    .any(|bytes| bytes == b"load --startup --")
+            );
             let output = check_zsh_syntax(block.source());
             assert!(output.status.success(), "managed block is invalid Zsh");
             assert!(output.stdout.is_empty());
