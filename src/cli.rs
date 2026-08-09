@@ -108,7 +108,7 @@ Commands:
   reload     Reload the active profile through the current-shell wrapper
   unload     Clear the active profile through the current-shell wrapper
 
-Only macOS and Zsh are supported in this development milestone. Current-shell
+Only macOS and Zsh are supported in v1. Current-shell
 commands require the managed Zsh function; the executable cannot mutate its
 parent shell."
 );
@@ -2713,7 +2713,7 @@ fn run_shell_parent(command: ShellParentCommand) -> ExitCode {
     eprintln!(
         "gschrank: '{operation}' must run through the managed Zsh function to change the current shell; install or refresh shell integration first"
     );
-    ExitCode::from(16)
+    ExitCode::from(1)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -3085,6 +3085,15 @@ mod tests {
         };
         assert!(write_shell_source(&mut writer, source).is_err());
         assert_eq!(writer.written, source.len());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn direct_current_shell_commands_use_a_public_runtime_exit_status() {
+        assert_eq!(
+            run_shell_parent(ShellParentCommand::Reload),
+            ExitCode::from(1)
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
