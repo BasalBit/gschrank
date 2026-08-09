@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS / Rust 1.89
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - name: Install Rust 1.89
+        run: rustup toolchain install 1.89.0 --profile minimal --component clippy,rustfmt
+      - name: Test
+        run: cargo +1.89.0 test --locked
+      - name: Lint
+        run: cargo +1.89.0 clippy --locked --all-targets --all-features -- -D warnings
+      - name: Check formatting
+        run: cargo +1.89.0 fmt --all -- --check
+      - name: Build release binary
+        run: cargo +1.89.0 build --locked --release
+
+  linux:
+    name: Linux portability / Rust 1.89
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - name: Install Rust 1.89
+        run: rustup toolchain install 1.89.0 --profile minimal --component clippy,rustfmt
+      - name: Compile complete target
+        run: cargo +1.89.0 check --locked --all-targets --all-features
+      - name: Test portable modules
+        run: "cargo +1.89.0 test --locked --lib -- --skip shell::zsh::tests::"
+      - name: Lint complete target
+        run: cargo +1.89.0 clippy --locked --all-targets --all-features -- -D warnings
+      - name: Check formatting
+        run: cargo +1.89.0 fmt --all -- --check
+
+  dependencies:
+    name: Dependency policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - name: Audit RustSec advisories
+        uses: EmbarkStudios/cargo-deny-action@6f99e342a8f0f8f8d1bdc9dc43e9a6f2dd611259 # v2.1.0
+        with:
+          command: check
+          arguments: --locked --all-features
+          command-arguments: advisories
+      - name: Check licenses, sources, and duplicate versions
+        uses: EmbarkStudios/cargo-deny-action@6f99e342a8f0f8f8d1bdc9dc43e9a6f2dd611259 # v2.1.0
+        with:
+          command: check
+          arguments: --locked --all-features
+          command-arguments: bans licenses sources
