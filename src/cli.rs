@@ -2702,6 +2702,7 @@ fn render_startup_success(success: &StartupSuccess) -> String {
     output
 }
 
+#[cfg(target_os = "macos")]
 fn run_shell_parent(command: ShellParentCommand) -> ExitCode {
     let operation = match command {
         ShellParentCommand::Load(_profile) => "load",
@@ -2715,6 +2716,13 @@ fn run_shell_parent(command: ShellParentCommand) -> ExitCode {
     ExitCode::from(16)
 }
 
+#[cfg(not(target_os = "macos"))]
+fn run_shell_parent(_command: ShellParentCommand) -> ExitCode {
+    eprintln!("gschrank: this build does not support current-shell integration on this platform");
+    ExitCode::from(1)
+}
+
+#[cfg(target_os = "macos")]
 fn run_shell_init(shortcut: bool) -> ExitCode {
     let source = ZshEmitter::new().emit_wrapper(shortcut);
     let mut stdout = std::io::stdout().lock();
@@ -2729,9 +2737,22 @@ fn run_shell_init(shortcut: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+#[cfg(not(target_os = "macos"))]
+fn run_shell_init(_shortcut: bool) -> ExitCode {
+    eprintln!("gschrank: this build does not support Zsh wrapper initialization on this platform");
+    ExitCode::from(1)
+}
+
+#[cfg(target_os = "macos")]
 fn run_shell_handshake() -> ExitCode {
     println!("{}", crate::shell::ZSH_WRAPPER_HANDSHAKE);
     ExitCode::SUCCESS
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_shell_handshake() -> ExitCode {
+    eprintln!("gschrank: this build does not support the Zsh wrapper protocol on this platform");
+    ExitCode::from(1)
 }
 
 #[cfg(target_os = "macos")]
@@ -3019,6 +3040,17 @@ fn run_startup(_command: StartupCommand) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn unsupported_platform_never_exposes_a_partial_zsh_adapter() {
+        assert_eq!(run_shell_init(false), ExitCode::from(1));
+        assert_eq!(run_shell_handshake(), ExitCode::from(1));
+        assert_eq!(
+            run_shell_parent(ShellParentCommand::Reload),
+            ExitCode::from(1)
+        );
+    }
 
     #[test]
     fn parses_only_the_available_exact_grammar() {
