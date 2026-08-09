@@ -8,7 +8,7 @@ use security_framework::{
     item::{
         ItemAddOptions, ItemAddValue, ItemClass, ItemSearchOptions, Limit, Location, SearchResult,
     },
-    os::macos::keychain::{KeychainUserInteractionLock, SecKeychain},
+    os::macos::keychain::{KeychainUserInteractionLock, SecKeychain, SecPreferencesDomain},
 };
 use security_framework_sys::base::{
     errSecAuthFailed as ERR_SEC_AUTH_FAILED, errSecDuplicateItem as ERR_SEC_DUPLICATE_ITEM,
@@ -67,9 +67,18 @@ impl MacOsKeychainProvider {
         }
     }
 
-    fn search(key_id: &KeyId, load_data: bool) -> Result<Vec<SearchResult>, NativeError> {
+    fn user_file_keychain() -> Result<SecKeychain, NativeError> {
+        SecKeychain::default_for_domain(SecPreferencesDomain::User)
+    }
+
+    fn search(
+        keychain: &SecKeychain,
+        key_id: &KeyId,
+        load_data: bool,
+    ) -> Result<Vec<SearchResult>, NativeError> {
         let mut options = ItemSearchOptions::new();
         options
+            .keychains(std::slice::from_ref(keychain))
             .class(ItemClass::generic_password())
             .service(SERVICE)
             .account(&key_id.to_hex())
@@ -123,8 +132,11 @@ impl KeyProvider for MacOsKeychainProvider {
         key_id: &KeyId,
         interaction: InteractionPolicy,
     ) -> Result<MasterKey, KeyProviderError> {
-        Self::with_interaction(interaction, || Self::search(key_id, true))
-            .and_then(Self::decode_loaded_key)
+        Self::with_interaction(interaction, || {
+            let keychain = Self::user_file_keychain()?;
+            Self::search(&keychain, key_id, true)
+        })
+        .and_then(Self::decode_loaded_key)
     }
 
     fn store_new(
@@ -134,13 +146,14 @@ impl KeyProvider for MacOsKeychainProvider {
         interaction: InteractionPolicy,
     ) -> Result<(), KeyProviderError> {
         Self::with_interaction(interaction, || {
+            let keychain = Self::user_file_keychain()?;
             let data = CFData::from_buffer(key.expose());
             let mut options = ItemAddOptions::new(ItemAddValue::Data {
                 class: ItemClass::generic_password(),
                 data,
             });
             options
-                .set_location(Location::DefaultFileKeychain)
+                .set_location(Location::FileKeychain(keychain))
                 .set_service(SERVICE)
                 .set_account_name(key_id.to_hex())
                 .set_label("Gschrank vault key");
@@ -154,8 +167,10 @@ impl KeyProvider for MacOsKeychainProvider {
         interaction: InteractionPolicy,
     ) -> Result<(), KeyProviderError> {
         Self::with_interaction(interaction, || {
+            let keychain = Self::user_file_keychain()?;
             let mut options = ItemSearchOptions::new();
             options
+                .keychains(std::slice::from_ref(&keychain))
                 .class(ItemClass::generic_password())
                 .service(SERVICE)
                 .account(&key_id.to_hex())
@@ -169,6 +184,22 @@ impl KeyProvider for MacOsKeychainProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestItemCleanup<'a> {
+        provider: &'a MacOsKeychainProvider,
+        key_id: KeyId,
+        armed: bool,
+    }
+
+    impl Drop for TestItemCleanup<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = self
+                    .provider
+                    .delete(&self.key_id, InteractionPolicy::AllowPrompt);
+            }
+        }
+    }
 
     #[test]
     fn maps_native_errors_without_native_messages() {
@@ -213,5 +244,34 @@ mod tests {
             panic!("long key material must be rejected");
         };
         assert_eq!(long.kind(), KeyProviderErrorKind::InvalidKeyMaterial);
+    }
+
+    #[test]
+    #[ignore = "mutates the current user's default file Keychain"]
+    fn round_trips_an_item_in_the_user_default_file_keychain() {
+        let provider = MacOsKeychainProvider::new();
+        let key_id = KeyId::generate().unwrap();
+        let key = MasterKey::generate().unwrap();
+
+        provider
+            .store_new(&key_id, &key, InteractionPolicy::AllowPrompt)
+            .unwrap();
+        let mut cleanup = TestItemCleanup {
+            provider: &provider,
+            key_id,
+            armed: true,
+        };
+        let loaded = provider.load(&key_id, InteractionPolicy::AllowPrompt);
+        let deleted = provider.delete(&key_id, InteractionPolicy::AllowPrompt);
+
+        if deleted.is_ok() {
+            cleanup.armed = false;
+        }
+        deleted.unwrap();
+        assert_eq!(loaded.unwrap().expose(), key.expose());
+        assert!(matches!(
+            provider.load(&key_id, InteractionPolicy::FailFast),
+            Err(error) if error.kind() == KeyProviderErrorKind::NotFound
+        ));
     }
 }

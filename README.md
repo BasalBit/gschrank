@@ -21,6 +21,8 @@ concurrent changes, and compiled `.zshrc.zwc` shadowing; it preserves file mode,
 keeps a first-change backup, and replaces through a synced same-directory file.
 The versioned Zsh wrapper and private apply protocol support transactional
 profile replacement, reload, and unload with inherited names-only metadata.
+`gschrank shell uninstall` removes only managed persistent and current-shell
+integration while retaining encrypted state, Keychain items, and backups.
 Profile rename follows the configured startup reference, and deletion refuses
 the startup profile until another profile is selected or automatic loading is
 turned off.

@@ -74,6 +74,7 @@ Usage:
   gschrank remove <profile> <variable>
   gschrank startup set <profile>
   gschrank startup off
+  gschrank shell uninstall
   gschrank load <profile>
   gschrank reload
   gschrank unload
@@ -96,6 +97,7 @@ Commands:
   set        Create or update a variable using hidden or explicit stdin input
   remove     Remove a variable from a profile
   startup    Select a profile for new Zsh shells, or turn automatic loading off
+  shell      Manage the installed current-shell integration
   load       Load a profile through the installed current-shell wrapper
   reload     Reload the active profile through the current-shell wrapper
   unload     Clear the active profile through the current-shell wrapper
@@ -121,6 +123,9 @@ enum Command {
         shell_wrapper: bool,
     },
     Purge {
+        shell_wrapper: bool,
+    },
+    ShellUninstall {
         shell_wrapper: bool,
     },
     RecoveryList,
@@ -448,6 +453,7 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
         Ok(Command::Rebuild) => run_rebuild(),
         Ok(Command::Reset { shell_wrapper }) => run_reset(shell_wrapper),
         Ok(Command::Purge { shell_wrapper }) => run_full_purge(shell_wrapper),
+        Ok(Command::ShellUninstall { shell_wrapper }) => run_shell_uninstall(shell_wrapper),
         Ok(Command::RecoveryList) => run_recovery_list(),
         Ok(Command::RecoveryRestore(bundle_id)) => run_recovery_restore(bundle_id),
         Ok(Command::RecoveryPurge(bundle_id)) => run_recovery_purge(bundle_id),
@@ -549,6 +555,11 @@ fn parse(arguments: &[OsString]) -> Result<Command, ParseError> {
         [startup, off] if startup == "startup" && off == "off" => {
             Ok(Command::Startup(StartupCommand::Off))
         }
+        [shell, uninstall] if shell == "shell" && uninstall == "uninstall" => {
+            Ok(Command::ShellUninstall {
+                shell_wrapper: false,
+            })
+        }
         [load, profile] if load == "load" => Ok(Command::ShellParent(ShellParentCommand::Load(
             parse_profile_name(profile)?,
         ))),
@@ -595,6 +606,9 @@ fn parse_private(arguments: &[OsString]) -> Result<Command, ParseError> {
             shell_wrapper: true,
         }),
         [purge] if purge == "__purge-from-zsh" => Ok(Command::Purge {
+            shell_wrapper: true,
+        }),
+        [uninstall] if uninstall == "__shell-uninstall-from-zsh" => Ok(Command::ShellUninstall {
             shell_wrapper: true,
         }),
         [shell_init, shell, protocol]
@@ -1173,6 +1187,37 @@ fn render_reset_success(receipt: ResetReceipt, shell_wrapper: bool) -> String {
         );
     }
     output
+}
+
+#[cfg(target_os = "macos")]
+fn run_shell_uninstall(shell_wrapper: bool) -> ExitCode {
+    let paths = match MacOsPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("gschrank: {error}");
+            return ExitCode::from(13);
+        }
+    };
+    let result = resolve_zsh_config(&paths, None)
+        .and_then(|resolved| remove_persistent_shell_integration(&resolved));
+    match result {
+        Ok(()) => {
+            print!("{}", render_shell_uninstall_success(shell_wrapper));
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("gschrank: {error}; persistent shell integration may require inspection");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
+fn render_shell_uninstall_success(shell_wrapper: bool) -> &'static str {
+    if shell_wrapper {
+        "Removed persistent Zsh integration. The executable, encrypted vault, recovery bundles, Keychain items, and startup-file backup were retained.\n"
+    } else {
+        "Removed persistent Zsh integration. The executable, encrypted vault, recovery bundles, Keychain items, and startup-file backup were retained.\nThe current shell was not changed; run 'gschrank unload' through its still-loaded managed function or close this shell.\n"
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2574,6 +2619,12 @@ fn run_full_purge(_shell_wrapper: bool) -> ExitCode {
 }
 
 #[cfg(not(target_os = "macos"))]
+fn run_shell_uninstall(_shell_wrapper: bool) -> ExitCode {
+    eprintln!("gschrank: this build does not support Zsh integration removal on this platform");
+    ExitCode::from(1)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn run_recovery_restore(_bundle_id: RecoveryBundleId) -> ExitCode {
     eprintln!("gschrank: this build does not support vault recovery on this platform");
     ExitCode::from(1)
@@ -2790,6 +2841,34 @@ mod tests {
         assert!(parse(&["purge".into(), "--force".into()]).is_err());
         assert!(parse(&["__purge-from-zsh".into(), "extra".into()]).is_err());
         assert!(!HELP.contains("__purge-from-zsh"));
+    }
+
+    #[test]
+    fn parses_only_the_exact_public_and_private_shell_uninstall_grammar() {
+        assert!(matches!(
+            parse(&["shell".into(), "uninstall".into()]),
+            Ok(Command::ShellUninstall {
+                shell_wrapper: false
+            })
+        ));
+        assert!(matches!(
+            parse(&["__shell-uninstall-from-zsh".into()]),
+            Ok(Command::ShellUninstall {
+                shell_wrapper: true
+            })
+        ));
+        assert!(parse(&["shell".into()]).is_err());
+        assert!(parse(&["shell".into(), "uninstall".into(), "extra".into()]).is_err());
+        assert!(parse(&["__shell-uninstall-from-zsh".into(), "extra".into()]).is_err());
+        assert!(!HELP.contains("__shell-uninstall-from-zsh"));
+    }
+
+    #[test]
+    fn shell_uninstall_output_distinguishes_wrapper_cleanup() {
+        let direct = render_shell_uninstall_success(false);
+        assert!(direct.contains("current shell was not changed"));
+        assert!(direct.contains("encrypted vault"));
+        assert!(!render_shell_uninstall_success(true).contains("current shell was not changed"));
     }
 
     #[test]
@@ -3247,7 +3326,7 @@ mod tests {
         }
 
         #[test]
-        fn full_purge_preparation_removes_managed_integration_and_saved_preferences() {
+        fn shell_uninstall_removes_managed_integration_and_saved_preferences_idempotently() {
             let test = TestDirectory::new();
             let editor = test.editor();
             let profile = ProfileName::new("work").unwrap();

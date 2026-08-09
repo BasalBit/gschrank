@@ -443,6 +443,40 @@ const WRAPPER_PREFIX: &str = r#"function __gschrank_dispatch_v1 {
         return "$GSCHRANK_SHELL_RC_V1"
       fi
       ;;
+    shell)
+      if (( $# != 2 )) || [[ "$2" != uninstall ]]; then
+        builtin command gschrank "$@"
+        return $?
+      fi
+      if GSCHRANK_SHELL_PAYLOAD_V1="$(builtin command gschrank __emit-zsh 1 explicit unload)"; then
+        if GSCHRANK_SHELL_COMMAND_OUTPUT_V1="$(builtin command gschrank __shell-uninstall-from-zsh)"; then
+          if builtin eval -- "$GSCHRANK_SHELL_PAYLOAD_V1"; then
+            builtin print -r -- "$GSCHRANK_SHELL_COMMAND_OUTPUT_V1"
+            builtin unset GSCHRANK_SHELL_PAYLOAD_V1 GSCHRANK_SHELL_COMMAND_OUTPUT_V1
+            if __gschrank_remove_integration_v1; then
+              return 0
+            else
+              GSCHRANK_SHELL_RC_V1=$?
+              builtin print -ru2 -- 'gschrank: persistent integration was removed but current-shell cleanup was incomplete; close this shell'
+              return "$GSCHRANK_SHELL_RC_V1"
+            fi
+          else
+            GSCHRANK_SHELL_RC_V1=$?
+            builtin unset GSCHRANK_SHELL_PAYLOAD_V1 GSCHRANK_SHELL_COMMAND_OUTPUT_V1
+            builtin print -ru2 -- 'gschrank: persistent integration was removed but this shell could not be unloaded; close it before running commands'
+            return "$GSCHRANK_SHELL_RC_V1"
+          fi
+        else
+          GSCHRANK_SHELL_RC_V1=$?
+          builtin unset GSCHRANK_SHELL_PAYLOAD_V1 GSCHRANK_SHELL_COMMAND_OUTPUT_V1
+          return "$GSCHRANK_SHELL_RC_V1"
+        fi
+      else
+        GSCHRANK_SHELL_RC_V1=$?
+        builtin unset GSCHRANK_SHELL_PAYLOAD_V1
+        return "$GSCHRANK_SHELL_RC_V1"
+      fi
+      ;;
     profile)
       if (( $# == 3 )) && [[ "$2" == delete && ${GSCHRANK_ACTIVE_PROFILE-} == "$3" ]]; then
         if GSCHRANK_SHELL_PAYLOAD_V1="$(builtin command gschrank __emit-zsh 1 explicit unload)"; then
@@ -528,7 +562,7 @@ function __gschrank_complete_v1 {
   builtin emulate -L zsh
   builtin unsetopt XTRACE VERBOSE
   if (( CURRENT == 2 )); then
-    builtin compadd -Q -- config init status doctor backup restore rebuild reset purge recovery import profile set remove startup load reload unload --help --version
+    builtin compadd -Q -- config init status doctor backup restore rebuild reset purge recovery import profile set remove startup shell load reload unload --help --version
     return
   fi
   case "${words[2]-}" in
@@ -576,6 +610,11 @@ function __gschrank_complete_v1 {
         builtin compadd -Q -- set off
       elif (( CURRENT == 4 )) && [[ "${words[3]-}" == set ]]; then
         __gschrank_complete_profiles_v1
+      fi
+      ;;
+    shell)
+      if (( CURRENT == 3 )); then
+        builtin compadd -Q -- uninstall
       fi
       ;;
     load)
@@ -1390,6 +1429,50 @@ mod tests {
 
         assert_eq!(output.status.code(), Some(14));
         assert_eq!(output.stdout, b"CANARY-purge-preserved\n");
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn shell_uninstall_removes_persistent_and_current_shell_integration() {
+        let fake = TestDirectory::with_fake_gschrank(
+            "#!/bin/zsh -f\nif [[ \"$1\" == __emit-zsh ]]; then\n  builtin print -rn -- 'builtin unset -- ACTIVE_VALUE GSCHRANK_ENV_PROTOCOL GSCHRANK_ACTIVE_PROFILE GSCHRANK_MANAGED_KEYS;'\n  exit 0\nfi\nif [[ \"$1\" == __shell-uninstall-from-zsh ]]; then\n  builtin print -r -- 'Removed persistent Zsh integration.'\n  exit 0\nfi\nexit 99\n",
+        );
+        let wrapper = ZshEmitter::new().emit_wrapper(true);
+        let output = run_zsh_parts_with_path(
+            b"autoload -Uz compinit\ncompinit -D\nbuiltin export ACTIVE_VALUE=CANARY-uninstall-active GSCHRANK_ENV_PROTOCOL=1 GSCHRANK_ACTIVE_PROFILE=work GSCHRANK_MANAGED_KEYS=ACTIVE_VALUE\n",
+            wrapper.as_bytes(),
+            b"gschrank shell uninstall\nGSCHRANK_TEST_RC=$?\nif builtin command /usr/bin/printenv ACTIVE_VALUE >/dev/null; then exit 96; fi\nfor GSCHRANK_TEST_FUNCTION in gschrank gsch __gschrank_dispatch_v1 __gschrank_complete_v1 __gschrank_register_completion_v1 __gschrank_remove_integration_v1; do\n  if (( ${+functions[$GSCHRANK_TEST_FUNCTION]} )); then exit 95; fi\ndone\nif [[ -n ${_comps[gschrank]-} || -n ${_comps[gsch]-} ]]; then exit 94; fi\nexit $GSCHRANK_TEST_RC\n",
+            Some(fake.path()),
+        );
+
+        assert!(
+            output.status.success(),
+            "shell-uninstall wrapper fixture failed"
+        );
+        assert_eq!(output.stdout, b"Removed persistent Zsh integration.\n");
+        assert!(
+            !output
+                .stderr
+                .windows(b"CANARY-uninstall-active".len())
+                .any(|window| window == b"CANARY-uninstall-active")
+        );
+    }
+
+    #[test]
+    fn failed_shell_uninstall_preserves_the_invoking_shell_integration() {
+        let fake = TestDirectory::with_fake_gschrank(
+            "#!/bin/zsh -f\nif [[ \"$1\" == __emit-zsh ]]; then\n  builtin print -rn -- 'builtin unset -- ACTIVE_VALUE GSCHRANK_ENV_PROTOCOL GSCHRANK_ACTIVE_PROFILE GSCHRANK_MANAGED_KEYS;'\n  exit 0\nfi\nif [[ \"$1\" == __shell-uninstall-from-zsh ]]; then\n  exit 14\nfi\nexit 99\n",
+        );
+        let wrapper = ZshEmitter::new().emit_wrapper(true);
+        let output = run_zsh_parts_with_path(
+            b"autoload -Uz compinit\ncompinit -D\nbuiltin export ACTIVE_VALUE=CANARY-uninstall-preserved GSCHRANK_ENV_PROTOCOL=1 GSCHRANK_ACTIVE_PROFILE=work GSCHRANK_MANAGED_KEYS=ACTIVE_VALUE\n",
+            wrapper.as_bytes(),
+            b"gschrank shell uninstall\nGSCHRANK_TEST_RC=$?\nbuiltin command /usr/bin/printenv ACTIVE_VALUE\n(( ${+functions[gschrank]} )) || exit 93\n(( ${+functions[gsch]} )) || exit 94\n[[ ${_comps[gschrank]-} == __gschrank_complete_v1 ]] || exit 95\n[[ ${_comps[gsch]-} == __gschrank_complete_v1 ]] || exit 96\nexit $GSCHRANK_TEST_RC\n",
+            Some(fake.path()),
+        );
+
+        assert_eq!(output.status.code(), Some(14));
+        assert_eq!(output.stdout, b"CANARY-uninstall-preserved\n");
         assert!(output.stderr.is_empty());
     }
 }

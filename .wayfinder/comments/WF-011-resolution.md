@@ -2,11 +2,15 @@
 
 Resolved with Eraldo on 2026-08-05.
 
-V1 uses the current user's file-based login Keychain. It stores the vault
+V1 uses the current user's default file-based Keychain, normally the login
+Keychain. It stores the vault
 master key as a non-synchronizing generic-password item and implements native
 access through the `security-framework` crate behind an application-owned
 `MacOsKeychainProvider` adapter. The adapter must use exact queries and
-create-only insertion rather than an upserting convenience API. The dependency
+create-only insertion rather than an upserting convenience API. Every create,
+load, and delete operation resolves the user-domain default Keychain and pins
+its exact native handle for the complete operation rather than relying on the
+implicit Keychain search list. The dependency
 version and its maintenance/security posture must be reviewed before release.
 
 The permanent item identity is:
@@ -50,4 +54,3 @@ deliberate fail-closed exception to ordinary transactional switching: the new
 shell clears inherited Gschrank-managed variables and metadata, then emits a
 non-secret warning. Explicit load, reload, and switch failures preserve the
 current profile.
-

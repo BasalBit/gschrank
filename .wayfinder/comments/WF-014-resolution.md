@@ -110,6 +110,12 @@ vault, and Keychain key in place. Package-manager removal of the executable and
 destructive vault purge remain separate operations. Gschrank never removes an
 unrelated command that occupies `gsch`.
 
+The public operation is `gschrank shell uninstall`. It is idempotent and does
+not require destructive confirmation. Direct executable invocation removes
+persistent integration and gives current-shell guidance; invocation through the
+managed wrapper unloads managed values and removes owned functions and
+completions only after persistent removal succeeds.
+
 ## Stable namespace
 
 The shortcut changes no persistent or machine-facing identifier. These retain

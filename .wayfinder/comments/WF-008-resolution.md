@@ -58,6 +58,8 @@ gschrank remove <profile> <variable>
 gschrank startup set <profile>
 gschrank startup off
 
+gschrank shell uninstall
+
 gschrank load <profile>
 gschrank reload
 gschrank unload
