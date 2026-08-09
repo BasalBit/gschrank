@@ -17,6 +17,7 @@ mod envelope;
 mod import_command;
 mod init;
 mod key_provider;
+mod process_security;
 mod profiles;
 mod purge;
 mod rebuild;
@@ -37,13 +38,13 @@ mod platform;
 #[cfg(test)]
 mod testing;
 
-pub use cli::run_cli;
 pub use codec::PayloadError;
 pub use domain::{DomainError, EnvironmentName, Mutation, ProfileName, SecretValue, Vault};
 pub use envelope::{
     EnvelopeError, EnvelopeMetadata, KeyId, MasterKey, OpenedVault, VaultId, inspect_envelope,
     open_envelope, seal_vault,
 };
+pub use process_security::run;
 
 /// Maximum size of a complete encrypted vault envelope.
 pub const MAX_ENVELOPE_SIZE: usize = 16 * 1024 * 1024;

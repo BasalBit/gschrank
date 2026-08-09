@@ -16,6 +16,7 @@ use crate::{
     import_command::{ImportCommandError, ImportOptions, ImportOutcome, execute_import},
     init::{InitOutcome, Initializer},
     key_provider::InteractionPolicy,
+    process_security::CoreDumpSuppression,
     profiles::{
         BackupReceipt, ImportOperationError, ProfileInspection, ProfileOperationError,
         ProfileOperations, VaultInspection, VaultReadiness,
@@ -433,7 +434,10 @@ impl std::fmt::Display for ParseError {
 }
 
 /// Runs the current Gschrank command surface.
-pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
+pub(crate) fn run_cli(
+    arguments: impl IntoIterator<Item = OsString>,
+    core_dumps: CoreDumpSuppression,
+) -> ExitCode {
     let arguments = arguments.into_iter().collect::<Vec<_>>();
     match parse(&arguments) {
         Ok(Command::Help) => {
@@ -447,7 +451,7 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
         Ok(Command::Config { rc_file }) => run_config(rc_file),
         Ok(Command::Init) => run_init(),
         Ok(Command::Status) => run_status(),
-        Ok(Command::Doctor) => run_doctor(),
+        Ok(Command::Doctor) => run_doctor(core_dumps),
         Ok(Command::Backup(destination)) => run_backup(destination),
         Ok(Command::Restore(source)) => run_restore(source),
         Ok(Command::Rebuild) => run_rebuild(),
@@ -907,11 +911,12 @@ fn run_status() -> ExitCode {
 }
 
 #[cfg(target_os = "macos")]
-fn run_doctor() -> ExitCode {
+fn run_doctor(core_dumps: CoreDumpSuppression) -> ExitCode {
+    report_core_dump_warning(core_dumps);
     let paths = match MacOsPaths::discover() {
         Ok(paths) => paths,
         Err(error) => {
-            print!("{}", render_path_failure("Doctor"));
+            print!("{}", render_doctor_path_failure(core_dumps));
             eprintln!("gschrank: {error}");
             return ExitCode::from(13);
         }
@@ -928,7 +933,7 @@ fn run_doctor() -> ExitCode {
         shell,
         current_shell,
     };
-    print!("{}", render_doctor(&report));
+    print!("{}", render_doctor(&report, core_dumps));
     report_diagnostic_errors(
         &report.vault,
         &report.recovery,
@@ -1448,7 +1453,7 @@ fn render_status(report: &StatusReport) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn render_doctor(report: &DoctorReport) -> String {
+fn render_doctor(report: &DoctorReport, core_dumps: CoreDumpSuppression) -> String {
     let mut output = String::new();
     output.push_str("Doctor: ");
     output.push_str(doctor_outcome(report));
@@ -1457,10 +1462,40 @@ fn render_doctor(report: &DoctorReport) -> String {
     append_recovery_overview(&mut output, &report.recovery);
     append_shell_status(&mut output, report.shell.as_ref().ok());
     append_current_shell_status(&mut output, &report.current_shell, false);
+    append_core_dump_status(&mut output, core_dumps);
     output.push_str("Remediation: ");
     output.push_str(doctor_remediation(report));
     output.push('\n');
     output
+}
+
+#[cfg(target_os = "macos")]
+fn render_doctor_path_failure(core_dumps: CoreDumpSuppression) -> String {
+    let mut output = render_path_failure("Doctor");
+    append_core_dump_status(&mut output, core_dumps);
+    output
+}
+
+#[cfg(target_os = "macos")]
+fn append_core_dump_status(output: &mut String, core_dumps: CoreDumpSuppression) {
+    output.push_str("Core dump suppression: ");
+    output.push_str(match core_dumps {
+        CoreDumpSuppression::Active => "active",
+        CoreDumpSuppression::Unavailable => "unavailable",
+    });
+    output.push('\n');
+}
+
+#[cfg(target_os = "macos")]
+fn report_core_dump_warning(core_dumps: CoreDumpSuppression) {
+    if core_dumps == CoreDumpSuppression::Unavailable {
+        write_core_dump_warning(&mut std::io::stderr().lock());
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn write_core_dump_warning(writer: &mut impl Write) {
+    let _ = writer.write_all(b"gschrank: warning: process core-dump suppression is unavailable\n");
 }
 
 #[cfg(target_os = "macos")]
@@ -2583,7 +2618,7 @@ fn run_status() -> ExitCode {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn run_doctor() -> ExitCode {
+fn run_doctor(_core_dumps: CoreDumpSuppression) -> ExitCode {
     eprintln!("gschrank: this build does not support encrypted diagnostics on this platform");
     ExitCode::from(1)
 }
@@ -3462,7 +3497,7 @@ mod tests {
                 current_shell: Ok(ManagedState::empty()),
             };
 
-            let output = render_doctor(&report);
+            let output = render_doctor(&report, CoreDumpSuppression::Active);
             assert!(output.contains("Doctor: initialization pending"));
             assert!(output.contains("Initialization candidate: present"));
             assert!(output.contains("Recovery bundles: 2"));
@@ -3485,7 +3520,7 @@ mod tests {
                 current_shell: Ok(ManagedState::empty()),
             };
 
-            let output = render_doctor(&report);
+            let output = render_doctor(&report, CoreDumpSuppression::Active);
             assert!(output.contains("Doctor: rebuild pending"));
             assert!(output.contains("Rebuild candidate: present"));
             assert!(output.contains("run 'gschrank rebuild'"));
@@ -3508,7 +3543,7 @@ mod tests {
                 current_shell: Ok(ManagedState::empty()),
             };
 
-            let output = render_doctor(&report);
+            let output = render_doctor(&report, CoreDumpSuppression::Active);
             assert!(output.contains("Doctor: recovery purge pending"));
             assert!(output.contains("Recovery purges pending: 1"));
             assert!(output.contains("gschrank recovery list"));
@@ -3539,7 +3574,7 @@ mod tests {
                 current_shell: Ok(ManagedState::empty()),
             };
 
-            let output = render_doctor(&report);
+            let output = render_doctor(&report, CoreDumpSuppression::Active);
             assert!(output.contains("Doctor: full purge pending"));
             assert!(output.contains("Full purge pending: yes"));
             assert!(output.contains("run 'gschrank purge'"));
@@ -3559,7 +3594,7 @@ mod tests {
                     Some("PRIVATE_TOKEN"),
                 ),
             };
-            let output = render_doctor(&healthy);
+            let output = render_doctor(&healthy, CoreDumpSuppression::Active);
             assert!(output.contains("Doctor: healthy"));
             assert!(output.contains("Revision: 9"));
             assert!(output.contains("valid active metadata"));
@@ -3575,7 +3610,10 @@ mod tests {
                 shell: Ok(installed_shell()),
                 current_shell: Ok(ManagedState::empty()),
             };
-            assert!(render_doctor(&not_initialized).contains("Doctor: not initialized"));
+            assert!(
+                render_doctor(&not_initialized, CoreDumpSuppression::Active)
+                    .contains("Doctor: not initialized")
+            );
             assert_eq!(not_initialized.exit_code(), 10);
 
             let frozen = DoctorReport {
@@ -3584,10 +3622,33 @@ mod tests {
                 shell: Ok(installed_shell()),
                 current_shell: Ok(ManagedState::empty()),
             };
-            let output = render_doctor(&frozen);
+            let output = render_doctor(&frozen, CoreDumpSuppression::Active);
             assert!(output.contains("Doctor: frozen"));
             assert!(output.contains("Keychain item: missing"));
             assert_eq!(frozen.exit_code(), 12);
+        }
+
+        #[test]
+        fn doctor_warns_safely_without_failing_when_core_suppression_is_unavailable() {
+            let report = DoctorReport {
+                vault: Ok(VaultReadiness { revision: 0 }),
+                recovery: Ok(clear_recovery()),
+                shell: Ok(installed_shell()),
+                current_shell: Ok(ManagedState::empty()),
+            };
+
+            let output = render_doctor(&report, CoreDumpSuppression::Unavailable);
+            assert!(output.contains("Core dump suppression: unavailable"));
+            assert!(!output.contains("CANARY-native-core-error"));
+            assert_eq!(report.exit_code(), 0);
+
+            let mut warning = Vec::new();
+            write_core_dump_warning(&mut warning);
+            assert_eq!(
+                warning,
+                b"gschrank: warning: process core-dump suppression is unavailable\n"
+            );
+            assert!(!warning.windows(6).any(|bytes| bytes == b"CANARY"));
         }
 
         #[test]
@@ -3603,7 +3664,10 @@ mod tests {
                 current_shell: Ok(ManagedState::empty()),
             };
             assert_eq!(absent.exit_code(), 14);
-            assert!(render_doctor(&absent).contains("run 'gschrank config'"));
+            assert!(
+                render_doctor(&absent, CoreDumpSuppression::Active)
+                    .contains("run 'gschrank config'")
+            );
 
             let conflict = DoctorReport {
                 vault: Ok(VaultReadiness { revision: 0 }),
@@ -3615,7 +3679,10 @@ mod tests {
                 current_shell: Ok(ManagedState::empty()),
             };
             assert_eq!(conflict.exit_code(), 14);
-            assert!(render_doctor(&conflict).contains("unmanaged 'gschrank'"));
+            assert!(
+                render_doctor(&conflict, CoreDumpSuppression::Active)
+                    .contains("unmanaged 'gschrank'")
+            );
 
             let invalid_metadata = DoctorReport {
                 vault: Ok(VaultReadiness { revision: 0 }),
@@ -3624,7 +3691,10 @@ mod tests {
                 current_shell: Err(ManagedStateError::Incomplete),
             };
             assert_eq!(invalid_metadata.exit_code(), 14);
-            assert!(render_doctor(&invalid_metadata).contains("fresh Zsh session"));
+            assert!(
+                render_doctor(&invalid_metadata, CoreDumpSuppression::Active)
+                    .contains("fresh Zsh session")
+            );
         }
 
         #[test]

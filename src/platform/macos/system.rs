@@ -12,6 +12,29 @@ use std::{
 const INITIAL_PASSWD_BUFFER_SIZE: usize = 16 * 1024;
 const MAX_PASSWD_BUFFER_SIZE: usize = 1024 * 1024;
 
+pub(crate) fn suppress_core_dumps() -> io::Result<()> {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: `limit` points to writable storage for one `rlimit`; the call
+    // retains no pointer and initializes the value only when it succeeds.
+    if unsafe { libc::getrlimit(libc::RLIMIT_CORE, limit.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful `getrlimit` initialized the complete value.
+    let mut limit = unsafe { limit.assume_init() };
+    disable_core_soft_limit(&mut limit);
+    // SAFETY: `limit` is fully initialized, remains live for the call, and the
+    // native function does not retain its pointer.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const limit) } == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn disable_core_soft_limit(limit: &mut libc::rlimit) {
+    limit.rlim_cur = 0;
+}
+
 pub(super) fn effective_user_id() -> u32 {
     // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
     unsafe { libc::geteuid() }
@@ -111,5 +134,16 @@ mod tests {
         let home = home_directory().unwrap();
         assert!(home.is_absolute());
         assert!(home.components().count() > 1);
+    }
+
+    #[test]
+    fn core_suppression_preserves_the_hard_limit() {
+        let mut limit = libc::rlimit {
+            rlim_cur: 1024,
+            rlim_max: 4096,
+        };
+        disable_core_soft_limit(&mut limit);
+        assert_eq!(limit.rlim_cur, 0);
+        assert_eq!(limit.rlim_max, 4096);
     }
 }

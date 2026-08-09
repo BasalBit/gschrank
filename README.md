@@ -23,6 +23,8 @@ The versioned Zsh wrapper and private apply protocol support transactional
 profile replacement, reload, and unload with inherited names-only metadata.
 `gschrank shell uninstall` removes only managed persistent and current-shell
 integration while retaining encrypted state, Keychain items, and backups.
+The process entry point suppresses core dumps on a best-effort basis and catches
+unexpected panics behind a fixed, payload-free diagnostic.
 Profile rename follows the configured startup reference, and deletion refuses
 the startup profile until another profile is selected or automatic loading is
 turned off.
