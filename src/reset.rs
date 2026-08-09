@@ -194,6 +194,31 @@ where
         init_pending: Option<&[u8]>,
         rebuild_pending: Option<&[u8]>,
     ) -> Result<RecoveryBundleId, ResetError> {
+        if let Some(existing) = transaction
+            .read_recovery_bundles()?
+            .into_iter()
+            .find(|bundle| {
+                bundle.metadata.reason == RecoveryReason::Reset
+                    && optional_bytes_equal(
+                        bundle.live.as_ref().map(|bytes| bytes.as_slice()),
+                        live,
+                    )
+                    && optional_bytes_equal(
+                        bundle.init_pending.as_ref().map(|bytes| bytes.as_slice()),
+                        init_pending,
+                    )
+                    && optional_bytes_equal(
+                        bundle
+                            .rebuild_pending
+                            .as_ref()
+                            .map(|bytes| bytes.as_slice()),
+                        rebuild_pending,
+                    )
+            })
+        {
+            return Ok(existing.metadata.id);
+        }
+
         let created_at_unix_seconds = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::IoFailure))?
@@ -215,14 +240,6 @@ where
                 Err(error) if error.kind() == VaultStoreErrorKind::Conflict => continue,
                 result => result?,
             };
-            match outcome {
-                CommitOutcome::NotCommitted => return Err(ResetError::RecoveryNotCommitted),
-                CommitOutcome::Indeterminate => {
-                    return Err(ResetError::RecoveryOutcomeIndeterminate);
-                }
-                CommitOutcome::Committed => {}
-            }
-
             let preserved = transaction
                 .read_recovery_bundles()?
                 .into_iter()
@@ -247,7 +264,12 @@ where
             }) {
                 return Ok(metadata.id);
             }
-            return Err(ResetError::RecoveryOutcomeIndeterminate);
+            return Err(match outcome {
+                CommitOutcome::NotCommitted => ResetError::RecoveryNotCommitted,
+                CommitOutcome::Committed | CommitOutcome::Indeterminate => {
+                    ResetError::RecoveryOutcomeIndeterminate
+                }
+            });
         }
         Err(VaultStoreError::new(VaultStoreErrorKind::Conflict).into())
     }
@@ -465,7 +487,6 @@ mod tests {
         for fault in [
             RecoveryPreservationFault::NotCommitted,
             RecoveryPreservationFault::IndeterminateBeforeCommit,
-            RecoveryPreservationFault::IndeterminateAfterCommit,
         ] {
             let (keys, store, _, old_live) = initialized_with_secret();
             store.fail_next_recovery_preservation(fault);
@@ -477,6 +498,15 @@ mod tests {
             );
             assert_eq!(store.live().as_deref(), Some(old_live.as_slice()));
         }
+
+        let (keys, store, _, _) = initialized_with_secret();
+        store.fail_next_recovery_preservation(RecoveryPreservationFault::IndeterminateAfterCommit);
+        let mut confirmer = ScriptedConfirmer::accepting();
+        assert!(
+            ResetOperations::new(&keys, &store)
+                .reset(INTERACTION, &mut confirmer, || Ok(()))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -497,6 +527,19 @@ mod tests {
             ));
             assert_eq!(store.live().as_deref(), Some(old_live.as_slice()));
             assert_eq!(keys.key_count(), 1);
+
+            let mut confirmer = ScriptedConfirmer::accepting();
+            ResetOperations::new(&keys, &store)
+                .reset(INTERACTION, &mut confirmer, || Ok(()))
+                .unwrap();
+            let bundles = store
+                .shared_read::<_, VaultStoreError, _>(|read| read.read_recovery_bundles())
+                .unwrap();
+            assert_eq!(bundles.len(), 1);
+            assert_eq!(
+                bundles[0].live.as_ref().map(|bytes| bytes.as_slice()),
+                Some(old_live.as_slice())
+            );
         }
 
         let (keys, store, _, old_live) = initialized_with_secret();
@@ -536,5 +579,37 @@ mod tests {
             Some(old_live.as_slice())
         );
         assert!(!error.to_string().contains("CANARY"));
+    }
+
+    #[test]
+    fn ordinary_init_resumes_reset_after_interrupted_fresh_vault_promotion() {
+        let (keys, store, old_key_id, old_live) = initialized_with_secret();
+        store.fail_next_promotion(crate::testing::PromotionFault::NotCommitted);
+        let mut confirmer = ScriptedConfirmer::accepting();
+
+        assert!(matches!(
+            ResetOperations::new(&keys, &store).reset(INTERACTION, &mut confirmer, || Ok(())),
+            Err(ResetError::Initialization(InitError::CommitNotCompleted))
+        ));
+        let pending = store.pending().unwrap();
+        assert!(store.live().is_none());
+        assert!(keys.contains(&old_key_id));
+
+        assert!(matches!(
+            crate::init::Initializer::new(&keys, &store)
+                .initialize(INTERACTION)
+                .unwrap(),
+            InitOutcome::Created { .. }
+        ));
+        assert_eq!(store.live().as_deref(), Some(pending.as_slice()));
+        assert!(store.pending().is_none());
+        let bundles = store
+            .shared_read::<_, VaultStoreError, _>(|read| read.read_recovery_bundles())
+            .unwrap();
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(
+            bundles[0].live.as_ref().map(|bytes| bytes.as_slice()),
+            Some(old_live.as_slice())
+        );
     }
 }

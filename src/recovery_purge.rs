@@ -191,7 +191,8 @@ where
             };
 
             confirmer.confirm(PURGE_CONFIRMATION)?;
-            let referenced = Self::referenced_elsewhere(transaction, bundle_id, &key_ids)?;
+            let referenced =
+                self.referenced_elsewhere(transaction, bundle_id, &key_ids, interaction)?;
             if needs_staging {
                 Self::stage_and_verify(transaction, bundle_id, &key_ids)?;
             }
@@ -266,9 +267,11 @@ where
     }
 
     fn referenced_elsewhere(
+        &self,
         transaction: &mut dyn VaultTransaction,
         selected_id: RecoveryBundleId,
         selected_keys: &[KeyId],
+        interaction: InteractionPolicy,
     ) -> Result<BTreeSet<KeyId>, RecoveryPurgeError> {
         let selected = selected_keys.iter().copied().collect::<BTreeSet<_>>();
         let mut referenced = BTreeSet::new();
@@ -280,26 +283,37 @@ where
         .into_iter()
         .flatten()
         {
-            Self::record_reference(&envelope, &selected, &mut referenced)?;
+            self.record_reference(&envelope, &selected, &mut referenced, interaction)?;
         }
         for bundle in transaction.read_recovery_bundles()? {
             if bundle.metadata.id == selected_id {
                 continue;
             }
             for envelope in bundle_artifacts(&bundle) {
-                Self::record_reference(envelope, &selected, &mut referenced)?;
+                self.record_reference(envelope, &selected, &mut referenced, interaction)?;
             }
         }
         Ok(referenced)
     }
 
     fn record_reference(
+        &self,
         envelope: &[u8],
         selected: &BTreeSet<KeyId>,
         referenced: &mut BTreeSet<KeyId>,
+        interaction: InteractionPolicy,
     ) -> Result<(), RecoveryPurgeError> {
         let metadata =
             inspect_envelope(envelope).map_err(|_| RecoveryPurgeError::ReferenceStateUnreadable)?;
+        let key = self
+            .keys
+            .load(&metadata.key_id, interaction)
+            .map_err(|_| RecoveryPurgeError::ReferenceStateUnreadable)?;
+        let opened = open_envelope(envelope, &key)
+            .map_err(|_| RecoveryPurgeError::ReferenceStateUnreadable)?;
+        if opened.key_id != metadata.key_id || opened.vault_id != metadata.vault_id {
+            return Err(RecoveryPurgeError::ReferenceStateUnreadable);
+        }
         if selected.contains(&metadata.key_id) {
             referenced.insert(metadata.key_id);
         }
@@ -578,6 +592,26 @@ mod tests {
     }
 
     #[test]
+    fn non_authenticating_other_artifacts_block_reference_sensitive_key_deletion() {
+        let (keys, store, _) = initialized();
+        let (old_key_id, envelope) = standalone_envelope(&keys, 3);
+        preserve(&store, BUNDLE_ID, &envelope);
+        let (_, mut other) = standalone_envelope(&keys, 5);
+        *other.last_mut().unwrap() ^= 1;
+        preserve(&store, OTHER_BUNDLE_ID, &other);
+        let mut confirmer = ScriptedConfirmer::accepting();
+
+        assert_eq!(
+            RecoveryPurgeOperations::new(&keys, &store)
+                .purge(BUNDLE_ID, INTERACTION, &mut confirmer)
+                .unwrap_err(),
+            RecoveryPurgeError::ReferenceStateUnreadable
+        );
+        assert!(keys.contains(&old_key_id));
+        assert_eq!(recovery_counts(&store), (2, 0));
+    }
+
+    #[test]
     fn rejection_and_unreadable_ciphertext_never_stage_or_delete() {
         let (keys, store, _) = initialized();
         let (old_key_id, envelope) = standalone_envelope(&keys, 3);
@@ -645,6 +679,33 @@ mod tests {
             .purge(BUNDLE_ID, INTERACTION, &mut confirmer)
             .unwrap();
         assert!(!keys.contains(&old_key_id));
+        assert_eq!(recovery_counts(&store), (0, 0));
+    }
+
+    #[test]
+    fn retry_accepts_a_bundle_key_deleted_before_keychain_reported_failure() {
+        let (keys, store, _) = initialized();
+        let (old_key_id, envelope) = standalone_envelope(&keys, 3);
+        preserve(&store, BUNDLE_ID, &envelope);
+        keys.fail_next_delete_after_commit(KeyProviderErrorKind::BackendFailure);
+        let mut confirmer = ScriptedConfirmer::accepting();
+
+        assert!(matches!(
+            RecoveryPurgeOperations::new(&keys, &store).purge(
+                BUNDLE_ID,
+                INTERACTION,
+                &mut confirmer
+            ),
+            Err(RecoveryPurgeError::SecureStore(error))
+                if error.kind() == KeyProviderErrorKind::BackendFailure
+        ));
+        assert!(!keys.contains(&old_key_id));
+        assert_eq!(recovery_counts(&store), (0, 1));
+
+        let mut confirmer = ScriptedConfirmer::accepting();
+        RecoveryPurgeOperations::new(&keys, &store)
+            .purge(BUNDLE_ID, INTERACTION, &mut confirmer)
+            .unwrap();
         assert_eq!(recovery_counts(&store), (0, 0));
     }
 

@@ -154,8 +154,9 @@ where
     {
         self.store.initialization_transaction(|transaction| {
             confirmer.confirm(PURGE_CONFIRMATION)?;
-            prepare().map_err(FullPurgeError::PreparationFailed)?;
-
+            if transaction.read_full_purge_pending()?.is_none() {
+                prepare().map_err(FullPurgeError::PreparationFailed)?;
+            }
             Self::stage_and_verify(transaction)?;
             let pending = transaction
                 .read_full_purge_pending()?
@@ -257,7 +258,7 @@ where
         let exact = transaction
             .read_full_purge_pending()?
             .is_some_and(|pending| pending.key_ids.as_deref() == Some(key_ids));
-        if outcome == CommitOutcome::Committed && exact {
+        if outcome != CommitOutcome::NotCommitted && exact {
             return Ok(());
         }
         Err(match outcome {
@@ -290,7 +291,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     use std::{
         fs::{self, DirBuilder},
-        os::unix::fs::DirBuilderExt,
+        os::unix::fs::{DirBuilderExt, symlink},
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
@@ -547,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn indeterminate_stage_and_plan_never_authorize_key_deletion() {
+    fn unverified_stage_and_plan_outcomes_never_authorize_key_deletion() {
         for (fault, expected) in [
             (
                 FullPurgeFault::NotCommitted,
@@ -580,21 +581,41 @@ mod tests {
             FullPurgeError::StageOutcomeIndeterminate
         );
         assert!(keys.contains(&live_key_id));
+        assert!(full_pending(&store).is_some());
 
-        store.fail_next_full_purge_plan(FullPurgeFault::IndeterminateAfterCommit);
         let mut confirmer = ScriptedConfirmer::accepting();
-        assert_eq!(
-            FullPurgeOperations::new(&keys, &store)
-                .purge(INTERACTION, &mut confirmer, || Ok(()))
-                .unwrap_err(),
-            FullPurgeError::PlanOutcomeIndeterminate
-        );
-        assert!(keys.contains(&live_key_id));
-        assert_eq!(
-            full_pending(&store).unwrap().key_ids,
-            Some(vec![live_key_id])
-        );
+        FullPurgeOperations::new(&keys, &store)
+            .purge(INTERACTION, &mut confirmer, || {
+                Err(FullPurgePreparationError::new(13))
+            })
+            .unwrap();
+        assert!(!keys.contains(&live_key_id));
 
+        for (fault, expected) in [
+            (
+                FullPurgeFault::NotCommitted,
+                FullPurgeError::PlanNotCommitted,
+            ),
+            (
+                FullPurgeFault::IndeterminateBeforeCommit,
+                FullPurgeError::PlanOutcomeIndeterminate,
+            ),
+        ] {
+            let (keys, store, live_key_id) = initialized();
+            store.fail_next_full_purge_plan(fault);
+            let mut confirmer = ScriptedConfirmer::accepting();
+            assert_eq!(
+                FullPurgeOperations::new(&keys, &store)
+                    .purge(INTERACTION, &mut confirmer, || Ok(()))
+                    .unwrap_err(),
+                expected
+            );
+            assert!(keys.contains(&live_key_id));
+            assert!(full_pending(&store).unwrap().key_ids.is_none());
+        }
+
+        let (keys, store, live_key_id) = initialized();
+        store.fail_next_full_purge_plan(FullPurgeFault::IndeterminateAfterCommit);
         let mut confirmer = ScriptedConfirmer::accepting();
         FullPurgeOperations::new(&keys, &store)
             .purge(INTERACTION, &mut confirmer, || Ok(()))
@@ -625,6 +646,55 @@ mod tests {
                 .unwrap_err(),
             FullPurgeError::CleanupNotCommitted
         );
+        assert!(!keys.contains(&live_key_id));
+        assert!(full_pending(&store).is_some());
+
+        let mut confirmer = ScriptedConfirmer::accepting();
+        FullPurgeOperations::new(&keys, &store)
+            .purge(INTERACTION, &mut confirmer, || Ok(()))
+            .unwrap();
+        assert!(full_pending(&store).is_none());
+    }
+
+    #[test]
+    fn staged_purge_resumes_without_repeating_failed_external_preparation() {
+        let (keys, store, live_key_id) = initialized();
+        keys.fail_next_delete(KeyProviderErrorKind::BackendFailure);
+        let mut confirmer = ScriptedConfirmer::accepting();
+        assert!(
+            FullPurgeOperations::new(&keys, &store)
+                .purge(INTERACTION, &mut confirmer, || Ok(()))
+                .is_err()
+        );
+        assert!(full_pending(&store).is_some());
+
+        let mut prepare_called = false;
+        let mut confirmer = ScriptedConfirmer::accepting();
+        FullPurgeOperations::new(&keys, &store)
+            .purge(INTERACTION, &mut confirmer, || {
+                prepare_called = true;
+                Err(FullPurgePreparationError::new(13))
+            })
+            .unwrap();
+        assert!(!prepare_called);
+        assert!(!keys.contains(&live_key_id));
+        assert!(full_pending(&store).is_none());
+    }
+
+    #[test]
+    fn retry_accepts_a_key_deleted_before_the_keychain_reported_failure() {
+        let (keys, store, live_key_id) = initialized();
+        keys.fail_next_delete_after_commit(KeyProviderErrorKind::BackendFailure);
+        let mut confirmer = ScriptedConfirmer::accepting();
+        assert!(matches!(
+            FullPurgeOperations::new(&keys, &store).purge(
+                INTERACTION,
+                &mut confirmer,
+                || Ok(())
+            ),
+            Err(FullPurgeError::SecureStore(error))
+                if error.kind() == KeyProviderErrorKind::BackendFailure
+        ));
         assert!(!keys.contains(&live_key_id));
         assert!(full_pending(&store).is_some());
 
@@ -673,5 +743,49 @@ mod tests {
             recreated,
             crate::init::InitOutcome::Created { .. }
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn partial_local_staging_never_authorizes_key_deletion() {
+        use crate::platform::macos::LocalVaultStore;
+
+        let test = TestDirectory::new();
+        let keys = MemoryKeyProvider::new();
+        let store = LocalVaultStore::new(test.data());
+        Initializer::new(&keys, &store)
+            .initialize(INTERACTION)
+            .unwrap();
+        let live_key_id = store
+            .shared_read::<_, VaultStoreError, _>(|read| {
+                Ok(inspect_envelope(&read.read_live()?.unwrap())
+                    .unwrap()
+                    .key_id)
+            })
+            .unwrap();
+        let outside = test.0.join("outside-recovery");
+        fs::create_dir(&outside).unwrap();
+        let recovery = test.data().join("recovery");
+        symlink(&outside, &recovery).unwrap();
+        let mut confirmer = ScriptedConfirmer::accepting();
+
+        assert_eq!(
+            FullPurgeOperations::new(&keys, &store)
+                .purge(INTERACTION, &mut confirmer, || Ok(()))
+                .unwrap_err(),
+            FullPurgeError::StageOutcomeIndeterminate
+        );
+        assert!(keys.contains(&live_key_id));
+        assert!(test.data().join("full-purge.pending/vault").exists());
+        assert!(recovery.is_symlink());
+
+        fs::remove_file(recovery).unwrap();
+        let mut confirmer = ScriptedConfirmer::accepting();
+        FullPurgeOperations::new(&keys, &store)
+            .purge(INTERACTION, &mut confirmer, || {
+                Err(FullPurgePreparationError::new(13))
+            })
+            .unwrap();
+        assert!(!keys.contains(&live_key_id));
     }
 }

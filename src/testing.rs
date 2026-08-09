@@ -26,8 +26,10 @@ struct MemoryKeyState {
     keys: BTreeMap<KeyId, Zeroizing<[u8; 32]>>,
     next_load_error: Option<KeyProviderErrorKind>,
     next_store_error: Option<KeyProviderErrorKind>,
+    next_store_error_after_commit: Option<KeyProviderErrorKind>,
     always_store_error: Option<KeyProviderErrorKind>,
     next_delete_error: Option<KeyProviderErrorKind>,
+    next_delete_error_after_commit: Option<KeyProviderErrorKind>,
     load_calls: usize,
     store_calls: usize,
 }
@@ -47,12 +49,20 @@ impl MemoryKeyProvider {
         self.state().next_store_error = Some(kind);
     }
 
+    pub(crate) fn fail_next_store_after_commit(&self, kind: KeyProviderErrorKind) {
+        self.state().next_store_error_after_commit = Some(kind);
+    }
+
     pub(crate) fn always_fail_store(&self, kind: KeyProviderErrorKind) {
         self.state().always_store_error = Some(kind);
     }
 
     pub(crate) fn fail_next_delete(&self, kind: KeyProviderErrorKind) {
         self.state().next_delete_error = Some(kind);
+    }
+
+    pub(crate) fn fail_next_delete_after_commit(&self, kind: KeyProviderErrorKind) {
+        self.state().next_delete_error_after_commit = Some(kind);
     }
 
     pub(crate) fn insert(&self, key_id: KeyId, key: &MasterKey) {
@@ -114,6 +124,9 @@ impl KeyProvider for MemoryKeyProvider {
             return Err(KeyProviderError::new(KeyProviderErrorKind::AlreadyExists));
         }
         state.keys.insert(*key_id, Zeroizing::new(*key.expose()));
+        if let Some(kind) = state.next_store_error_after_commit.take() {
+            return Err(KeyProviderError::new(kind));
+        }
         Ok(())
     }
 
@@ -127,7 +140,11 @@ impl KeyProvider for MemoryKeyProvider {
             return Err(KeyProviderError::new(kind));
         }
         if state.keys.remove(key_id).is_some() {
-            Ok(())
+            if let Some(kind) = state.next_delete_error_after_commit.take() {
+                Err(KeyProviderError::new(kind))
+            } else {
+                Ok(())
+            }
         } else {
             Err(KeyProviderError::new(KeyProviderErrorKind::NotFound))
         }

@@ -335,6 +335,22 @@ where
         transaction: &mut dyn VaultTransaction,
         live: &[u8],
     ) -> Result<RecoveryBundleId, RestoreError> {
+        if let Some(existing) = transaction
+            .read_recovery_bundles()?
+            .into_iter()
+            .find(|bundle| {
+                bundle.metadata.reason == RecoveryReason::Restore
+                    && bundle
+                        .live
+                        .as_ref()
+                        .is_some_and(|bytes| bytes.as_slice() == live)
+                    && bundle.init_pending.is_none()
+                    && bundle.rebuild_pending.is_none()
+            })
+        {
+            return Ok(existing.metadata.id);
+        }
+
         let created_at_unix_seconds = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::IoFailure))?
@@ -356,12 +372,6 @@ where
                 Err(error) if error.kind() == VaultStoreErrorKind::Conflict => continue,
                 result => result?,
             };
-            if outcome == CommitOutcome::NotCommitted {
-                return Err(RestoreError::RecoveryNotCommitted);
-            }
-            if outcome == CommitOutcome::Indeterminate {
-                return Err(RestoreError::RecoveryOutcomeIndeterminate);
-            }
             let preserved = transaction
                 .read_recovery_bundles()?
                 .into_iter()
@@ -377,7 +387,12 @@ where
             }) {
                 return Ok(metadata.id);
             }
-            return Err(RestoreError::RecoveryOutcomeIndeterminate);
+            return Err(match outcome {
+                CommitOutcome::NotCommitted => RestoreError::RecoveryNotCommitted,
+                CommitOutcome::Committed | CommitOutcome::Indeterminate => {
+                    RestoreError::RecoveryOutcomeIndeterminate
+                }
+            });
         }
         Err(VaultStoreError::new(VaultStoreErrorKind::Conflict).into())
     }
@@ -627,11 +642,11 @@ mod tests {
     }
 
     #[test]
-    fn indeterminate_preservation_aborts_before_live_replacement() {
+    fn indeterminate_before_preservation_is_retryable_without_replacing_live() {
         let (keys, store) = initialized();
         let backup = store.live().unwrap();
         let displaced = changed_live(&keys, &store);
-        store.fail_next_recovery_preservation(RecoveryPreservationFault::IndeterminateAfterCommit);
+        store.fail_next_recovery_preservation(RecoveryPreservationFault::IndeterminateBeforeCommit);
         let mut confirmer = ScriptedConfirmer::accepting();
 
         assert_eq!(
@@ -641,6 +656,34 @@ mod tests {
             RestoreError::RecoveryOutcomeIndeterminate
         );
         assert_eq!(store.live().as_deref(), Some(displaced.as_slice()));
+
+        let mut confirmer = ScriptedConfirmer::accepting();
+        RestoreOperations::new(&keys, &store)
+            .restore_external(&backup, INTERACTION, &mut confirmer)
+            .unwrap();
+        assert_eq!(store.live().as_deref(), Some(backup.as_slice()));
+    }
+
+    #[test]
+    fn verified_indeterminate_preservation_continues_to_live_replacement() {
+        let (keys, store) = initialized();
+        let backup = store.live().unwrap();
+        let displaced = changed_live(&keys, &store);
+        store.fail_next_recovery_preservation(RecoveryPreservationFault::IndeterminateAfterCommit);
+        let mut confirmer = ScriptedConfirmer::accepting();
+
+        RestoreOperations::new(&keys, &store)
+            .restore_external(&backup, INTERACTION, &mut confirmer)
+            .unwrap();
+        assert_eq!(store.live().as_deref(), Some(backup.as_slice()));
+        let bundles = store
+            .shared_read::<_, VaultStoreError, _>(|read| read.read_recovery_bundles())
+            .unwrap();
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(
+            bundles[0].live.as_ref().map(|bytes| bytes.as_slice()),
+            Some(displaced.as_slice())
+        );
     }
 
     #[test]
@@ -681,6 +724,64 @@ mod tests {
                 .unwrap(),
             1
         );
+
+        let mut confirmer = ScriptedConfirmer::accepting();
+        RestoreOperations::new(&keys, &store)
+            .restore_external(&backup, INTERACTION, &mut confirmer)
+            .unwrap();
+        assert_eq!(store.live().as_deref(), Some(backup.as_slice()));
+        assert_eq!(
+            store
+                .shared_read::<_, VaultStoreError, _>(|read| {
+                    Ok(read.read_recovery_bundles()?.len())
+                })
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn absent_live_install_faults_are_retryable_without_recovery_mutation() {
+        for fault in [
+            ReplacementFault::NotCommitted,
+            ReplacementFault::IndeterminateBeforeCommit,
+        ] {
+            let (keys, store) = initialized();
+            let backup = store.live().unwrap();
+            store.clear_live();
+            store.fail_next_replacement(fault);
+            let mut confirmer = ScriptedConfirmer::accepting();
+
+            assert!(
+                RestoreOperations::new(&keys, &store)
+                    .restore_external(&backup, INTERACTION, &mut confirmer)
+                    .is_err()
+            );
+            assert!(store.live().is_none());
+            assert_eq!(confirmer.calls, 0);
+
+            RestoreOperations::new(&keys, &store)
+                .restore_external(&backup, INTERACTION, &mut confirmer)
+                .unwrap();
+            assert_eq!(store.live().as_deref(), Some(backup.as_slice()));
+            assert!(
+                store
+                    .shared_read::<_, VaultStoreError, _>(|read| {
+                        Ok(read.read_recovery_bundles()?.is_empty())
+                    })
+                    .unwrap()
+            );
+        }
+
+        let (keys, store) = initialized();
+        let backup = store.live().unwrap();
+        store.clear_live();
+        store.fail_next_replacement(ReplacementFault::IndeterminateAfterCommit);
+        let mut confirmer = ScriptedConfirmer::accepting();
+        RestoreOperations::new(&keys, &store)
+            .restore_external(&backup, INTERACTION, &mut confirmer)
+            .unwrap();
+        assert_eq!(store.live().as_deref(), Some(backup.as_slice()));
     }
 
     #[test]

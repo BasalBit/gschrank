@@ -341,6 +341,32 @@ mod tests {
     }
 
     #[test]
+    fn retry_resumes_when_key_storage_committed_before_reporting_failure() {
+        let keys = MemoryKeyProvider::new();
+        keys.fail_next_store_after_commit(KeyProviderErrorKind::BackendFailure);
+        let store = MemoryVaultStore::new();
+        let initializer = Initializer::new(&keys, &store);
+
+        assert!(matches!(
+            initializer.initialize(INTERACTION),
+            Err(InitError::SecureStore(error))
+                if error.kind() == KeyProviderErrorKind::BackendFailure
+        ));
+        let pending = store.pending().unwrap();
+        let pending_key_id = inspect_envelope(&pending).unwrap().key_id;
+        assert!(keys.contains(&pending_key_id));
+
+        assert!(matches!(
+            initializer.initialize(INTERACTION).unwrap(),
+            InitOutcome::Created { key_id, .. } if key_id == pending_key_id
+        ));
+        assert_eq!(store.live().as_deref(), Some(pending.as_slice()));
+        assert!(store.pending().is_none());
+        assert_eq!(keys.store_calls(), 1);
+        assert_eq!(keys.key_count(), 1);
+    }
+
+    #[test]
     fn repeated_init_resumes_a_pending_envelope_with_its_existing_key() {
         let keys = MemoryKeyProvider::new();
         let store = MemoryVaultStore::new();
@@ -533,6 +559,15 @@ mod tests {
         assert!(store.live().is_none());
         assert!(store.pending().is_some());
         assert_eq!(keys.key_count(), 1);
+
+        assert!(matches!(
+            Initializer::new(&keys, &store)
+                .initialize(INTERACTION)
+                .unwrap(),
+            InitOutcome::Created { .. }
+        ));
+        assert!(store.pending().is_none());
+        assert_eq!(keys.store_calls(), 1);
     }
 
     #[test]

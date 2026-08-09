@@ -591,7 +591,18 @@ mod tests {
             RebuildError::CommitOutcomeIndeterminate
         );
         assert_eq!(store.live().as_deref(), Some(old_live.as_slice()));
-        assert!(store.rebuild_pending().is_some());
+        let candidate = store.rebuild_pending().unwrap();
+
+        let mut confirmer = ScriptedConfirmer::accepting();
+        RebuildOperations::new(&keys, &store)
+            .rebuild(INTERACTION, &mut confirmer)
+            .unwrap();
+        assert_eq!(store.live().as_deref(), Some(candidate.as_slice()));
+        assert!(store.rebuild_pending().is_none());
+        let bundles = store
+            .shared_read::<_, VaultStoreError, _>(|read| read.read_recovery_bundles())
+            .unwrap();
+        assert_eq!(bundles.len(), 1);
     }
 
     #[test]
@@ -676,6 +687,34 @@ mod tests {
         assert_eq!(store.live().as_deref(), Some(old_live.as_slice()));
         assert!(store.rebuild_pending().is_some());
         assert_eq!(keys.key_count(), 1);
+    }
+
+    #[test]
+    fn retry_promotes_a_candidate_whose_key_store_reported_failure_after_commit() {
+        let (keys, store, _, old_live) = initialized_with_secret();
+        keys.fail_next_store_after_commit(KeyProviderErrorKind::BackendFailure);
+        let mut confirmer = ScriptedConfirmer::accepting();
+
+        assert!(matches!(
+            RebuildOperations::new(&keys, &store).rebuild(INTERACTION, &mut confirmer),
+            Err(RebuildError::SecureStore(error))
+                if error.kind() == KeyProviderErrorKind::BackendFailure
+        ));
+        let candidate = store.rebuild_pending().unwrap();
+        let candidate_key_id = inspect_envelope(&candidate).unwrap().key_id;
+        assert!(keys.contains(&candidate_key_id));
+        assert_eq!(store.live().as_deref(), Some(old_live.as_slice()));
+        assert_eq!(keys.store_calls(), 2);
+
+        let mut confirmer = ScriptedConfirmer::accepting();
+        let receipt = RebuildOperations::new(&keys, &store)
+            .rebuild(INTERACTION, &mut confirmer)
+            .unwrap();
+        assert_eq!(receipt.key_id, candidate_key_id);
+        assert_eq!(store.live().as_deref(), Some(candidate.as_slice()));
+        assert!(store.rebuild_pending().is_none());
+        assert_eq!(keys.store_calls(), 2);
+        assert_eq!(keys.key_count(), 2);
     }
 
     #[test]
