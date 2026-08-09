@@ -117,8 +117,9 @@ impl ZshConfigEditor {
         self.verify_unchanged(&snapshot)?;
         fs::rename(temporary.path(), &self.rc_file).map_err(map_io)?;
 
-        let committed =
-            read_regular_file(&self.rc_file)?.ok_or(ZshConfigError::OutcomeIndeterminate)?;
+        let committed = read_regular_file(&self.rc_file)
+            .map_err(|_| ZshConfigError::OutcomeIndeterminate)?
+            .ok_or(ZshConfigError::OutcomeIndeterminate)?;
         if committed.bytes != replacement {
             return Err(ZshConfigError::OutcomeIndeterminate);
         }
@@ -162,8 +163,9 @@ impl ZshConfigEditor {
         self.verify_unchanged(&snapshot)?;
         fs::rename(temporary.path(), &self.rc_file).map_err(map_io)?;
 
-        let committed =
-            read_regular_file(&self.rc_file)?.ok_or(ZshConfigError::OutcomeIndeterminate)?;
+        let committed = read_regular_file(&self.rc_file)
+            .map_err(|_| ZshConfigError::OutcomeIndeterminate)?
+            .ok_or(ZshConfigError::OutcomeIndeterminate)?;
         if committed.bytes != replacement {
             return Err(ZshConfigError::OutcomeIndeterminate);
         }
@@ -238,7 +240,7 @@ impl ZshConfigEditor {
 
         let temporary = TemporaryFile::write(parent, &source.bytes, source.identity.mode)?;
         match fs::hard_link(temporary.path(), &backup) {
-            Ok(()) => sync_directory(parent).map_err(map_io),
+            Ok(()) => sync_directory(parent).map_err(|_| ZshConfigError::OutcomeIndeterminate),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let metadata = fs::symlink_metadata(&backup).map_err(map_io)?;
                 validate_owned_regular(&metadata)

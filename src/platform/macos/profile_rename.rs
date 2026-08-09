@@ -105,8 +105,8 @@ impl ApplicationOperationLock {
         if sync_directory(&self.directory).is_err() {
             return Err(ProfileRenameStoreError::OutcomeIndeterminate);
         }
-        match self.read_intent()? {
-            Some(committed) if committed == *intent => Ok(()),
+        match self.read_intent() {
+            Ok(Some(committed)) if committed == *intent => Ok(()),
             _ => Err(ProfileRenameStoreError::OutcomeIndeterminate),
         }
     }
@@ -121,18 +121,18 @@ impl ApplicationOperationLock {
             None => return Ok(()),
         }
         fs::remove_file(self.directory.join(INTENT_FILE)).map_err(map_io)?;
-        // A crash may restore an unsynced marker, but replay only verifies the
-        // already-completed resources and removes the marker again.
-        let _ = sync_directory(&self.directory);
-        if self.read_intent()?.is_some() {
-            Err(ProfileRenameStoreError::OutcomeIndeterminate)
-        } else {
-            Ok(())
+        if sync_directory(&self.directory).is_err() {
+            return Err(ProfileRenameStoreError::OutcomeIndeterminate);
+        }
+        match self.read_intent() {
+            Ok(None) => Ok(()),
+            _ => Err(ProfileRenameStoreError::OutcomeIndeterminate),
         }
     }
 }
 
 fn prepare_directory(path: &Path, create: bool) -> Result<bool, ProfileRenameStoreError> {
+    let mut created = false;
     match fs::symlink_metadata(path) {
         Ok(metadata) => validate_directory(&metadata)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
@@ -140,12 +140,17 @@ fn prepare_directory(path: &Path, create: bool) -> Result<bool, ProfileRenameSto
             builder.mode(0o700);
             builder.create(path).map_err(map_io)?;
             validate_directory(&fs::symlink_metadata(path).map_err(map_io)?)?;
+            created = true;
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(map_io(error)),
     }
     if !system::is_apfs(path).map_err(map_io)? {
         return Err(ProfileRenameStoreError::UnsupportedStorage);
+    }
+    if created {
+        let parent = path.parent().ok_or(ProfileRenameStoreError::UnsafePath)?;
+        sync_directory(parent).map_err(|_| ProfileRenameStoreError::OutcomeIndeterminate)?;
     }
     Ok(true)
 }
@@ -342,7 +347,7 @@ impl Drop for TemporaryFile {
 fn validate_directory(metadata: &fs::Metadata) -> Result<(), ProfileRenameStoreError> {
     if !metadata.file_type().is_dir()
         || metadata.uid() != system::effective_user_id()
-        || metadata.mode() & 0o777 != 0o700
+        || metadata.mode() & 0o7777 != 0o700
     {
         Err(ProfileRenameStoreError::UnsafePath)
     } else {
@@ -354,7 +359,7 @@ fn validate_regular(file: &File) -> Result<(), ProfileRenameStoreError> {
     let metadata = file.metadata().map_err(map_io)?;
     if !metadata.file_type().is_file()
         || metadata.uid() != system::effective_user_id()
-        || metadata.mode() & 0o777 != 0o600
+        || metadata.mode() & 0o7777 != 0o600
     {
         Err(ProfileRenameStoreError::UnsafePath)
     } else {

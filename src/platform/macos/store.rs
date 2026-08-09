@@ -592,18 +592,39 @@ fn read_purge_envelope(
 }
 
 fn stage_full_purge(directory: &Path) -> Result<CommitOutcome, VaultStoreError> {
+    let purge_existed = match fs::symlink_metadata(directory.join(FULL_PURGE_DIRECTORY)) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(map_directory_io(error)),
+    };
     let purge = ensure_full_purge_directory(directory)?;
     let existing_plan = read_full_purge_plan(&purge)?;
     if existing_plan.is_some() && active_full_purge_state_exists(directory)? {
         return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
     }
 
-    for name in [LIVE_FILE, INIT_PENDING_FILE, REBUILD_PENDING_FILE] {
-        move_full_purge_entry(directory, &purge, name, false)?;
+    let mut changed = !purge_existed;
+    let stage_result = (|| {
+        for name in [LIVE_FILE, INIT_PENDING_FILE, REBUILD_PENDING_FILE] {
+            move_full_purge_entry(directory, &purge, name, false, &mut changed)?;
+        }
+        move_full_purge_write_temporaries(directory, &purge, &mut changed)?;
+        move_full_purge_entry(directory, &purge, RECOVERY_DIRECTORY, true, &mut changed)?;
+        move_full_purge_entry(
+            directory,
+            &purge,
+            RECOVERY_PURGE_DIRECTORY,
+            true,
+            &mut changed,
+        )
+    })();
+    if let Err(error) = stage_result {
+        return if changed {
+            Ok(CommitOutcome::Indeterminate)
+        } else {
+            Err(error)
+        };
     }
-    move_full_purge_write_temporaries(directory, &purge)?;
-    move_full_purge_entry(directory, &purge, RECOVERY_DIRECTORY, true)?;
-    move_full_purge_entry(directory, &purge, RECOVERY_PURGE_DIRECTORY, true)?;
 
     if sync_directory(directory).is_err() || sync_directory(&purge).is_err() {
         return Ok(CommitOutcome::Indeterminate);
@@ -640,6 +661,7 @@ fn move_full_purge_entry(
     purge: &Path,
     name: &str,
     is_directory: bool,
+    changed: &mut bool,
 ) -> Result<(), VaultStoreError> {
     let source = directory.join(name);
     let destination = purge.join(name);
@@ -669,7 +691,9 @@ fn move_full_purge_entry(
             } else {
                 validate_regular_file(&source_metadata)?;
             }
-            fs::rename(source, destination).map_err(map_file_io)
+            fs::rename(source, destination).map_err(map_file_io)?;
+            *changed = true;
+            Ok(())
         }
         (Err(source_error), Ok(destination_metadata))
             if source_error.kind() == io::ErrorKind::NotFound =>
@@ -715,6 +739,7 @@ fn active_full_purge_state_exists(directory: &Path) -> Result<bool, VaultStoreEr
 fn move_full_purge_write_temporaries(
     directory: &Path,
     purge: &Path,
+    changed: &mut bool,
 ) -> Result<(), VaultStoreError> {
     let names = fs::read_dir(directory)
         .map_err(map_directory_io)?
@@ -730,7 +755,7 @@ fn move_full_purge_write_temporaries(
         .into_iter()
         .filter(|name| is_write_temporary_name(name))
     {
-        move_full_purge_entry(directory, purge, &name, false)?;
+        move_full_purge_entry(directory, purge, &name, false, changed)?;
     }
     Ok(())
 }
@@ -897,34 +922,48 @@ fn remove_full_purge_pending(directory: &Path) -> Result<CommitOutcome, VaultSto
         return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
     }
 
-    for name in [
-        LIVE_FILE,
-        INIT_PENDING_FILE,
-        REBUILD_PENDING_FILE,
-        RECOVERY_DIRECTORY,
-        RECOVERY_PURGE_DIRECTORY,
-        FULL_PURGE_PLAN_TEMP_FILE,
-    ] {
-        remove_full_purge_entry(&purge.join(name))?;
+    let mut changed = false;
+    let cleanup_result = (|| {
+        for name in [
+            LIVE_FILE,
+            INIT_PENDING_FILE,
+            REBUILD_PENDING_FILE,
+            RECOVERY_DIRECTORY,
+            RECOVERY_PURGE_DIRECTORY,
+            FULL_PURGE_PLAN_TEMP_FILE,
+        ] {
+            remove_full_purge_entry(&purge.join(name), &mut changed)?;
+        }
+        let temporary_names = fs::read_dir(&purge)
+            .map_err(map_directory_io)?
+            .map(|entry| {
+                entry
+                    .map_err(map_directory_io)?
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for name in temporary_names
+            .into_iter()
+            .filter(|name| is_write_temporary_name(name))
+        {
+            remove_full_purge_entry(&purge.join(name), &mut changed)?;
+        }
+        sync_directory(&purge).map_err(map_directory_io)?;
+        remove_full_purge_entry(&purge.join(FULL_PURGE_PLAN_FILE), &mut changed)?;
+        sync_directory(&purge).map_err(map_directory_io)?;
+        fs::remove_dir(&purge).map_err(map_directory_io)?;
+        changed = true;
+        Ok(())
+    })();
+    if let Err(error) = cleanup_result {
+        return if changed {
+            Ok(CommitOutcome::Indeterminate)
+        } else {
+            Err(error)
+        };
     }
-    let temporary_names = fs::read_dir(&purge)
-        .map_err(map_directory_io)?
-        .map(|entry| {
-            entry
-                .map_err(map_directory_io)?
-                .file_name()
-                .into_string()
-                .map_err(|_| VaultStoreError::new(VaultStoreErrorKind::Conflict))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    for name in temporary_names
-        .into_iter()
-        .filter(|name| is_write_temporary_name(name))
-    {
-        remove_full_purge_entry(&purge.join(name))?;
-    }
-    remove_full_purge_entry(&purge.join(FULL_PURGE_PLAN_FILE))?;
-    fs::remove_dir(&purge).map_err(map_directory_io)?;
     if sync_directory(directory).is_err() {
         return Ok(CommitOutcome::Indeterminate);
     }
@@ -935,7 +974,7 @@ fn remove_full_purge_pending(directory: &Path) -> Result<CommitOutcome, VaultSto
     }
 }
 
-fn remove_full_purge_entry(path: &Path) -> Result<(), VaultStoreError> {
+fn remove_full_purge_entry(path: &Path, changed: &mut bool) -> Result<(), VaultStoreError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -944,13 +983,16 @@ fn remove_full_purge_entry(path: &Path) -> Result<(), VaultStoreError> {
     if metadata.is_dir() {
         validate_directory(&metadata)?;
         for entry in fs::read_dir(path).map_err(map_directory_io)? {
-            remove_full_purge_entry(&entry.map_err(map_directory_io)?.path())?;
+            remove_full_purge_entry(&entry.map_err(map_directory_io)?.path(), changed)?;
         }
-        fs::remove_dir(path).map_err(map_directory_io)
+        sync_directory(path).map_err(map_directory_io)?;
+        fs::remove_dir(path).map_err(map_directory_io)?;
     } else {
         validate_regular_file(&metadata)?;
-        fs::remove_file(path).map_err(map_file_io)
+        fs::remove_file(path).map_err(map_file_io)?;
     }
+    *changed = true;
+    Ok(())
 }
 
 fn read_artifact(
@@ -1246,8 +1288,16 @@ fn stage_recovery_purge(
     validate_recovery_purge_key_ids(key_ids)?;
     let recovery = ensure_recovery_directory(directory)?;
     let purge = ensure_recovery_purge_directory(directory)?;
+    let existing_plan = read_recovery_purge_plan(&purge, bundle_id)?;
+    if existing_plan
+        .as_deref()
+        .is_some_and(|existing| existing != key_ids)
+    {
+        return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict));
+    }
     let active = recovery.join(bundle_id.to_hex());
     let staged = purge.join(bundle_id.to_hex());
+    let mut changed = false;
     let active_state = fs::symlink_metadata(&active);
     let staged_state = fs::symlink_metadata(&staged);
     match (active_state, staged_state) {
@@ -1257,6 +1307,7 @@ fn stage_recovery_purge(
             validate_directory(&active_metadata)?;
             read_recovery_bundle(&active, bundle_id)?;
             fs::rename(&active, &staged).map_err(map_directory_io)?;
+            changed = true;
             if sync_directory(&recovery).is_err() || sync_directory(&purge).is_err() {
                 return Ok(CommitOutcome::Indeterminate);
             }
@@ -1280,7 +1331,7 @@ fn stage_recovery_purge(
         (Err(error), _) | (_, Err(error)) => return Err(map_directory_io(error)),
     }
 
-    let plan_outcome = match read_recovery_purge_plan(&purge, bundle_id)? {
+    let plan_outcome = match existing_plan {
         Some(existing) if existing == key_ids => {
             if sync_directory(&purge).is_err() {
                 CommitOutcome::Indeterminate
@@ -1288,14 +1339,24 @@ fn stage_recovery_purge(
                 CommitOutcome::Committed
             }
         }
-        Some(_) => return Err(VaultStoreError::new(VaultStoreErrorKind::Conflict)),
+        Some(_) => unreachable!("conflicting recovery purge plan rejected before staging"),
         None => {
             let plan = encode_recovery_purge_plan(bundle_id, key_ids)?;
-            publish_recovery_purge_plan(&purge, bundle_id, &plan)?
+            let outcome = match publish_recovery_purge_plan(&purge, bundle_id, &plan) {
+                Ok(outcome) => outcome,
+                Err(_) if changed => return Ok(CommitOutcome::Indeterminate),
+                Err(error) => return Err(error),
+            };
+            changed = true;
+            outcome
         }
     };
 
-    let pending = read_recovery_purge_pending(directory)?;
+    let pending = match read_recovery_purge_pending(directory) {
+        Ok(pending) => pending,
+        Err(_) if changed => return Ok(CommitOutcome::Indeterminate),
+        Err(error) => return Err(error),
+    };
     if pending
         .iter()
         .any(|pending| pending.id == bundle_id && pending.key_ids.as_deref() == Some(key_ids))
@@ -1728,6 +1789,7 @@ fn cleanup_recovery_temporary(directory: &Path) {
         RECOVERY_MANIFEST_FILE,
         RECOVERY_LIVE_FILE,
         RECOVERY_INIT_FILE,
+        RECOVERY_REBUILD_FILE,
     ] {
         let _ = fs::remove_file(directory.join(name));
     }
@@ -1781,7 +1843,7 @@ fn temporary_name() -> Result<String, VaultStoreError> {
 fn validate_directory(metadata: &Metadata) -> Result<(), VaultStoreError> {
     if !metadata.file_type().is_dir()
         || metadata.uid() != system::effective_user_id()
-        || metadata.mode() & 0o777 != 0o700
+        || metadata.mode() & 0o7777 != 0o700
     {
         return Err(VaultStoreError::new(VaultStoreErrorKind::UnsafePath));
     }
@@ -1791,7 +1853,8 @@ fn validate_directory(metadata: &Metadata) -> Result<(), VaultStoreError> {
 fn validate_regular_file(metadata: &Metadata) -> Result<(), VaultStoreError> {
     if !metadata.file_type().is_file()
         || metadata.uid() != system::effective_user_id()
-        || metadata.mode() & 0o777 != 0o600
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
     {
         return Err(VaultStoreError::new(VaultStoreErrorKind::UnsafePath));
     }
@@ -1925,6 +1988,113 @@ mod tests {
             );
         }
         assert!(!test.data().join(INIT_PENDING_FILE).exists());
+    }
+
+    #[test]
+    fn rejects_hard_linked_internal_artifacts() {
+        let test = TestDirectory::new();
+        let store = LocalVaultStore::new(test.data());
+        store
+            .initialization_transaction::<_, VaultStoreError, _>(|transaction| {
+                transaction.create_init_pending(b"encrypted-envelope")?;
+                transaction.promote_init_pending()?;
+                Ok(())
+            })
+            .unwrap();
+        fs::hard_link(test.data().join(LIVE_FILE), test.0.join("vault-alias")).unwrap();
+
+        let error = store
+            .shared_read::<_, VaultStoreError, _>(|transaction| transaction.read_live())
+            .unwrap_err();
+        assert_eq!(error.kind(), VaultStoreErrorKind::UnsafePath);
+    }
+
+    #[test]
+    fn partial_full_purge_staging_is_indeterminate() {
+        let test = TestDirectory::new();
+        let store = LocalVaultStore::new(test.data());
+        store
+            .initialization_transaction::<_, VaultStoreError, _>(|transaction| {
+                transaction.create_init_pending(b"encrypted-envelope")?;
+                transaction.promote_init_pending()?;
+                Ok(())
+            })
+            .unwrap();
+        let outside = test.0.join("outside-recovery");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, test.data().join(RECOVERY_DIRECTORY)).unwrap();
+
+        let outcome = store
+            .exclusive_transaction::<_, VaultStoreError, _>(|transaction| {
+                transaction.stage_full_purge()
+            })
+            .unwrap();
+
+        assert_eq!(outcome, CommitOutcome::Indeterminate);
+        assert!(!test.data().join(LIVE_FILE).exists());
+        assert!(
+            test.data()
+                .join(FULL_PURGE_DIRECTORY)
+                .join(LIVE_FILE)
+                .exists()
+        );
+        assert!(test.data().join(RECOVERY_DIRECTORY).is_symlink());
+    }
+
+    #[test]
+    fn conflicting_recovery_purge_plan_is_rejected_before_the_bundle_moves() {
+        let test = TestDirectory::new();
+        let store = LocalVaultStore::new(test.data());
+        let bundle_id = RecoveryBundleId::from_bytes([0x44; 16]);
+        store
+            .initialization_transaction::<_, VaultStoreError, _>(|transaction| {
+                transaction.preserve_recovery(
+                    RecoveryBundleMetadata {
+                        id: bundle_id,
+                        created_at_unix_seconds: 1,
+                        reason: RecoveryReason::Reset,
+                    },
+                    RecoveryArtifacts {
+                        live: Some(b"encrypted-envelope"),
+                        init_pending: None,
+                        rebuild_pending: None,
+                    },
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let purge = ensure_recovery_purge_directory(&test.data()).unwrap();
+        let existing_keys = [KeyId::from_bytes([2; 16])];
+        let plan = encode_recovery_purge_plan(bundle_id, &existing_keys).unwrap();
+        publish_recovery_purge_plan(&purge, bundle_id, &plan).unwrap();
+
+        let error = store
+            .exclusive_transaction::<_, VaultStoreError, _>(|transaction| {
+                transaction.stage_recovery_purge(bundle_id, &[KeyId::from_bytes([1; 16])])
+            })
+            .unwrap_err();
+
+        assert_eq!(error.kind(), VaultStoreErrorKind::Conflict);
+        assert!(
+            test.data()
+                .join(RECOVERY_DIRECTORY)
+                .join(bundle_id.to_hex())
+                .exists()
+        );
+        assert!(!purge.join(bundle_id.to_hex()).exists());
+    }
+
+    #[test]
+    fn failed_recovery_preparation_cleanup_removes_rebuild_artifacts() {
+        let test = TestDirectory::new();
+        let temporary = test.0.join("recovery.pending");
+        let mut builder = DirBuilder::new();
+        builder.mode(0o700).create(&temporary).unwrap();
+        fs::write(temporary.join(RECOVERY_REBUILD_FILE), b"ciphertext").unwrap();
+
+        cleanup_recovery_temporary(&temporary);
+
+        assert!(!temporary.exists());
     }
 
     #[test]

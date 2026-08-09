@@ -72,7 +72,7 @@ fn validate_path(path: &Path) -> Result<(), RestoreSourceError> {
 fn validate_file(metadata: &Metadata) -> Result<(), RestoreSourceError> {
     if !metadata.file_type().is_file()
         || metadata.uid() != system::effective_user_id()
-        || metadata.permissions().mode() & 0o777 != 0o600
+        || metadata.permissions().mode() & 0o7777 != 0o600
     {
         Err(RestoreSourceError::UnsafePath)
     } else {

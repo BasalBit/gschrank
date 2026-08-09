@@ -98,7 +98,8 @@ impl ShellPreferenceStore {
         let temporary = TemporaryFile::write(&self.directory, &bytes)?;
         fs::rename(temporary.path(), self.directory.join(CONFIG_FILE)).map_err(map_file_io)?;
 
-        let committed = open_optional_regular(&self.directory.join(CONFIG_FILE))?
+        let committed = open_optional_regular(&self.directory.join(CONFIG_FILE))
+            .map_err(|_| PreferenceError::OutcomeIndeterminate)?
             .ok_or(PreferenceError::OutcomeIndeterminate)?;
         let mut committed_bytes = Vec::new();
         committed
@@ -148,15 +149,25 @@ impl ShellPreferenceStore {
             changed = true;
         }
         for path in temporary_paths {
-            fs::remove_file(path).map_err(map_file_io)?;
+            if let Err(error) = fs::remove_file(path) {
+                return if changed {
+                    Err(PreferenceError::OutcomeIndeterminate)
+                } else {
+                    Err(map_file_io(error))
+                };
+            }
             changed = true;
         }
         if !changed {
             return Ok(());
         }
         sync_directory(&self.directory).map_err(|_| PreferenceError::OutcomeIndeterminate)?;
-        if open_optional_regular(&config_path)?.is_some()
-            || !config_temporary_paths(&self.directory)?.is_empty()
+        if open_optional_regular(&config_path)
+            .map_err(|_| PreferenceError::OutcomeIndeterminate)?
+            .is_some()
+            || !config_temporary_paths(&self.directory)
+                .map_err(|_| PreferenceError::OutcomeIndeterminate)?
+                .is_empty()
         {
             Err(PreferenceError::OutcomeIndeterminate)
         } else {
@@ -165,6 +176,7 @@ impl ShellPreferenceStore {
     }
 
     fn prepare_directory(&self, create: bool) -> Result<bool, PreferenceError> {
+        let mut created = false;
         match fs::symlink_metadata(&self.directory) {
             Ok(metadata) => validate_directory(&metadata)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
@@ -174,12 +186,17 @@ impl ShellPreferenceStore {
                 validate_directory(
                     &fs::symlink_metadata(&self.directory).map_err(map_directory_io)?,
                 )?;
+                created = true;
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(map_directory_io(error)),
         }
         if !system::is_apfs(&self.directory).map_err(map_directory_io)? {
             return Err(PreferenceError::UnsupportedStorage);
+        }
+        if created {
+            let parent = self.directory.parent().ok_or(PreferenceError::UnsafePath)?;
+            sync_directory(parent).map_err(|_| PreferenceError::OutcomeIndeterminate)?;
         }
         Ok(true)
     }
@@ -299,7 +316,7 @@ fn read_config_bytes(config: File) -> Result<Vec<u8>, PreferenceError> {
 fn validate_directory(metadata: &Metadata) -> Result<(), PreferenceError> {
     if !metadata.file_type().is_dir()
         || metadata.uid() != system::effective_user_id()
-        || metadata.mode() & 0o777 != 0o700
+        || metadata.mode() & 0o7777 != 0o700
     {
         Err(PreferenceError::UnsafePath)
     } else {
@@ -310,7 +327,8 @@ fn validate_directory(metadata: &Metadata) -> Result<(), PreferenceError> {
 fn validate_regular(metadata: &Metadata) -> Result<(), PreferenceError> {
     if !metadata.file_type().is_file()
         || metadata.uid() != system::effective_user_id()
-        || metadata.mode() & 0o777 != 0o600
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
     {
         Err(PreferenceError::UnsafePath)
     } else {
