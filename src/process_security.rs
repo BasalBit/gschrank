@@ -66,7 +66,8 @@ const fn suppress_core_dumps() -> CoreDumpSuppression {
 #[cfg(test)]
 mod tests {
     use std::{
-        process::Command,
+        io::{Read, Write},
+        process::{Command, Stdio},
         sync::{Arc, Mutex},
     };
 
@@ -131,6 +132,37 @@ mod tests {
     }
 
     #[test]
+    fn rich_panic_payload_is_absent_with_all_backtrace_modes() {
+        for backtrace in ["1", "full"] {
+            let canary = crate::testing::AcceptanceCanary::unique("panic");
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "process_security::tests::rich_panic_subprocess_fixture",
+                ])
+                .env("GSCHRANK_RICH_PANIC_FIXTURE", "1")
+                .env("RUST_BACKTRACE", backtrace)
+                .env("RUST_LIB_BACKTRACE", backtrace)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(canary.value().as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(!output.status.success());
+            canary.assert_absent("panic stdout", &output.stdout);
+            canary.assert_absent("panic stderr and backtrace", &output.stderr);
+        }
+    }
+
+    #[test]
     #[ignore = "subprocess fixture"]
     fn panic_hook_subprocess_fixture() {
         if std::env::var_os("GSCHRANK_PANIC_HOOK_TEST").is_none() {
@@ -138,5 +170,20 @@ mod tests {
         }
         install_sanitized_panic_hook();
         panic!("CANARY-secret-panic-payload");
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn rich_panic_subprocess_fixture() {
+        if std::env::var_os("GSCHRANK_RICH_PANIC_FIXTURE").is_none() {
+            return;
+        }
+        let mut payload = String::new();
+        std::io::stdin()
+            .lock()
+            .read_to_string(&mut payload)
+            .unwrap();
+        install_sanitized_panic_hook();
+        panic::panic_any(payload);
     }
 }

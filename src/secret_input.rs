@@ -134,7 +134,10 @@ fn read_hidden_terminal_secret() -> Result<SecretValue, SecretInputError> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Cursor};
+    use std::{
+        io::{self, BufRead, BufReader, Cursor, Read, Write},
+        process::{Command, Stdio},
+    };
 
     use super::*;
 
@@ -207,5 +210,84 @@ mod tests {
             );
             assert_eq!(error.to_string(), "value must be UTF-8 without NUL bytes");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stdin_secret_never_enters_process_arguments_or_public_output() {
+        let canary = crate::testing::AcceptanceCanary::unique("process");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "secret_input::tests::stdin_process_observation_fixture",
+                "--nocapture",
+            ])
+            .env("GSCHRANK_STDIN_OBSERVATION_FIXTURE", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(&(canary.value().len() as u64).to_be_bytes())
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(canary.value().as_bytes())
+            .unwrap();
+
+        let mut stdout_reader = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = Vec::new();
+        loop {
+            let mut line = String::new();
+            assert_ne!(stdout_reader.read_line(&mut line).unwrap(), 0);
+            stdout.extend_from_slice(line.as_bytes());
+            if line == "ready\n" {
+                break;
+            }
+        }
+
+        let process = Command::new("/bin/ps")
+            .args(["-p", &child.id().to_string(), "-o", "command="])
+            .output()
+            .unwrap();
+        assert!(process.status.success());
+        canary.assert_absent("process arguments and title", &process.stdout);
+        drop(child.stdin.take());
+        stdout_reader.read_to_end(&mut stdout).unwrap();
+        let mut stderr = Vec::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_end(&mut stderr)
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        canary.assert_absent("fixture stdout", &stdout);
+        canary.assert_absent("fixture stderr", &stderr);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn stdin_process_observation_fixture() {
+        if std::env::var_os("GSCHRANK_STDIN_OBSERVATION_FIXTURE").is_none() {
+            return;
+        }
+        let mut stdin = std::io::stdin().lock();
+        let mut length = [0_u8; 8];
+        stdin.read_exact(&mut length).unwrap();
+        let value = read_stream((&mut stdin).take(u64::from_be_bytes(length))).unwrap();
+        assert!(value.expose().starts_with(b" GSCHRANK_ACCEPTANCE_CANARY_"));
+        println!("ready");
+        std::io::stdout().flush().unwrap();
+        let mut end = [0_u8; 1];
+        assert_eq!(stdin.read(&mut end).unwrap(), 0);
     }
 }

@@ -1431,6 +1431,76 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_eval_failure_clears_private_payload_without_tracing_it() {
+        let canary = crate::testing::AcceptanceCanary::unique("eval-failure");
+        let fake = TestDirectory::with_fake_gschrank(
+            "#!/bin/zsh -f\nbuiltin command /bin/cat -- \"$0:h/transition\"\n",
+        );
+        let mut failing_source = ZshEmitter::new()
+            .emit_apply(&transition(canary.value()))
+            .unwrap()
+            .to_vec();
+        failing_source.extend_from_slice(b"builtin false;");
+        fs::write(fake.path().join("transition"), failing_source).unwrap();
+        let wrapper = ZshEmitter::new().emit_wrapper(false);
+        let output = run_zsh_parts_with_path(
+            b"",
+            wrapper.as_bytes(),
+            b"builtin setopt XTRACE VERBOSE\ngschrank load work\nGSCHRANK_TEST_RC=$?\nbuiltin unsetopt XTRACE VERBOSE\nif (( ${+parameters[GSCHRANK_SHELL_PAYLOAD_V1]} )); then exit 98; fi\nexit $GSCHRANK_TEST_RC\n",
+            Some(fake.path()),
+        );
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("shell rejected"));
+        canary.assert_absent("eval failure trace", &output.stderr);
+    }
+
+    #[test]
+    fn interactive_history_never_records_a_captured_secret_transition() {
+        let canary = crate::testing::AcceptanceCanary::unique("history");
+        let fake = TestDirectory::with_fake_gschrank(
+            "#!/bin/zsh -f\nbuiltin command /bin/cat -- \"$0:h/transition\"\n",
+        );
+        let source = ZshEmitter::new()
+            .emit_apply(&transition(canary.value()))
+            .unwrap();
+        fs::write(fake.path().join("transition"), &source).unwrap();
+        let history = fake.path().join("history");
+        let wrapper = ZshEmitter::new().emit_wrapper(false);
+        let mut command = Command::new("/bin/zsh");
+        command
+            .args(["-d", "-f", "-i"])
+            .env("PATH", fake.path())
+            .env("HISTFILE", &history)
+            .env("HISTSIZE", "10000")
+            .env("SAVEHIST", "10000")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(wrapper.as_bytes()).unwrap();
+        stdin
+            .write_all(
+                b"\nbuiltin setopt INC_APPEND_HISTORY\ngschrank load work\nbuiltin command /usr/bin/printenv TEST_VALUE\nbuiltin fc -W\nexit\n",
+            )
+            .unwrap();
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let mut expected = canary.value().as_bytes().to_vec();
+        expected.push(b'\n');
+        assert_eq!(output.stdout, expected);
+        canary.assert_absent("interactive transcript", &output.stderr);
+        let history = fs::read(history).unwrap();
+        canary.assert_absent("shell history", &history);
+        assert!(
+            !history
+                .windows(source.len())
+                .any(|part| part == source.as_slice())
+        );
+    }
+
+    #[test]
     fn wrapper_localizes_tracing_while_it_evaluates_captured_source() {
         let fake = TestDirectory::with_fake_gschrank(
             "#!/bin/zsh -f\nbuiltin print -rn -- \"builtin export -- WRAPPED_VALUE='CANARY-wrapper-secret';\"\n",

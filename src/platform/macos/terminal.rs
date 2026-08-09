@@ -329,4 +329,38 @@ mod tests {
         assert_eq!(handle.join().unwrap(), Err(HiddenInputError::Interrupted));
         assert!(echo_enabled(slave.as_raw_fd()));
     }
+
+    #[test]
+    fn eof_and_oversized_input_restore_terminal_state() {
+        let (master, slave) = pseudo_terminal();
+        let reader = Arc::clone(&slave);
+        let handle = thread::spawn(move || read_hidden_fd(reader.as_raw_fd(), 256));
+        wait_until_echo_is_disabled(slave.as_raw_fd());
+        drop(master);
+        assert_eq!(handle.join().unwrap().unwrap().as_slice(), b"");
+        assert!(echo_enabled(slave.as_raw_fd()));
+
+        let (mut master, slave) = pseudo_terminal();
+        let reader = Arc::clone(&slave);
+        let handle = thread::spawn(move || read_hidden_fd(reader.as_raw_fd(), 4));
+        wait_until_echo_is_disabled(slave.as_raw_fd());
+        master.write_all(b"abcdef\n").unwrap();
+        assert_eq!(handle.join().unwrap().unwrap().as_slice(), b"abcde");
+        assert!(echo_enabled(slave.as_raw_fd()));
+    }
+
+    #[test]
+    fn unwinding_drops_the_terminal_guard_and_restores_echo() {
+        let (_master, slave) = pseudo_terminal();
+        let result = std::panic::catch_unwind({
+            let slave = Arc::clone(&slave);
+            move || {
+                let _guard = TerminalGuard::disable_echo(slave.as_raw_fd()).unwrap();
+                assert!(!echo_enabled(slave.as_raw_fd()));
+                panic!("injected hidden-input panic");
+            }
+        });
+        assert!(result.is_err());
+        assert!(echo_enabled(slave.as_raw_fd()));
+    }
 }

@@ -2726,11 +2726,7 @@ fn run_shell_parent(_command: ShellParentCommand) -> ExitCode {
 fn run_shell_init(shortcut: bool) -> ExitCode {
     let source = ZshEmitter::new().emit_wrapper(shortcut);
     let mut stdout = std::io::stdout().lock();
-    if stdout
-        .write_all(source.as_bytes())
-        .and_then(|()| stdout.flush())
-        .is_err()
-    {
+    if write_shell_source(&mut stdout, source.as_bytes()).is_err() {
         eprintln!("gschrank: failed to write the Zsh wrapper");
         return ExitCode::from(1);
     }
@@ -2849,15 +2845,16 @@ fn run_emit_zsh(context: OperationContext, operation: EmitOperation) -> ExitCode
         }
     };
     let mut stdout = std::io::stdout().lock();
-    if stdout
-        .write_all(&source)
-        .and_then(|()| stdout.flush())
-        .is_err()
-    {
+    if write_shell_source(&mut stdout, &source).is_err() {
         eprintln!("gschrank: failed to write the shell transition");
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
+}
+
+fn write_shell_source(writer: &mut impl Write, source: &[u8]) -> std::io::Result<()> {
+    writer.write_all(source)?;
+    writer.flush()
 }
 
 #[cfg(target_os = "macos")]
@@ -3039,7 +3036,56 @@ fn run_startup(_command: StartupCommand) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::*;
+
+    struct FaultingWriter {
+        limit: usize,
+        written: usize,
+        fail_flush: bool,
+    }
+
+    impl Write for FaultingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.written >= self.limit {
+                return Err(io::Error::other("injected shell pipe failure"));
+            }
+            let length = buffer.len().min(self.limit - self.written);
+            self.written += length;
+            Ok(length)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                Err(io::Error::other("injected shell flush failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn shell_source_writer_reports_closed_partial_and_unflushed_pipes() {
+        let source = b"private shell transition";
+        for limit in [0, source.len() / 2] {
+            let mut writer = FaultingWriter {
+                limit,
+                written: 0,
+                fail_flush: false,
+            };
+            assert!(write_shell_source(&mut writer, source).is_err());
+            assert_eq!(writer.written, limit);
+        }
+
+        let mut writer = FaultingWriter {
+            limit: source.len(),
+            written: 0,
+            fail_flush: true,
+        };
+        assert!(write_shell_source(&mut writer, source).is_err());
+        assert_eq!(writer.written, source.len());
+    }
 
     #[cfg(not(target_os = "macos"))]
     #[test]

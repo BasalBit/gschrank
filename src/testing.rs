@@ -2,7 +2,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use zeroize::Zeroizing;
@@ -16,6 +19,41 @@ use crate::{
         VaultTransaction,
     },
 };
+
+static NEXT_ACCEPTANCE_CANARY: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) struct AcceptanceCanary {
+    marker: String,
+    value: String,
+}
+
+impl AcceptanceCanary {
+    pub(crate) fn unique(case: &str) -> Self {
+        let id = NEXT_ACCEPTANCE_CANARY.fetch_add(1, Ordering::Relaxed);
+        let marker = format!("GSCHRANK_ACCEPTANCE_CANARY_{case}_{id}");
+        let value = format!(
+            " {marker} [31m ü🗝 'quote' \"double\" $HOME $(false) `false` \\ !*?[]\t\r\nembedded\ntrailing\n"
+        );
+        Self { marker, value }
+    }
+
+    pub(crate) fn marker(&self) -> &[u8] {
+        self.marker.as_bytes()
+    }
+
+    pub(crate) fn value(&self) -> &str {
+        &self.value
+    }
+
+    pub(crate) fn assert_absent(&self, surface: &str, bytes: &[u8]) {
+        assert!(
+            !bytes
+                .windows(self.marker().len())
+                .any(|window| window == self.marker()),
+            "acceptance canary appeared in {surface}"
+        );
+    }
+}
 
 pub(crate) struct MemoryKeyProvider {
     state: Mutex<MemoryKeyState>,

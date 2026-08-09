@@ -39,6 +39,9 @@ mod platform;
 #[cfg(test)]
 mod testing;
 
+#[cfg(test)]
+mod acceptance;
+
 pub use codec::PayloadError;
 pub use domain::{DomainError, EnvironmentName, Mutation, ProfileName, SecretValue, Vault};
 pub use envelope::{

@@ -376,6 +376,31 @@ mod tests {
     }
 
     #[test]
+    fn generated_malformed_payloads_never_panic() {
+        let valid = encode_payload(&fixture()).unwrap();
+        for length in 0..valid.len() {
+            assert_eq!(decode_error(&valid[..length]), PayloadError::Truncated);
+        }
+        for suffix_length in 1..64 {
+            let mut trailing = valid.to_vec();
+            trailing.resize(valid.len() + suffix_length, 0xa5);
+            assert_eq!(decode_error(&trailing), PayloadError::TrailingData);
+        }
+
+        let mut state = 0xd1b5_4a32_d192_ed03_u64;
+        for length in 0..1_024 {
+            let mut input = vec![0_u8; length];
+            for byte in &mut input {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state.to_le_bytes()[0];
+            }
+            let _ = decode_payload(&input);
+        }
+    }
+
+    #[test]
     fn rejects_noncanonical_profile_order() {
         let mut bytes = Vec::new();
         put_u16(&mut bytes, 1);

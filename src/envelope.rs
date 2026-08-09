@@ -536,6 +536,32 @@ mod tests {
     }
 
     #[test]
+    fn generated_malformed_envelopes_never_panic_or_authenticate() {
+        let (vault, vault_id, key_id, key) = fixture();
+        let envelope = seal_vault(&vault, vault_id, key_id, &key).unwrap();
+        for position in 0..envelope.len() {
+            for bit in 0..8 {
+                let mut mutated = envelope.to_vec();
+                mutated[position] ^= 1 << bit;
+                assert!(open_envelope(&mutated, &key).is_err());
+            }
+        }
+
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for length in 0..512 {
+            let mut input = vec![0_u8; length];
+            for byte in &mut input {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state.to_le_bytes()[0];
+            }
+            let _ = inspect_envelope(&input);
+            let _ = open_envelope(&input, &key);
+        }
+    }
+
+    #[test]
     fn identifiers_use_fixed_lowercase_hex() {
         assert_eq!(
             KeyId::from_bytes([0xab; 16]).to_hex(),

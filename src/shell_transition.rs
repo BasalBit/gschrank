@@ -228,6 +228,46 @@ mod tests {
     }
 
     #[test]
+    fn generated_metadata_combinations_are_revalidated_without_panicking() {
+        let protocols = [None, Some(""), Some("1"), Some("2"), Some("🗝")];
+        let profiles = [None, Some("work"), Some("bad name"), Some("GSCHRANK_BAD")];
+        let manifests = [
+            None,
+            Some(""),
+            Some("A"),
+            Some("A:B"),
+            Some("B:A"),
+            Some("A:A"),
+            Some("GSCHRANK_BAD"),
+            Some("A::B"),
+        ];
+        for protocol in protocols {
+            for profile in profiles {
+                for manifest in manifests {
+                    let result = ManagedState::from_metadata(protocol, profile, manifest);
+                    let expected_valid = matches!(
+                        (protocol, profile, manifest),
+                        (None, None, None) | (Some("1"), Some("work"), Some("" | "A" | "A:B"))
+                    );
+                    assert_eq!(
+                        result.is_ok(),
+                        expected_valid,
+                        "unexpected metadata result for {protocol:?}, {profile:?}, {manifest:?}"
+                    );
+                    if let Ok(state) = result {
+                        assert!(
+                            state
+                                .managed_names()
+                                .windows(2)
+                                .all(|pair| pair[0] < pair[1])
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn transition_owns_one_snapshot_and_fixed_failure_policy() {
         let mut vault = Vault::empty();
         let work = ProfileName::new("work").unwrap();
