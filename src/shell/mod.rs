@@ -10,7 +10,7 @@ use crate::{EnvironmentName, shell_transition::ShellTransition};
 
 pub(crate) use zsh::{
     ZSH_MANAGED_BLOCK_END, ZSH_MANAGED_BLOCK_START, ZSH_SHORTCUT_METADATA, ZSH_STARTUP_METADATA,
-    ZshEmitter, ZshManagedBlock,
+    ZSH_WRAPPER_HANDSHAKE, ZshEmitter, ZshManagedBlock,
 };
 
 /// Shell-specific source generation over validated shell-neutral inputs.

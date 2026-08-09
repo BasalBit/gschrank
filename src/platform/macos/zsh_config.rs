@@ -447,8 +447,20 @@ fn function_declares(statement: &[u8], name: &[u8]) -> bool {
 }
 
 fn command_declares(statement: &[u8], command: &[u8], name: &[u8]) -> bool {
-    command_remainder(statement, command)
-        .is_some_and(|rest| rest.split(u8::is_ascii_whitespace).any(|word| word == name))
+    command_remainder(statement, command).is_some_and(|rest| {
+        rest.split(u8::is_ascii_whitespace).any(|word| {
+            let word = match (word.first(), word.last()) {
+                (Some(b'\''), Some(b'\'')) | (Some(b'"'), Some(b'"')) if word.len() >= 2 => {
+                    &word[1..word.len() - 1]
+                }
+                _ => word,
+            };
+            word == name
+                || word
+                    .strip_prefix(name)
+                    .is_some_and(|remainder| remainder.starts_with(b"="))
+        })
+    })
 }
 
 fn command_remainder<'bytes>(statement: &'bytes [u8], command: &[u8]) -> Option<&'bytes [u8]> {
@@ -960,6 +972,24 @@ mod tests {
                 .unwrap()
                 .starts_with(shortcut_bytes)
         );
+
+        for declaration in [
+            "autoload -Uz gsch\n",
+            "hash gsch\n",
+            "hash gsch=/opt/unrelated/gsch\n",
+            "hash 'gsch=/opt/unrelated/gsch'\n",
+            "hash \"gsch\"\n",
+            "autoload -Uz 'gsch'\n",
+        ] {
+            let test = TestDirectory::new();
+            fs::write(test.rc_file(), declaration).unwrap();
+            assert_eq!(
+                test.editor().configure(&block(None, true)).unwrap_err(),
+                ZshConfigError::ShortcutNameConflict,
+                "missed declaration: {declaration}"
+            );
+            assert_eq!(fs::read_to_string(test.rc_file()).unwrap(), declaration);
+        }
     }
 
     #[test]

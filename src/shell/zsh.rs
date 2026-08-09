@@ -24,6 +24,7 @@ pub(crate) const ZSH_MANAGED_BLOCK_START: &[u8] = b"# >>> gschrank initialize v1
 pub(crate) const ZSH_MANAGED_BLOCK_END: &[u8] = b"# <<< gschrank initialize v1 <<<";
 pub(crate) const ZSH_STARTUP_METADATA: &[u8] = b"# gschrank startup profile: ";
 pub(crate) const ZSH_SHORTCUT_METADATA: &[u8] = b"# gschrank shortcut: ";
+pub(crate) const ZSH_WRAPPER_HANDSHAKE: &str = "gschrank:zsh-wrapper:1";
 
 /// A complete non-secret block ready for safe placement in `.zshrc`.
 pub(crate) struct ZshManagedBlock {
@@ -75,7 +76,7 @@ impl ZshEmitter {
         source.extend_from_slice(MANAGED_BLOCK_WRAPPER_INIT.as_bytes());
         match configuration.profile() {
             Some(_) => source.extend_from_slice(
-                b"  if ! gschrank load --startup; then\n    __gschrank_clear_inherited_v1 || :\n    builtin print -ru2 -- 'gschrank: startup profile failed; inherited profile cleanup attempted'\n  fi\n",
+                b"  if (( ${+functions[gschrank]} )) && [[ ${functions[gschrank]} == $'\t__gschrank_dispatch_v1 \"$@\"' ]] && ! 'gschrank' load --startup; then\n    __gschrank_clear_inherited_v1 || :\n    builtin print -ru2 -- 'gschrank: startup profile failed; inherited profile cleanup attempted'\n  fi\n",
             ),
             None => source.extend_from_slice(
                 b"  if ! __gschrank_clear_inherited_v1; then\n    builtin print -ru2 -- 'gschrank: inherited profile cleanup was incomplete; close the parent shell or unload manually'\n  fi\n",
@@ -649,7 +650,7 @@ function __gschrank_register_completion_v1 {
     return 1
   fi
   _comps[gschrank]=__gschrank_complete_v1
-  if (( ${+functions[gsch]} )) && [[ ${functions[gsch]} == *'__gschrank_dispatch_v1 "$@"'* ]]; then
+  if (( ${+functions[gsch]} )) && [[ ${functions[gsch]} == $'\t__gschrank_dispatch_v1 "$@"' ]]; then
     _comps[gsch]=__gschrank_complete_v1
   elif [[ ${_comps[gsch]-} == __gschrank_complete_v1 ]]; then
     builtin unset '_comps[gsch]' 2>/dev/null || return 1
@@ -677,11 +678,11 @@ function __gschrank_remove_integration_v1 {
   if [[ ${parameters[precmd_functions]-} == array* ]]; then
     precmd_functions=("${(@)precmd_functions:#__gschrank_register_completion_v1}") || _gschrank_cleanup_rc_v1=1
   fi
-  if (( ${+functions[gschrank]} )) && [[ ${functions[gschrank]} == *'__gschrank_dispatch_v1 "$@"'* ]]; then
-    builtin unfunction -- gschrank 2>/dev/null || _gschrank_cleanup_rc_v1=1
+  if (( ${+functions[gschrank]} )) && [[ ${functions[gschrank]} == $'\t__gschrank_dispatch_v1 "$@"' ]]; then
+    builtin unfunction -- 'gschrank' 2>/dev/null || _gschrank_cleanup_rc_v1=1
   fi
-  if (( ${+functions[gsch]} )) && [[ ${functions[gsch]} == *'__gschrank_dispatch_v1 "$@"'* ]]; then
-    builtin unfunction -- gsch 2>/dev/null || _gschrank_cleanup_rc_v1=1
+  if (( ${+functions[gsch]} )) && [[ ${functions[gsch]} == $'\t__gschrank_dispatch_v1 "$@"' ]]; then
+    builtin unfunction -- 'gsch' 2>/dev/null || _gschrank_cleanup_rc_v1=1
   fi
   _gschrank_private_functions_v1=(
     __gschrank_complete_profiles_v1
@@ -689,6 +690,7 @@ function __gschrank_remove_integration_v1 {
     __gschrank_complete_recovery_v1
     __gschrank_complete_v1
     __gschrank_register_completion_v1
+    __gschrank_recheck_shortcut_v1
     __gschrank_remove_integration_v1
     __gschrank_dispatch_v1
   )
@@ -704,6 +706,30 @@ function __gschrank_remove_integration_v1 {
 const SHORTCUT_FUNCTION: &str = r#"function gsch {
   __gschrank_dispatch_v1 "$@"
 }
+function __gschrank_recheck_shortcut_v1 {
+  builtin emulate -L zsh
+  builtin unsetopt XTRACE VERBOSE
+  builtin typeset -i _gschrank_late_conflict_v1=0
+
+  if (( ${+aliases[gsch]} || ${+galiases[gsch]} || ${+saliases[gsch]} || ${+builtins[gsch]} || ${reswords[(Ie)gsch]} != 0 || ${+commands[gsch]} )); then
+    _gschrank_late_conflict_v1=1
+  elif (( ${+functions[gsch]} )) && [[ ${functions[gsch]} != $'\t__gschrank_dispatch_v1 "$@"' ]]; then
+    _gschrank_late_conflict_v1=1
+  fi
+  if (( _gschrank_late_conflict_v1 )); then
+    if (( ${+functions[gsch]} )) && [[ ${functions[gsch]} == $'\t__gschrank_dispatch_v1 "$@"' ]]; then
+      builtin unfunction -- 'gsch'
+    fi
+    if [[ ${parameters[_comps]-} == association* && ${_comps[gsch]-} == __gschrank_complete_v1 ]]; then
+      builtin unset '_comps[gsch]' 2>/dev/null || :
+    fi
+    builtin print -ru2 -- "gschrank: the optional 'gsch' shortcut was claimed by later shell configuration; continuing without it"
+  fi
+  if [[ ${parameters[precmd_functions]-} == array* ]]; then
+    precmd_functions=("${(@)precmd_functions:#__gschrank_recheck_shortcut_v1}")
+  fi
+  builtin unfunction -- '__gschrank_recheck_shortcut_v1' 2>/dev/null || :
+}
 "#;
 
 const COMPLETION_REGISTRATION: &str = r"if ! __gschrank_register_completion_v1; then
@@ -712,6 +738,14 @@ const COMPLETION_REGISTRATION: &str = r"if ! __gschrank_register_completion_v1; 
   fi
   if [[ ${parameters[precmd_functions]-} == array* ]] && (( ${precmd_functions[(Ie)__gschrank_register_completion_v1]} == 0 )); then
     precmd_functions+=(__gschrank_register_completion_v1)
+  fi
+fi
+if (( ${+functions[__gschrank_recheck_shortcut_v1]} )); then
+  if (( ! ${+parameters[precmd_functions]} )); then
+    builtin typeset -ga precmd_functions
+  fi
+  if [[ ${parameters[precmd_functions]-} == array* ]] && (( ${precmd_functions[(Ie)__gschrank_recheck_shortcut_v1]} == 0 )); then
+    precmd_functions+=(__gschrank_recheck_shortcut_v1)
   fi
 fi
 ";
@@ -749,41 +783,52 @@ function __gschrank_initialize_v1 {
   builtin emulate -L zsh
   builtin unsetopt XTRACE VERBOSE
   builtin typeset _gschrank_init_payload_v1=''
+  builtin typeset _gschrank_executable_v1='' _gschrank_handshake_v1=''
   builtin typeset -a _gschrank_init_args_v1
   builtin typeset -i _gschrank_use_shortcut_v1=0
 
-  if (( ${+aliases[gschrank]} || ${+builtins[gschrank]} || ${reswords[(Ie)gschrank]} != 0 )); then
-    __gschrank_forget_completion_v1 gschrank || :
-    __gschrank_forget_completion_v1 gsch || :
+  if (( ${+aliases[gschrank]} || ${+galiases[gschrank]} || ${+saliases[gschrank]} || ${+builtins[gschrank]} || ${reswords[(Ie)gschrank]} != 0 )); then
+    __gschrank_forget_completion_v1 'gschrank' || :
+    __gschrank_forget_completion_v1 'gsch' || :
     __gschrank_clear_inherited_v1 || :
     builtin print -ru2 -- 'gschrank: the canonical shell name is already in use; inherited profile cleanup attempted'
     return 0
   fi
-  if (( ${+functions[gschrank]} )) && [[ ${functions[gschrank]} != *'__gschrank_dispatch_v1 "$@"'* ]]; then
-    __gschrank_forget_completion_v1 gschrank || :
-    __gschrank_forget_completion_v1 gsch || :
+  if (( ${+functions[gschrank]} )) && [[ ${functions[gschrank]} != $'\t__gschrank_dispatch_v1 "$@"' ]]; then
+    __gschrank_forget_completion_v1 'gschrank' || :
+    __gschrank_forget_completion_v1 'gsch' || :
     __gschrank_clear_inherited_v1 || :
     builtin print -ru2 -- 'gschrank: the canonical shell name is already in use; inherited profile cleanup attempted'
     return 0
   fi
   if (( ! ${+commands[gschrank]} )); then
-    __gschrank_forget_completion_v1 gschrank || :
-    __gschrank_forget_completion_v1 gsch || :
+    __gschrank_forget_completion_v1 'gschrank' || :
+    __gschrank_forget_completion_v1 'gsch' || :
     __gschrank_clear_inherited_v1 || :
     builtin print -ru2 -- 'gschrank: the executable is unavailable; inherited profile cleanup attempted'
     return 0
   fi
+  _gschrank_executable_v1="${commands[gschrank]}"
+  if [[ "$_gschrank_executable_v1" != /* ]] || ! _gschrank_handshake_v1="$(builtin command "$_gschrank_executable_v1" __shell-handshake zsh 1)" || [[ "$_gschrank_handshake_v1" != 'gschrank:zsh-wrapper:1' ]]; then
+    builtin unset _gschrank_executable_v1 _gschrank_handshake_v1
+    __gschrank_forget_completion_v1 'gschrank' || :
+    __gschrank_forget_completion_v1 'gsch' || :
+    __gschrank_clear_inherited_v1 || :
+    builtin print -ru2 -- 'gschrank: the executable failed the shell wrapper handshake; inherited profile cleanup attempted'
+    return 0
+  fi
+  builtin unset _gschrank_handshake_v1
 "#;
 
 const MANAGED_BLOCK_SHORTCUT_ENABLED: &str = r#"
-  if (( ${+aliases[gsch]} || ${+builtins[gsch]} || ${reswords[(Ie)gsch]} != 0 || ${+commands[gsch]} )); then
-    if (( ${+functions[gsch]} )) && [[ ${functions[gsch]} == *'__gschrank_dispatch_v1 "$@"'* ]]; then
-      builtin unfunction -- gsch
+  if (( ${+aliases[gsch]} || ${+galiases[gsch]} || ${+saliases[gsch]} || ${+builtins[gsch]} || ${reswords[(Ie)gsch]} != 0 || ${+commands[gsch]} )); then
+    if (( ${+functions[gsch]} )) && [[ ${functions[gsch]} == $'\t__gschrank_dispatch_v1 "$@"' ]]; then
+      builtin unfunction -- 'gsch'
     fi
-    __gschrank_forget_completion_v1 gsch || :
+    __gschrank_forget_completion_v1 'gsch' || :
     builtin print -ru2 -- "gschrank: the optional 'gsch' shortcut is already in use; continuing without it"
-  elif (( ${+functions[gsch]} )) && [[ ${functions[gsch]} != *'__gschrank_dispatch_v1 "$@"'* ]]; then
-    __gschrank_forget_completion_v1 gsch || :
+  elif (( ${+functions[gsch]} )) && [[ ${functions[gsch]} != $'\t__gschrank_dispatch_v1 "$@"' ]]; then
+    __gschrank_forget_completion_v1 'gsch' || :
     builtin print -ru2 -- "gschrank: the optional 'gsch' shortcut is already in use; continuing without it"
   else
     _gschrank_use_shortcut_v1=1
@@ -791,10 +836,16 @@ const MANAGED_BLOCK_SHORTCUT_ENABLED: &str = r#"
 "#;
 
 const MANAGED_BLOCK_SHORTCUT_DISABLED: &str = r#"
-  if (( ${+functions[gsch]} )) && [[ ${functions[gsch]} == *'__gschrank_dispatch_v1 "$@"'* ]]; then
-    builtin unfunction -- gsch
+  if (( ${+functions[gsch]} )) && [[ ${functions[gsch]} == $'\t__gschrank_dispatch_v1 "$@"' ]]; then
+    builtin unfunction -- 'gsch'
   fi
-  __gschrank_forget_completion_v1 gsch || :
+  if [[ ${parameters[precmd_functions]-} == array* ]]; then
+    precmd_functions=("${(@)precmd_functions:#__gschrank_recheck_shortcut_v1}")
+  fi
+  if (( ${+functions[__gschrank_recheck_shortcut_v1]} )); then
+    builtin unfunction -- __gschrank_recheck_shortcut_v1
+  fi
+  __gschrank_forget_completion_v1 'gsch' || :
 "#;
 
 const MANAGED_BLOCK_WRAPPER_INIT: &str = r#"
@@ -803,7 +854,7 @@ const MANAGED_BLOCK_WRAPPER_INIT: &str = r#"
   else
     _gschrank_init_args_v1=()
   fi
-  if _gschrank_init_payload_v1="$(builtin command gschrank __shell-init zsh 1 "${_gschrank_init_args_v1[@]}")"; then
+  if _gschrank_init_payload_v1="$(builtin command "$_gschrank_executable_v1" __shell-init zsh 1 "${_gschrank_init_args_v1[@]}")"; then
     :
   else
     builtin unset _gschrank_init_payload_v1
@@ -811,6 +862,7 @@ const MANAGED_BLOCK_WRAPPER_INIT: &str = r#"
     builtin print -ru2 -- 'gschrank: shell initialization failed; inherited profile cleanup attempted'
     return 0
   fi
+  builtin unset _gschrank_executable_v1
   if ! builtin eval -- "$_gschrank_init_payload_v1"; then
     builtin unset _gschrank_init_payload_v1
     __gschrank_clear_inherited_v1 || :
@@ -1128,6 +1180,12 @@ mod tests {
             assert_eq!(block.configuration(), &configuration);
             assert!(block.source().starts_with(ZSH_MANAGED_BLOCK_START));
             assert!(block.source().ends_with(b"<<<\n"));
+            assert!(
+                block
+                    .source()
+                    .windows(ZSH_WRAPPER_HANDSHAKE.len())
+                    .any(|bytes| bytes == ZSH_WRAPPER_HANDSHAKE.as_bytes())
+            );
             assert!(!block.source().windows(9).any(|bytes| bytes == b"API_TOKEN"));
             assert!(
                 !block
@@ -1145,7 +1203,7 @@ mod tests {
     #[test]
     fn startup_off_clears_inherited_values_but_keeps_the_wrapper() {
         let fake = TestDirectory::with_fake_gschrank(
-            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-init ]]; then\n  builtin print -rn -- 'function __gschrank_dispatch_v1 { return 0; }; function gschrank { __gschrank_dispatch_v1 \"$@\"; };:'\n  exit 0\nfi\nexit 2\n",
+            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-handshake ]]; then print -r -- 'gschrank:zsh-wrapper:1'; exit 0; fi\nif [[ \"$1\" == __shell-init ]]; then\n  builtin print -rn -- 'function __gschrank_dispatch_v1 { return 0; }; function gschrank { __gschrank_dispatch_v1 \"$@\"; };:'\n  exit 0\nfi\nexit 2\n",
         );
         let block = ZshEmitter::emit_managed_block(StartupConfiguration::new(None, false));
         let output = run_zsh_parts_with_path(
@@ -1162,7 +1220,7 @@ mod tests {
     #[test]
     fn disabling_the_shortcut_removes_only_its_managed_completion() {
         let fake = TestDirectory::with_fake_gschrank(
-            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-init ]]; then\n  builtin print -rn -- 'function __gschrank_dispatch_v1 { return 0; }; function gschrank { __gschrank_dispatch_v1 \"$@\"; };:'\n  exit 0\nfi\nexit 2\n",
+            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-handshake ]]; then print -r -- 'gschrank:zsh-wrapper:1'; exit 0; fi\nif [[ \"$1\" == __shell-init ]]; then\n  builtin print -rn -- 'function __gschrank_dispatch_v1 { return 0; }; function gschrank { __gschrank_dispatch_v1 \"$@\"; };:'\n  exit 0\nfi\nexit 2\n",
         );
         let block = ZshEmitter::emit_managed_block(StartupConfiguration::new(None, false));
         let output = run_zsh_parts_with_path(
@@ -1183,7 +1241,7 @@ mod tests {
     #[test]
     fn failed_automatic_startup_attempts_fail_closed_and_leave_zsh_open() {
         let fake = TestDirectory::with_fake_gschrank(
-            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-init ]]; then\n  builtin print -rn -- 'function __gschrank_dispatch_v1 { return 42; }; function gschrank { __gschrank_dispatch_v1 \"$@\"; };:'\n  exit 0\nfi\nexit 2\n",
+            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-handshake ]]; then print -r -- 'gschrank:zsh-wrapper:1'; exit 0; fi\nif [[ \"$1\" == __shell-init ]]; then\n  builtin print -rn -- 'function __gschrank_dispatch_v1 { return 42; }; function gschrank { __gschrank_dispatch_v1 \"$@\"; };:'\n  exit 0\nfi\nexit 2\n",
         );
         let block = ZshEmitter::emit_managed_block(StartupConfiguration::new(
             Some(ProfileName::new("work").unwrap()),
@@ -1209,7 +1267,7 @@ mod tests {
     #[test]
     fn managed_block_never_evaluates_partial_output_from_failed_wrapper_initialization() {
         let fake = TestDirectory::with_fake_gschrank(
-            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-init ]]; then\n  builtin print -rn -- 'function gschrank { builtin export SHOULD_NOT_APPLY=partial; };'\n  exit 42\nfi\nexit 2\n",
+            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-handshake ]]; then print -r -- 'gschrank:zsh-wrapper:1'; exit 0; fi\nif [[ \"$1\" == __shell-init ]]; then\n  builtin print -rn -- 'function gschrank { builtin export SHOULD_NOT_APPLY=partial; };'\n  exit 42\nfi\nexit 2\n",
         );
         let block = ZshEmitter::emit_managed_block(StartupConfiguration::new(None, false));
         let output = run_zsh_parts_with_path(
@@ -1230,9 +1288,117 @@ mod tests {
     }
 
     #[test]
+    fn managed_block_rejects_wrapper_source_before_eval_when_the_handshake_is_wrong() {
+        let fake = TestDirectory::with_fake_gschrank(
+            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-handshake ]]; then print -r -- 'not-gschrank'; exit 0; fi\nif [[ \"$1\" == __shell-init ]]; then print -rn -- 'builtin export SHOULD_NOT_APPLY=untrusted; function gschrank { return 0; };'; exit 0; fi\nexit 2\n",
+        );
+        let block = ZshEmitter::emit_managed_block(StartupConfiguration::new(None, false));
+        let output = run_zsh_parts_with_path(
+            b"builtin export OLD_VALUE=CANARY-inherited GSCHRANK_ENV_PROTOCOL=1 GSCHRANK_ACTIVE_PROFILE=old GSCHRANK_MANAGED_KEYS=OLD_VALUE\n",
+            block.source(),
+            b"if (( ${+parameters[SHOULD_NOT_APPLY]} || ${+functions[gschrank]} )); then exit 96; fi\nif builtin command /usr/bin/printenv OLD_VALUE >/dev/null; then exit 97; fi\nbuiltin print -r -- shell-opened\n",
+            Some(fake.path()),
+        );
+
+        assert!(output.status.success(), "handshake rejection closed Zsh");
+        assert_eq!(output.stdout, b"shell-opened\n");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("failed the shell wrapper handshake")
+        );
+    }
+
+    #[test]
+    fn a_canonical_alias_conflict_is_never_invoked_during_startup() {
+        let fake = TestDirectory::with_fake_gschrank(
+            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-handshake ]]; then print -r -- 'gschrank:zsh-wrapper:1'; exit 0; fi\nexit 2\n",
+        );
+        let block = ZshEmitter::emit_managed_block(StartupConfiguration::new(
+            Some(ProfileName::new("work").unwrap()),
+            false,
+        ));
+        let output = run_zsh_parts_with_path(
+            b"alias gschrank='builtin export SHOULD_NOT_APPLY=alias'\nbuiltin export OLD_VALUE=CANARY-inherited GSCHRANK_ENV_PROTOCOL=1 GSCHRANK_ACTIVE_PROFILE=old GSCHRANK_MANAGED_KEYS=OLD_VALUE\n",
+            block.source(),
+            b"if (( ${+parameters[SHOULD_NOT_APPLY]} || ${+functions[gschrank]} )); then exit 96; fi\nif builtin command /usr/bin/printenv OLD_VALUE >/dev/null; then exit 97; fi\n(( ${+aliases[gschrank]} )) || exit 98\n",
+            Some(fake.path()),
+        );
+
+        assert!(output.status.success(), "canonical-alias fixture failed");
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("canonical shell name"));
+    }
+
+    #[test]
+    fn a_global_alias_conflict_cannot_rewrite_or_replace_the_shortcut() {
+        let fake = TestDirectory::with_fake_gschrank(
+            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-handshake ]]; then print -r -- 'gschrank:zsh-wrapper:1'; exit 0; fi\nif [[ \"$1\" == __shell-init ]]; then print -rn -- 'function __gschrank_dispatch_v1 { return 0; }; function gschrank { __gschrank_dispatch_v1 \"$@\"; };:'; exit 0; fi\nexit 2\n",
+        );
+        let block = ZshEmitter::emit_managed_block(StartupConfiguration::new(None, true));
+        let output = run_zsh_parts_with_path(
+            b"alias -g gsch='SHOULD_NOT_EXPAND'\n",
+            block.source(),
+            b"(( ${+galiases[gsch]} )) || exit 96\nif (( ${+functions[gsch]} )); then exit 97; fi\n(( ${+functions[gschrank]} )) || exit 98\n",
+            Some(fake.path()),
+        );
+
+        assert!(output.status.success(), "global-alias fixture failed");
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("shortcut is already in use"));
+    }
+
+    #[test]
+    fn later_startup_configuration_can_claim_the_shortcut_without_being_shadowed() {
+        let fake = TestDirectory::with_fake_gschrank(
+            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-handshake ]]; then print -r -- 'gschrank:zsh-wrapper:1'; exit 0; fi\nif [[ \"$1\" == __shell-init && \"$4\" == --shortcut ]]; then builtin command /bin/cat -- \"$0:h/wrapper\"; exit 0; fi\nexit 2\n",
+        );
+        fs::write(
+            fake.path().join("wrapper"),
+            ZshEmitter::new().emit_wrapper(true),
+        )
+        .unwrap();
+        let block = ZshEmitter::emit_managed_block(StartupConfiguration::new(None, true));
+        let output = run_zsh_parts_with_path(
+            b"",
+            block.source(),
+            b"alias gsch='builtin print -r -- unrelated'\n(( ${precmd_functions[(Ie)__gschrank_recheck_shortcut_v1]} != 0 )) || exit 95\n__gschrank_recheck_shortcut_v1\n(( ${+aliases[gsch]} )) || exit 96\nif (( ${+functions[gsch]} )); then exit 97; fi\n(( ${+functions[gschrank]} )) || exit 98\n",
+            Some(fake.path()),
+        );
+
+        assert!(
+            output.status.success(),
+            "late-configuration fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("later shell configuration"));
+    }
+
+    #[test]
+    fn a_function_that_only_contains_the_ownership_text_is_still_a_conflict() {
+        let fake = TestDirectory::with_fake_gschrank(
+            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-handshake ]]; then print -r -- 'gschrank:zsh-wrapper:1'; exit 0; fi\nif [[ \"$1\" == __shell-init ]]; then print -rn -- 'function __gschrank_dispatch_v1 { return 0; }; function gschrank { __gschrank_dispatch_v1 \"$@\"; };:'; exit 0; fi\nexit 2\n",
+        );
+        let block = ZshEmitter::emit_managed_block(StartupConfiguration::new(None, true));
+        let output = run_zsh_parts_with_path(
+            b"function gsch { builtin print -r -- unrelated; __gschrank_dispatch_v1 \"$@\"; }\n",
+            block.source(),
+            b"builtin print -r -- ${(qqq)functions[gsch]}\n",
+            Some(fake.path()),
+        );
+
+        assert!(
+            output.status.success(),
+            "function-conflict fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("unrelated"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("shortcut is already in use"));
+    }
+
+    #[test]
     fn a_late_shortcut_conflict_is_not_shadowed_at_shell_startup() {
         let fake = TestDirectory::with_fake_gschrank(
-            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-init ]]; then\n  if [[ \"$4\" == --shortcut ]]; then\n    builtin print -rn -- 'function __gschrank_dispatch_v1 { return 0; }; function gschrank { __gschrank_dispatch_v1 \"$@\"; }; function gsch { __gschrank_dispatch_v1 \"$@\"; };:'\n  else\n    builtin print -rn -- 'function __gschrank_dispatch_v1 { return 0; }; function gschrank { __gschrank_dispatch_v1 \"$@\"; };:'\n  fi\n  exit 0\nfi\nexit 2\n",
+            "#!/bin/zsh -f\nif [[ \"$1\" == __shell-handshake ]]; then print -r -- 'gschrank:zsh-wrapper:1'; exit 0; fi\nif [[ \"$1\" == __shell-init ]]; then\n  if [[ \"$4\" == --shortcut ]]; then\n    builtin print -rn -- 'function __gschrank_dispatch_v1 { return 0; }; function gschrank { __gschrank_dispatch_v1 \"$@\"; }; function gsch { __gschrank_dispatch_v1 \"$@\"; };:'\n  else\n    builtin print -rn -- 'function __gschrank_dispatch_v1 { return 0; }; function gschrank { __gschrank_dispatch_v1 \"$@\"; };:'\n  fi\n  exit 0\nfi\nexit 2\n",
         );
         fake.add_executable("gsch", "#!/bin/zsh -f\nbuiltin print -r -- external-gsch\n");
         let block = ZshEmitter::emit_managed_block(StartupConfiguration::new(None, true));

@@ -156,6 +156,7 @@ enum Command {
     ShellInit {
         shortcut: bool,
     },
+    ShellHandshake,
     EmitZsh {
         context: OperationContext,
         operation: EmitOperation,
@@ -580,6 +581,7 @@ pub(crate) fn run_cli(
         Command::Startup(command) => run_startup(command),
         Command::ShellParent(command) => run_shell_parent(command),
         Command::ShellInit { shortcut } => run_shell_init(shortcut),
+        Command::ShellHandshake => run_shell_handshake(),
         Command::EmitZsh { context, operation } => run_emit_zsh(context, operation),
     }
 }
@@ -590,7 +592,11 @@ fn acquire_operation_lock(
 ) -> Result<Option<ApplicationOperationLock>, ProfileRenameStoreError> {
     if matches!(
         command,
-        Command::Help | Command::Version | Command::ShellParent(_) | Command::ShellInit { .. }
+        Command::Help
+            | Command::Version
+            | Command::ShellParent(_)
+            | Command::ShellInit { .. }
+            | Command::ShellHandshake
     ) {
         return Ok(None);
     }
@@ -821,6 +827,11 @@ fn parse_import(arguments: &[OsString]) -> Result<Command, ParseError> {
 
 fn parse_private(arguments: &[OsString]) -> Result<Command, ParseError> {
     match arguments {
+        [handshake, shell, protocol]
+            if handshake == "__shell-handshake" && shell == "zsh" && protocol == "1" =>
+        {
+            Ok(Command::ShellHandshake)
+        }
         [reset] if reset == "__reset-from-zsh" => Ok(Command::Reset {
             shell_wrapper: true,
         }),
@@ -2718,6 +2729,11 @@ fn run_shell_init(shortcut: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn run_shell_handshake() -> ExitCode {
+    println!("{}", crate::shell::ZSH_WRAPPER_HANDSHAKE);
+    ExitCode::SUCCESS
+}
+
 #[cfg(target_os = "macos")]
 fn inherited_managed_state() -> Result<ManagedState, ManagedStateError> {
     let protocol = std::env::var_os(ENV_PROTOCOL_NAME);
@@ -3067,6 +3083,10 @@ mod tests {
             parse(&["__shell-init".into(), "zsh".into(), "1".into()]),
             Ok(Command::ShellInit { shortcut: false })
         ));
+        assert!(matches!(
+            parse(&["__shell-handshake".into(), "zsh".into(), "1".into()]),
+            Ok(Command::ShellHandshake)
+        ));
         assert!(parse(&["init".into(), "extra".into()]).is_err());
         assert!(parse(&["status".into(), "extra".into()]).is_err());
         assert!(parse(&["doctor".into(), "extra".into()]).is_err());
@@ -3092,6 +3112,7 @@ mod tests {
         );
         assert!(!HELP.contains("__emit-zsh"));
         assert!(!HELP.contains("__shell-init"));
+        assert!(!HELP.contains("__shell-handshake"));
     }
 
     #[test]
