@@ -108,11 +108,13 @@ fn read_hidden_terminal_secret() -> Result<SecretValue, SecretInputError> {
 
     let stderr = std::io::stderr();
     let mut stderr = stderr.lock();
-    stderr
-        .write_all(b"Enter value: ")
-        .and_then(|()| stderr.flush())
-        .map_err(|_| SecretInputError::IoFailure)?;
-    let input = read_hidden_stdin(MAX_VALUE_BYTES).map_err(|error| match error {
+    let input = read_hidden_stdin(MAX_VALUE_BYTES, || {
+        stderr
+            .write_all(b"Enter value: ")
+            .and_then(|()| stderr.flush())
+            .map_err(|_| HiddenInputError::IoFailure)
+    })
+    .map_err(|error| match error {
         HiddenInputError::NotTerminal => SecretInputError::InteractiveTerminalRequired,
         HiddenInputError::IoFailure => SecretInputError::IoFailure,
         HiddenInputError::Interrupted => SecretInputError::Interrupted,
